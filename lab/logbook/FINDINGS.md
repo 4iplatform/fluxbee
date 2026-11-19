@@ -433,8 +433,9 @@ no change required
     ([io-web-v2](../../docs/io-web-v2.md) §13): a transparent proxy, straight to Cloud's iframe (no
     stage in its own tab); no time, size or rewrite of the proxy's own (A-142 settled for the
     proxy); SSE frame by frame; what is open cut at once when the access ends; a renewal
-    interrupts nobody; A-351 agreed. The talk goes on with §13.7 (the headers and Cloud's origin,
-    the `Origin` check, observability and the gate), then the build design.
+    interrupts nobody; A-351 agreed; the headers Fluxbee adds, and Cloud's origin as a field of
+    `publish_cloud_endpoint` (§13.7). The talk goes on with §13.8 (the `Origin` check,
+    observability and the gate), then the build design.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -501,7 +502,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12): stage 2.1 complete, the board's item 31
   ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)). What is left was redefined on
   2026-11-19 (§13): one stage 2.2, a transparent proxy straight to Cloud's iframe; its talk goes on
-  with §13.7.
+  with §13.8.
 - A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
 - A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
 

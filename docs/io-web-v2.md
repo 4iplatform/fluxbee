@@ -609,7 +609,7 @@ two stages (Archi in its own tab, then in Cloud's iframe), §12.4's "limits and 
 exposure", and §12.6's steps 2 and 3, which become one. Stage 2.1's exposures, links, sessions and
 registry stay as built.
 
-**Status:** agreed in the talk of 2026-11-19. The points of §13.7 come next in the same talk; then
+**Status:** agreed in the talk of 2026-11-19. The points of §13.8 come next in the same talk; then
 the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.1.
 
 ### 13.1 Decisions
@@ -628,7 +628,7 @@ the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.
    1. **the entry:** Cloud's one-time link, redeemed for the session cookie (built in 2.1);
    2. **the end:** a disable, an unpublish or the end of the access cuts everything of the
       exposure at once, what is open included (§13.4);
-   3. **the permission** for Cloud's page to frame it (`frame-ancestors`; §13.7, point 1).
+   3. **the permission** for Cloud's page to frame it (`frame-ancestors`; §13.7).
 
    It adds no time, no size and no rewrite of its own: the application's own rule (*"el timeout
    tiene que ser el de archi interno, el reverse proxy no veo porque tenga que cambiar la
@@ -728,7 +728,7 @@ the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.
 - **Cookies** (A-351): the system's own cookies pass. Fluxbee's (`__Host-fluxbee_*`) are removed
   before the upstream, and a `Set-Cookie` of that name from the upstream never reaches the browser.
   2.1's sliding cookie is added to proxied answers.
-- **The application's headers pass untouched.** What Fluxbee adds is §13.7, point 1.
+- **The application's headers pass untouched.** What Fluxbee adds is §13.7.
 
 ### 13.4 The end: what is open is cut at once
 
@@ -768,7 +768,9 @@ the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.
   login. Single sign-on (OpenID Connect) comes later, with a prerequisite: a session knows its
   exposure but not its person, since Cloud's link names nobody. Cloud, which holds people's logins,
   would name the person in the link and be Odoo's OpenID provider. This meets §10's question 2
-  (who may enter Archi).
+  (who may enter Archi). Fluxbee's cookie is `SameSite=Strict`, so a redirect back from an
+  identity provider on another site arrives without it and gets a 401; Cloud, under `fluxbee.ai`,
+  has no such problem.
 - **The upstream's scheme** (http or https, and the certificate of an internal https upstream) is
   not recorded (§13.2). It is open until the first third-party exposure.
 
@@ -781,16 +783,63 @@ the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.
   of 2026-11-19, with figures): the application's rule (decision 3).
 - Sessions without a cookie (a token in the URL, or no session): decision 5.
 
-### 13.7 Open: the talk's next points, one at a time
+### 13.7 The headers, and Cloud's origin (decided 2026-11-19)
 
-1. **The headers Fluxbee adds**, on io.web's own answers and on proxied ones, under decision 3 and
-   §12.4's grade A. That includes where io.web learns Cloud's origin for `frame-ancestors`: the hive
-   does not know it today (`publish_cloud_endpoint` opens the hive's door for Cloud; it does not
-   name Cloud's page).
-2. **The `Origin` check on the methods that write** (2.1 §4 already had it for 2.2). Every exposure
+**Two facts order it.**
+
+- The scanners (SSL Labs, securityheaders, Mozilla Observatory) have no session. On an exposure
+  host they see io.web's own 401 page; on the main host, the edge's answers. Only whoever came in
+  sees the application's page. The grade A of §12.4 is therefore Fluxbee's own answers', and the
+  application's answers follow decision 3.
+- The edge adds its security headers to every answer that lacks them (`src/bin/sy_edge.rs:3965-3977`).
+  Archi sends no CSP, so the edge would give its page `default-src 'none'; frame-ancestors 'none'`:
+  no JavaScript, and Cloud's frame refused. The edge must change.
+
+**The headers** (the operator approved the table):
+
+| | Fluxbee's own answers (io.web's 401 and `/.fluxbee/*`, the edge's) | The application's answers |
+| --- | --- | --- |
+| Today's strict headers (`default-src 'none'`, `no-store`, `no-referrer`…) | stay | never added |
+| `Strict-Transport-Security`, one year | added | added |
+| `Permissions-Policy`, every feature off | added | not added: it could turn off something the application uses |
+| `frame-ancestors` | Cloud's origins, in place of `'none'`: an ended session shows io.web's page inside Cloud's frame, not the browser's error | Cloud's origins, in a CSP header of its own |
+| `X-Content-Type-Options: nosniff` | already there | added when missing |
+| `Server`, `X-Powered-By` | — | removed |
+
+- **Why a CSP header of its own:** the browser enforces every CSP header it gets, so Fluxbee's only
+  limits who frames, and the application's CSP stays as it is.
+- **Why no `Referrer-Policy: no-referrer` on the application's answers:** some applications
+  (Django, for one) check `Referer` against CSRF on a POST.
+- **The grade:** SSL Labs gives A+ only with HSTS. With HSTS and `Permissions-Policy`, Fluxbee's own
+  answers carry every header the scanners ask for. Archi has no CSP of its own; one would be a
+  change to Archi, later if wanted.
+
+**Cloud's origin: a field of `publish_cloud_endpoint`** (the operator's call: *"vamos por el
+comando"*).
+
+- The hive learns its Cloud when Cloud's door is opened, before any exposure: io.cloud first, then
+  Cloud's operations through it to SY.admin. Archi receives none of them and does not know it is
+  exposed.
+- `cloud_origins`: one or more `https://<host>` origins. More than one covers a move, while
+  `cloud.fluxbee.ai` and the root live together. SY.admin keeps them with the record of Cloud's door
+  and sends them to io.web with the exposures. Its checks of the field are the build design's.
+- Without one, nobody frames an exposure, which then works in its own tab only.
+- Changing it is running the command again, which rotates Cloud's token, as every publish does. On
+  PROD, whose door is published, that is one rotation when 2.2 arrives, and then one each time
+  Cloud moves.
+- **Considered, not taken:**
+  - A DNS TXT record for the whole domain (for example `_fluxbee-cloud.fluxbee.ai`): one edit for
+    every hive. But SY.admin resolves addresses only, with the system's resolver
+    (`src/bin/sy_admin/acme.rs:2041`), so a TXT needs a new DNS library. And without DNSSEC the
+    answer is not authenticated, while this datum is the permission to frame Archi.
+  - A field of `enable_exposure`, named by Cloud at each enable.
+
+### 13.8 Open: the talk's next points, one at a time
+
+1. **The `Origin` check on the methods that write** (2.1 §4 already had it for 2.2). Every exposure
    of every hive shares the site `fluxbee.ai`, so `SameSite=Strict` does not stop a request from a
    sibling host, another hive's exposure included.
-3. **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
+2. **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
    gate measures (the SSE cadence, the cut).
 
 Then the build design, its review, the releases and the gate on 8.x.
