@@ -509,6 +509,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   with §13.9.
 - A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
 - A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
+- A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low).
 - A-356, A-357 🔵 SY.admin's executor contract: `publish_cloud_endpoint`'s `cloud_node` among the required fields (low); `vault_assign`'s lists read as strings (medium); built for 0.1.151.
 - A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
@@ -1646,6 +1647,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-358 [General/admin] 🔵 design (medium-low; found 2026-11-19 by io.web stage 2.2's io.web builder; read in the code, not run) — SY.admin publishes a `hive` upstream whose registry address io.web will refuse
+
+- **Why:** at publish, SY.admin checks a `hive` upstream's role only (`check_upstream`,
+  `src/bin/sy_admin/exposures.rs` ~651-690). From 0.1.151 io.web reads the hive's registry `address`
+  at each request, resolves a name, and refuses an address outside the private ranges, or one that
+  is loopback, link-local or the motherbee's own, as SY.admin refuses an `address` upstream
+  ([io-web-v2-stage-2-2](../../docs/io-web-v2-stage-2-2.md) §4.2). A worker recorded at a public
+  address publishes fine, then every request answers 502 (`address_refused` in io.web's log).
+- **Fix:** SY.admin applies the same checks to the hive's registry address at publish, and says why
+  it refuses. The address can still change after publish, so io.web's check stays.
+
 ### A-357 [General/admin] 🔵 BUILT for 0.1.151 (`coa/fix-151-contract`) (medium; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run; there since `vault_assign`'s contract) — the executor's schema reads `vault_assign`'s lists as strings, so a plan step that passes a list is refused
 
 - **Why:** `vault_assign`'s optional fields `assigned_nodes` and `assigned_ilks` were typed
@@ -1678,6 +1690,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   different cargo workspaces, so the shared place is the Rust SDK, and R1 (0.1.150) was already
   closed when the review found it.
 - **Fix:** the next Rust SDK release moves the list into the SDK, and both read it from there.
+- **Also (2026-11-19, io.web's build):** the `Permissions-Policy` string of Fluxbee's own answers is
+  written twice, in SY.edge and in io.web (`nodes/io/io-web/src/headers.rs` ~32); it goes into the SDK
+  with the list.
 
 ### A-354 [General/admin] ✅ VALIDATED ON 8.x (0.1.149, 2026-11-19; a new exposure host read pending, then covered at 9.1 s, never held) (low; found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code) — a published host reads `held` while its own name-change order runs
 

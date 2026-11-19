@@ -988,9 +988,11 @@ Cloud publishes, opens, closes and removes exposures, and only Cloud asks for li
 - **No tenant.** An exposure is the installation's, not a tenant's: any envelope `tenant_id` but
   `null` is refused with `INVALID_REQUEST`, not ignored (§3). Each op takes the params listed for
   it; other fields are ignored (§3, rule 1).
-- **What a person sees for now:** with a session, the hive's placeholder page. The hive records the
-  upstream already, and leads the host to it in a later release. Paths under `/.fluxbee/` belong to
-  the hive on every exposure host, and never reach the upstream.
+- **What a person sees:** from 0.1.151, with a session, the exposure's upstream itself, Archi or
+  another system, through a transparent proxy: every request its page makes, uploads, answers that
+  take minutes, live streams and WebSockets, as on the upstream's own port (up to 0.1.150, the
+  hive's placeholder page). Paths under `/.fluxbee/` belong to the hive on every exposure host, and
+  never reach the upstream.
 
 **The flow:** `publish_exposure` → `list_exposures` until the host's `certificate.state` is
 `covered` → `enable_exposure` for the time you need → `issue_exposure_link` → open the link → before
@@ -1090,12 +1092,12 @@ Fluxbee's own ports are refused for every kind: 22, 80, 443, 3000, 8080, 8384, 9
   `pending`, and the hive tells it again every minute. Until io.web holds the new secret, a link
   answers `IO_WEB_UNAVAILABLE`: ask again shortly.
 - **A renewal** is another `enable_exposure` before `enabled_until`: `renewed: true`, and the
-  exposure stays open with no gap. A session never outlives the enablement it was taken under:
-  the sessions taken before the renewal end at the previous `enabled_until`, and new links come from
-  the new enablement only. To keep a person in past that time, give them a new link.
+  exposure stays open with no gap. From 0.1.151 a renewal interrupts nobody: a person's session
+  moves to the new enablement at its next request, and what they have open stays open (up to
+  0.1.150, the sessions taken before the renewal ended at the previous `enabled_until`). New links
+  come from the new enablement only.
 - **Two enablements at most** stay live, the newest and the one it renewed: another renewal ends
-  the oldest at once, and its sessions with it. Renew each enablement once, well before its
-  `enabled_until`.
+  the oldest at once. Renew each enablement once, well before its `enabled_until`.
 - **A session** lasts while the person is active, 30 minutes idle at most, and never past the end
   of its enablement.
 
@@ -1112,11 +1114,11 @@ Fluxbee's own ports are refused for every kind: 22, 80, 443, 3000, 8080, 8384, 9
 **The `url` lets one person in, once, for about 120 s**, until `expires_at` (RFC 3339, UTC, like
 the view's times):
 
-- **open it once, top-level, in Cloud's own tab, within 120 s.** The person's browser goes to it;
-  the hive sets its session cookie on the host and moves on to the host's page;
-- never fetch it from your server or from a script, never let it be prefetched or previewed, and do
-  not open it in an iframe (not supported yet): the first request spends it, and the session goes
-  to whoever made that request;
+- **open it once, within 120 s, as the `src` of Cloud's iframe** (from 0.1.151, see "Inside
+  Cloud's iframe" below) **or top-level in Cloud's own tab.** The person's browser goes to it; the
+  hive sets its session cookie on the host and moves on to the host's page;
+- never fetch it from your server or from a script, and never let it be prefetched or previewed:
+  the first request spends it, and the session goes to whoever made that request;
 - **never log it, and never store it:** whoever holds it within its 120 s gets in. `link_id` names
   the link in the hive's logs; log that instead.
 
@@ -1130,7 +1132,7 @@ its newest enablement.
 
 | op | what it does |
 |---|---|
-| `disable_exposure` | closes it: every link and session of it stops working. It stays published, and can be enabled again |
+| `disable_exposure` | closes it: every link and session of it stops working, and from 0.1.151 what is open is cut at once (a page's live stream, a request still waiting, a WebSocket). It stays published, and can be enabled again |
 | `unpublish_exposure` | removes it: closed, and its host answers 404. The label can be published again, as a new exposure with a new id |
 
 - Both take effect at io.web as soon as it answers: `io_web` `acknowledged` in the answer. With
@@ -1144,6 +1146,30 @@ its newest enablement.
 
 No params. `result: {"exposures":[…views…],"count":2,"max":16}`: every published exposure, the closed
 ones included.
+
+#### Inside Cloud's iframe (from 0.1.151)
+
+Archi, and any exposure, works inside Cloud's page: the iframe's `src` is the link's `url`. What it
+needs, and what Cloud must keep:
+
+- **The hive frames only the origins its operator named:** `cloud_origins` in
+  `publish_cloud_endpoint`, the operator's action that opens Cloud's door (§7), for example
+  `["https://cloud.fluxbee.ai"]`. Tell the operator the origin of the page that holds the iframe.
+  Without one, nobody may frame an exposure, which then works in its own tab only. Naming or
+  changing the origins runs that action again, which rotates Cloud's token, as every run does.
+- **One domain:** Cloud's page and the hive's hosts must share the domain (`*.fluxbee.ai`).
+  Otherwise the browser treats the iframe as a third party, and the session cookie does not travel
+  in it (Cloud on `localhost` during development included: test on the real domain).
+- **Cloud's own credentials must be host-only `__Host-` cookies.** Every `*.fluxbee.ai` host is one
+  site for the browser: a cookie Cloud set with `Domain=fluxbee.ai` would reach every exposure,
+  and so every upstream behind it. A `__Host-` cookie also cannot be overwritten by one that another
+  host of the site plants.
+- **Writes come from the exposure's own page.** A request that writes (anything but GET, HEAD and
+  OPTIONS) or opens a WebSocket on an exposure host is answered 403 when it comes from another
+  origin, Cloud's page included: Cloud frames the exposure and never calls into it.
+- **Nothing to time on Cloud's side:** an exposure answers as its upstream does (a chat turn that
+  takes minutes, a stream that stays open). A renewal interrupts nobody; a disable, an unpublish
+  or the enablement's end cuts what is open at once, and the frame shows the hive's 401 page.
 
 #### Errors
 
@@ -1368,6 +1394,19 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.151
+
+- **An exposure leads to its upstream** (§5.8): with a session, the person uses Archi, or the
+  exposure's system, as on its own port, through a transparent proxy, where 0.1.150 showed a
+  placeholder page.
+- **Inside Cloud's iframe** (§5.8, "Inside Cloud's iframe"): the iframe's `src` is the link's `url`.
+  The hive frames only the origins its operator named with `publish_cloud_endpoint`'s new
+  `cloud_origins`, which rotates Cloud's token once when the operator names them. Cloud's page must
+  share the hive's domain, and Cloud's own credentials must be host-only `__Host-` cookies.
+- **A renewal moves the sessions** and interrupts nobody; **a disable cuts what is open** at once.
+- **Writes come from the exposure's own page:** a write or a WebSocket from another origin, Cloud's
+  page included, answers 403.
 
 ### 0.1.150
 

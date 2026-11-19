@@ -331,11 +331,19 @@ def web_health():
         state = (view.get("certificate") or {}).get("state") or "?"
         certs[state] = certs.get(state, 0) + 1
     sync = io_web.get("exposures") or {}
-    print("%-10s exposures=%d enabled=%d cert=%s route=%s io.web=%s%s(ack %s of %s)%s" % (
+    # Since 0.1.151 (io.web stage 2.2): what io.web holds open and the upstream failures, summed over
+    # its exposures (extensions.web.exposures.per_exposure), and the origins of Cloud's page.
+    held = (((io_web.get("answer") or {}).get("extensions") or {}).get("web") or {}).get("exposures") or {}
+    per = [x for x in held.get("per_exposure") or [] if isinstance(x, dict)]
+    opened = sum(sum(v for v in (x.get("open") or {}).values() if isinstance(v, int)) for x in per)
+    failed = sum(x.get("upstream_failures") or 0 for x in per)
+    proxy = " open=%d fail=%d origins=%d" % (opened, failed, len(web.get("cloud_origins") or [])) \
+        if "cloud_origins" in web else ""
+    print("%-10s exposures=%d enabled=%d cert=%s route=%s io.web=%s%s(ack %s of %s)%s%s" % (
         "web", len(views), sum(1 for v in views if v.get("state") == "enabled"),
         ",".join("%s:%d" % kv for kv in sorted(certs.items())) or "none", routes.get("state"),
         io_web.get("state"), health, sync.get("acknowledged_generation"), sync.get("pushed_generation"),
-        " registry=unreadable" if web.get("state") == "unreadable" else ""))
+        proxy, " registry=unreadable" if web.get("state") == "unreadable" else ""))
 
 
 def utc_stamp(epoch):

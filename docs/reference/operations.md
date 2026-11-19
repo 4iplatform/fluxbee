@@ -1140,7 +1140,7 @@ SY.admin follow:
 
 ```text
 edge-cert  acme=on names=hive-k3m9x7q2.fluxbee.ai,archi.hive-k3m9x7q2.fluxbee.ai conditions=none
-web        exposures=1 enabled=1 cert=covered:1 route=acknowledged io.web=running(ack 1763121600123 of 1763121600123)
+web        exposures=1 enabled=1 cert=covered:1 route=acknowledged io.web=running(ack 1763121600123 of 1763121600123) open=1 fail=0 origins=1
 ```
 
 - `edge-cert` (`GET /acme/status`): a `critical` condition fails the check.
@@ -1149,7 +1149,10 @@ web        exposures=1 enabled=1 cert=covered:1 route=acknowledged io.web=runnin
   `pending`, `waiting_dns`, `failed`, `held`, `off`), the edge's answer to the routes
   (`routes.state`), and io.web's state, with its health when it reports one other than `HEALTHY`,
   and the generation of the exposures' set it acknowledged of the one SY.admin pushed last
-  (`ack <held> of <pushed>`); ` registry=unreadable` when SY.admin cannot read its
+  (`ack <held> of <pushed>`). Since 0.1.151 ([io-web-v2-stage-2-2](../io-web-v2-stage-2-2.md) §5)
+  it adds what io.web holds open (`open`: requests waiting, streams and WebSockets, summed over
+  the exposures), the upstream failures it counted (`fail`) and how many origins of Cloud's page
+  may frame the exposures (`origins`). ` registry=unreadable` when SY.admin cannot read its
   `exposures.json`. It never fails the check: io.web runs only once the operator starts it, and
   the edge and io.web answer again within a minute of a restart.
 
