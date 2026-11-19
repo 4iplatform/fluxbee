@@ -469,7 +469,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `cognition_clear` | `SY.cognition@<hive>` | `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` (`handle_cognition_clear`) |
 | `node_control_config_get/set`, `send_node_message` | the node; a bare name is a node of the path's hive, and a name of another hive is refused (`node_name_on_hive`, FINDINGS A-127) | `CONFIG_GET`, `CONFIG_SET`; the message as given, with no answer awaited |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
-| `publish_cloud_endpoint` | `SY.orchestrator@motherbee` (the record), then `SY.vault@motherbee` and the edge (its externalize, the token's mint), then `IO.cloud@motherbee`, then, when the door moved, the edge it moved from | the record first (FINDINGS A-317, since 0.1.139): `get_node_config` of IO.cloud, then `set_node_config` of its `io` with `io.edge_node`, the rest of it as read (`msg_type: admin`; each tried once more at once, `record_cloud_edge`); then `VAULT_*`, `EDGE_OPEN_URL`; then `CONFIG_GET` and, unless IO.cloud trusts that edge already, a `CONFIG_SET` of its live config with the edge at its `config_version` + 1; a `CONFIG_SET` refused as stale or not answered is tried once more on the config read again; 30 s in all (`apply_cloud_edge`, FINDINGS A-255); last, when the config named another edge before and the running IO.cloud trusts the new one, `EDGE_CLOSE_URL` of IO.cloud's channel to that edge, tried once more at once (`settle_moved_cloud_door`, `close_moved_cloud_door`). One run at a time (`cloud_door_lock`, in SY.admin's context): one asked while another runs is refused at once, `409 BUSY` with `payload.retryable: true`, nothing read, recorded or minted (`cloud_door_busy`, since 0.1.139's integration review; it waited for the lock with no bound, past what a plan's run waits, and then answered a token no one read). `edge_node` must be `SY.edge@<hive>`, and a `cloud_node` that is not IO.cloud is refused, before anything is read or recorded. The answer says `edge_applied`; `false` comes with a `warning` that says why: the edge recorded but not applied yet, SY.admin unable to check what IO.cloud trusts, or another config that reached IO.cloud meanwhile and may have replaced the record. A door moved to another edge: `previous_edge_node` names the edge it moved from and `previous_edge_closed` says whether its door closed; one that did not close is in the `warning` too, with the `unexternalize` that closes it once that edge answers. When IO.cloud did not take the new edge, or SY.admin could not tell (`edge_applied: false`), the old door is left open, not asked to close (A-317's review): IO.cloud may still trust the old edge, whose door is then the Cloud's only way in; the `warning` says to close it once IO.cloud trusts the new edge and the Cloud has the new URL and token. The previous token stops at once on a move; on a rotation on the same edge it works for up to 10 minutes (SY.edge's grace, in its memory: the edge keeps one previous token, and a restart or another run ends it sooner). Nothing extends it. A record whose read or write fails twice answers `502 CONFIG_RECORD_FAILED` before anything is minted (FINDINGS A-273, A-317): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. Only when a try of the write got no answer (HTTP 504, or none at all) does the detail say it may have been written all the same, and on a move to put `io.edge_node` back to the old edge first (`cloud_edge_maybe_written`): IO.cloud would otherwise trust, from its next start, an edge with no door. The cause is fixed first, then `publish_cloud_endpoint` runs again, on the motherbee's HTTP API (`POST /hives/motherbee/cloud/endpoint`) or through Archi, which since 0.1.139 shows the token once and keeps it masked (FINDINGS A-124; before, never through Archi). Up to 0.1.138 the record came after the token, and that answer left the door open with a token no one received. A door that does not open (the externalize's error) puts the record back as it was, tried once more at once (`put_back_cloud_edge_record`), and the error's detail says so, or that IO.cloud's config still names the edge. When the edge refused the open or did not answer it, the vault had already taken the token this run minted, which no one received: SY.admin first rolls `edge_channel_secret:<ich>` back to the token before it (`VAULT_ROLLBACK` to SY.vault, 5 s, `roll_back_cloud_token`; the operator's call of 2026-11-12 on FINDINGS A-317), so the vault holds the token the door served before the run, and the detail says it rolled back (`cloud_token_said`): on a rotation on the same edge, when the edge refused the open or the router did not reach it, the token that edge serves and reads again when it restarts; on a move, the old edge's, though the key stays the new edge's (this run's put made it the owner, and a rollback does not change it), so the old edge reads none once it restarts and the run goes again on an edge that answers. An edge that did not answer the open (`StoredChannelToken`'s `open_unanswered`: any error of `EDGE_OPEN_URL` but the router's `UNREACHABLE` or `TTL_EXCEEDED`, `never_reached`; a 15 s timeout above all) may have taken it all the same: SY.edge answers an open, then reads its token from the vault, and the rollback reaches the vault, not the edge's memory (a `VAULT_SECRET_CHANGED` re-reads only an entry with no token). It then serves this run's token until it restarts, and on a rotation the Cloud's beside it only for up to 10 minutes after the open (its grace); the detail says so, and that the run goes again on an edge that answers (0.1.139's integration review). A rollback SY.vault refused, or that did not reach it, changed nothing and is asked once more at once; one SY.vault did not answer in time is not asked again, since a rollback swaps the token and the one before it; `NO_PREVIOUS_VERSION` means no token before this run. Each of these is logged, nothing asks again later, and the detail says the vault then holds (or, unanswered, may hold) the token no one received, which the edge the door was on reads when it restarts (after a move it reads none, the key being the new edge's). Such a run takes up to 235 s by its bounds, within Archi's 240 s. A token goes out once, only in an ok answer, and in no error or log line |
+| `publish_cloud_endpoint` | `SY.orchestrator@motherbee` (the record), then `SY.vault@motherbee` and the edge (its externalize, the token's mint), then `IO.cloud@motherbee` and, when the run names `cloud_origins`, the public edge and `IO.web@motherbee`, then, when the door moved, the edge it moved from | the record first (FINDINGS A-317, since 0.1.139): `get_node_config` of IO.cloud, then `set_node_config` of its `io` with `io.edge_node`, the rest of it as read (`msg_type: admin`; each tried once more at once, `record_cloud_edge`); then `VAULT_*`, `EDGE_OPEN_URL`; then `CONFIG_GET` and, unless IO.cloud trusts that edge already, a `CONFIG_SET` of its live config with the edge at its `config_version` + 1; a `CONFIG_SET` refused as stale or not answered is tried once more on the config read again; 30 s in all (`apply_cloud_edge`, FINDINGS A-255); last, when the config named another edge before and the running IO.cloud trusts the new one, `EDGE_CLOSE_URL` of IO.cloud's channel to that edge, tried once more at once (`settle_moved_cloud_door`, `close_moved_cloud_door`). One run at a time (`cloud_door_lock`, in SY.admin's context): one asked while another runs is refused at once, `409 BUSY` with `payload.retryable: true`, nothing read, recorded or minted (`cloud_door_busy`, since 0.1.139's integration review; it waited for the lock with no bound, past what a plan's run waits, and then answered a token no one read). `edge_node` must be `SY.edge@<hive>`, and a `cloud_node` that is not IO.cloud is refused, before anything is read or recorded. The answer says `edge_applied`; `false` comes with a `warning` that says why: the edge recorded but not applied yet, SY.admin unable to check what IO.cloud trusts, or another config that reached IO.cloud meanwhile and may have replaced the record. A door moved to another edge: `previous_edge_node` names the edge it moved from and `previous_edge_closed` says whether its door closed; one that did not close is in the `warning` too, with the `unexternalize` that closes it once that edge answers. When IO.cloud did not take the new edge, or SY.admin could not tell (`edge_applied: false`), the old door is left open, not asked to close (A-317's review): IO.cloud may still trust the old edge, whose door is then the Cloud's only way in; the `warning` says to close it once IO.cloud trusts the new edge and the Cloud has the new URL and token. The previous token stops at once on a move; on a rotation on the same edge it works for up to 10 minutes (SY.edge's grace, in its memory: the edge keeps one previous token, and a restart or another run ends it sooner). Nothing extends it. A record whose read or write fails twice answers `502 CONFIG_RECORD_FAILED` before anything is minted (FINDINGS A-273, A-317): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. Only when a try of the write got no answer (HTTP 504, or none at all) does the detail say it may have been written all the same, and on a move to put `io.edge_node` back to the old edge first (`cloud_edge_maybe_written`): IO.cloud would otherwise trust, from its next start, an edge with no door. The cause is fixed first, then `publish_cloud_endpoint` runs again, on the motherbee's HTTP API (`POST /hives/motherbee/cloud/endpoint`) or through Archi, which since 0.1.139 shows the token once and keeps it masked (FINDINGS A-124; before, never through Archi). Up to 0.1.138 the record came after the token, and that answer left the door open with a token no one received. A door that does not open (the externalize's error) puts the record back as it was, tried once more at once (`put_back_cloud_edge_record`), and the error's detail says so, or that IO.cloud's config still names the edge. When the edge refused the open or did not answer it, the vault had already taken the token this run minted, which no one received: SY.admin first rolls `edge_channel_secret:<ich>` back to the token before it (`VAULT_ROLLBACK` to SY.vault, 5 s, `roll_back_cloud_token`; the operator's call of 2026-11-12 on FINDINGS A-317), so the vault holds the token the door served before the run, and the detail says it rolled back (`cloud_token_said`): on a rotation on the same edge, when the edge refused the open or the router did not reach it, the token that edge serves and reads again when it restarts; on a move, the old edge's, though the key stays the new edge's (this run's put made it the owner, and a rollback does not change it), so the old edge reads none once it restarts and the run goes again on an edge that answers. An edge that did not answer the open (`StoredChannelToken`'s `open_unanswered`: any error of `EDGE_OPEN_URL` but the router's `UNREACHABLE` or `TTL_EXCEEDED`, `never_reached`; a 15 s timeout above all) may have taken it all the same: SY.edge answers an open, then reads its token from the vault, and the rollback reaches the vault, not the edge's memory (a `VAULT_SECRET_CHANGED` re-reads only an entry with no token). It then serves this run's token until it restarts, and on a rotation the Cloud's beside it only for up to 10 minutes after the open (its grace); the detail says so, and that the run goes again on an edge that answers (0.1.139's integration review). A rollback SY.vault refused, or that did not reach it, changed nothing and is asked once more at once; one SY.vault did not answer in time is not asked again, since a rollback swaps the token and the one before it; `NO_PREVIOUS_VERSION` means no token before this run. Each of these is logged, nothing asks again later, and the detail says the vault then holds (or, unanswered, may hold) the token no one received, which the edge the door was on reads when it restarts (after a move it reads none, the key being the new edge's). Such a run takes up to 235 s by its bounds, within Archi's 240 s. A token goes out once, only in an ok answer, and in no error or log line. When the run names `cloud_origins`, once its door is open and beside the apply to IO.cloud: the exposure lock waited for, the exposures registry written, then `EDGE_WEB_ROUTES` (with `frame_origins`) and `IO_WEB_EXPOSURES` (with `cloud_origins`) together, 5 s each ([Cloud's origins](#clouds-origins)); beside the apply's 30 s, they add nothing to the run's bounds |
 | `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
 | `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
 | `list_published_artifacts` | answered by SY.admin from its publication ledger | |
@@ -1905,7 +1905,8 @@ Source: `src/bin/sy_admin/exposures.rs`.
   `publications.json` is (a temporary file of mode 0640, synced, renamed) and held in memory:
   each exposure's id (`exp:<uuid>`), label, host, upstream, `published_at`, `published_by`
   (`cloud`) and its live enablements, at most two, the current one and the one it renewed (id,
-  `from`, `until`, its key's slot and version, never the key). Its `generation` is
+  `from`, `until`, its key's slot and version, never the key), and Cloud's origins
+  (`cloud_origins`, [Cloud's origins](#clouds-origins)). Its `generation` is
   `max(previous + 1, now in ms)` at each write, so it never goes back, even after the file is
   lost. An opening change (publish, enable) writes the file before it opens anything; a closing
   one (disable, unpublish) acts first, in memory and in the pushes, then writes, and a write that
@@ -1965,7 +1966,8 @@ Source: `src/bin/sy_admin/exposures.rs`.
   answering is `503 IO_WEB_UNAVAILABLE` with `payload.retryable: true`.
 - **Each call waits 5 s** (`EXPOSURE_CALL_TIMEOUT`): a vault put, a push, a link. A push
   unanswered in an action comes back `pending` in its answer, for the loops to send again.
-- **io.web's set** (`IO_WEB_EXPOSURES`: the whole set with its generation, never a secret) goes at
+- **io.web's set** (`IO_WEB_EXPOSURES`: the whole set with its generation and Cloud's origins,
+  never a secret) goes at
   each change and every 60 s from the start (`Exposures::run_io_web`, 20 s each), which first
   writes, under the exposure lock, what a closing change left unwritten. io.web's answer is kept:
   the generation it holds and whether it holds each live enablement's key; the answer to a push a
@@ -1991,6 +1993,58 @@ Source: `src/bin/sy_admin/exposures.rs`.
   the edge's 502 until `start_node IO.web@motherbee` runs it again (its instance stays, so
   `run_node` answers `NODE_ALREADY_EXISTS`).
 
+## Cloud's origins
+
+The origins of the Fluxbee Cloud page that manages the hive, which may frame its exposures
+([io-web-v2](../io-web-v2.md) §13.7, [io-web-v2-stage-2-2](../io-web-v2-stage-2-2.md) §2): the
+edge and io.web name them in the `frame-ancestors` of their answers, and nobody else frames. The
+operator names them in `publish_cloud_endpoint`, since 0.1.150; the upstreams behind the
+exposures, Archi's website among them, never see them. Source: `handle_publish_cloud_endpoint` and `keep_cloud_origins` in `src/bin/sy_admin.rs`,
+`cloud_origins_param`, `check_cloud_origin` and `Exposures::set_cloud_origins` in
+`src/bin/sy_admin/exposures.rs`.
+
+- **The field**, `cloud_origins`, optional. Absent, or null (what the executor gives a field a plan
+  does not name), keeps the origins kept, so a run that only rotates a lost token names none. `[]`
+  clears them, and nobody frames.
+- **Each origin** is `https://<host>` with an optional port, written as a browser writes an origin:
+  lowercase as given, never folded; a DNS host, never an IP literal, nor a host whose last label is
+  a number, which a browser reads as one; no user, path (not even `/`), query, fragment or
+  wildcard; a port of 1 to 65535 with no leading zero, never `:443`, which an origin leaves out. At
+  most 4, none twice. Anything else is `400 INVALID_REQUEST`, which names the origin and the rule,
+  before anything is read or minted, as `edge_node`'s check is.
+- **An origin outside the hive's own domain** is taken, but frames a page whose session cookie
+  does not travel: Cloud's page and every exposure host under `fluxbee.ai` are one site, and
+  io.web's cookie (`__Host-`, `SameSite=Strict`) crosses to no other site (io-web-v2 §13.1,
+  decision 4). The answer says nothing of it.
+- **Where they are kept**: the exposures registry, as `cloud_origins` beside the exposures. Its
+  schema stays 1: a file written before 2.2 names none, and loads with none.
+- **When**: once the run's door is open, beside the apply to IO.cloud. The two run together, so the
+  run stays within the 240 s Archi waits for it. A door that does not open changes none of them.
+- **The write** waits for the exposure lock, where an exposure change answers `409 BUSY`: the token
+  has rotated by then, so the run does not give its origins up, and an exposure change holds the
+  lock only for its own calls, 5 s each. Memory takes them with a new generation, so io.web's
+  shortcut for a set of the generation it holds never hides them, then the file. A write that
+  fails is kept in memory, pushed, and written again every minute, as a closing change's is.
+- **An unreadable registry**: while the registry could not be read at SY.admin's start, it is never
+  written, so a run that names them is refused, `500 RECORD_FAILED`, before anything is read or
+  minted. The token the Cloud holds works as before.
+- **The pushes** follow the write at once, the edge's routes and io.web's set together, 5 s each,
+  as the exposure actions push them; every push after them carries them too:
+  - `EDGE_WEB_ROUTES` carries them as `frame_origins` beside `routes`, only when there is one. An
+    edge before 2.2 refuses any field it does not know and keeps its last set, so every edge runs
+    2.2 before the first origin is named;
+  - `IO_WEB_EXPOSURES` carries them as `cloud_origins`, absent on the wire while there is none.
+- **The answer** names the origins kept (`cloud_origins`). When the run named them,
+  `cloud_origins_persisted` says whether the file holds them, and `false` comes with a `warning`.
+- **Changing them is a run**, so it rotates Cloud's token, which the Cloud gets at once: on a hive
+  whose door is published, one rotation when 2.2 arrives, then one each time Cloud's page moves.
+- **`GET /web/status`** shows them (`web.cloud_origins`) and the `frame_origins` the edge
+  acknowledged (`routes.acknowledged_frame_origins`). io.web takes them with the generation it
+  acknowledges (`io_web.exposures.acknowledged_generation`).
+- **The log**: one line per run that names them, `publish_cloud_endpoint: Fluxbee Cloud's origins
+  kept and pushed`, with the origins, the generation, whether the file holds them and each push's
+  answer.
+
 ## The web routes
 
 SY.admin pushes the published exposures' hosts to the public edge, which serves them only through
@@ -2003,15 +2057,18 @@ io.web, never through `/e/` or `/public/` ([docs/io-web-v2.md](../io-web-v2.md) 
   at boot.
 - **The push** (`WebRoutes::push_once`): at the start and every 60 s, SY.admin's own loop
   (`WebRoutes::run`, 20 s each; the ACME check runs every 6 h), and at each publish and unpublish
-  (5 s), SY.admin sends `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}]}` with every
-  published host to the public edge as the ACME client resolves it (`admin.public_edge_node`, else
-  the one connected ingress). The edge takes it on its TLS command channel. Each push carries the
+  (5 s), SY.admin sends `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}], frame_origins}`
+  with every published host to the public edge as the ACME client resolves it
+  (`admin.public_edge_node`, else the one connected ingress). `frame_origins`, Cloud's origins
+  ([Cloud's origins](#clouds-origins)), goes only when there is one: an edge before 2.2 refuses
+  the field. The edge takes it on its TLS command channel. Each push carries the
   full set, an empty one with nothing published or while the registry cannot be read, so an
   unpublished host leaves the edge at once. One push at a time, its set read once it goes: an
   older set never overtakes a newer one.
 - **The answer** is kept in memory: the edge, `acknowledged`, `refused`, `no_answer` or `no_edge`
-  with its detail, since when, when the edge last acknowledged a set and that set's hosts. An
-  acknowledgement also carries the edge's proxy to io.web (`upstream`: `ready` or `unavailable`
+  with its detail, since when, when the edge last acknowledged a set, that set's hosts and the
+  `frame_origins` the acknowledgement names beside its routes (none from an edge that names none).
+  An acknowledgement also carries the edge's proxy to io.web (`upstream`: `ready` or `unavailable`
   with its reason, and the last request io.web did not answer, its time and kind), kept with that
   push (`EdgeWebUpstream`). Only a change of edge or of answer is logged, the detail included (a
   timeout reads `no answer in 20s`, so repeated ones are no change), never a change of upstream:
@@ -2030,10 +2087,10 @@ states, named in the answer. Source: `handle_web_status` and `io_web_status` in
 
 | Part | What it says | From |
 | --- | --- | --- |
-| `web` | `state`: `published` (with `hosts`, the published exposures' hosts), `none`, or `unreadable` (the registry could not be read at boot; `reason` says why) | the exposures registry |
+| `web` | `state`: `published` (with `hosts`, the published exposures' hosts), `none`, or `unreadable` (the registry could not be read at boot; `reason` says why); `cloud_origins`, the origins of Cloud's page that may frame the exposures ([Cloud's origins](#clouds-origins)) | the exposures registry |
 | `exposures` | each exposure's view ([The exposures](#the-exposures)) | the registry, the ACME client, the routes' and io.web's last answers |
 | `certificate` | `acme` (the client's `config.state`); `names`, the names it certifies (the main one, then the published hosts); `served`, the `names` and `not_after` of the leaf the edge served at the client's last look; `last_answer_at`, the edge's last answer to the client; `hosts_missing`, the published hosts that leaf does not cover (null without a leaf) | the ACME client, with no call to the edge: `config.names` and `edge.last_seen` of `GET /acme/status`, which asks the edge afresh |
-| `routes` | `state`: `acknowledged`, `refused`, `no_answer`, `no_edge`, or `not_pushed` before the first push; `edge`, `set` (the full set every push carries), `detail`, `since_at` and `acknowledged_at`; `upstream`, the edge's way to io.web as its acknowledgement reported it (null for any other answer): `state` `ready` or `unavailable` (then every web host answers 502), `reason` (what the edge found missing at its boot), `last_failure` (`at`, `kind` of the last request io.web did not answer, or null) | the last push ([The web routes](#the-web-routes)) |
+| `routes` | `state`: `acknowledged`, `refused`, `no_answer`, `no_edge`, or `not_pushed` before the first push; `edge`, `set` (the full set every push carries), `detail`, `since_at` and `acknowledged_at`; `acknowledged_frame_origins`, the `frame_origins` the edge's last acknowledgement named (null before one); `upstream`, the edge's way to io.web as its acknowledgement reported it (null for any other answer): `state` `ready` or `unavailable` (then every web host answers 502), `reason` (what the edge found missing at its boot), `last_failure` (`at`, `kind` of the last request io.web did not answer, or null) | the last push ([The web routes](#the-web-routes)) |
 | `io_web` | `node` (`IO.web@motherbee`), `state`; `lifecycle_state` and `runtime_version`, the orchestrator's view; `answer`, the node's own `NODE_STATUS_GET` answer; `view_error` and `answer_error`; `exposures`, io.web's side of the exposures' pushes: `pushed_generation`, `acknowledged_generation` (the set io.web holds), `last_answer` (`taken` with each live enablement's key `ready` or `unavailable`, `refused` with its `error_code`, `no_answer`, or `absent`: no io.web was reached) and `since` | `get_node_status` to `SY.orchestrator@motherbee` (5 s) and `NODE_STATUS_GET` to `IO.web@motherbee` (3 s), sent together; `exposures` from SY.admin's memory |
 
 `io_web.state`:
@@ -2100,8 +2157,8 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
   last edge status seen and the conditions. An unreadable file is moved aside
   (`acme.json.unreadable-<time>`) and ACME starts empty.
 - `/var/lib/fluxbee/state/sy-admin/exposures.json`: io.web's exposures, written atomically, never
-  a key: the generation and each exposure with its live enablements
-  ([The exposures](#the-exposures)). An unreadable file is kept as it is, and every exposure
+  a key: the generation, each exposure with its live enablements
+  ([The exposures](#the-exposures)) and Cloud's origins ([Cloud's origins](#clouds-origins)). An unreadable file is kept as it is, and every exposure
   change is refused until the operator removes it, never repairs it, and restarts SY.admin.
 - `/var/lib/fluxbee/state/sy-admin/installation-update.json`: the installation's update, written
   atomically: the open update with each hive's state, outcome and next step, and the last 20
@@ -2251,7 +2308,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_drift_alerts` | `GET /hives/{hive}/drift-alerts` | List historical drift alerts for one hive. |
 | `set_storage` | `PUT /config/storage` | Persist storage configuration changes. |
 | `update` | `POST /hives/{hive}/update` | Run hive update workflow. |
-| `publish_cloud_endpoint` | `POST /hives/{hive}/cloud/endpoint` | Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). |
+| `publish_cloud_endpoint` | `POST /hives/{hive}/cloud/endpoint` | Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). `cloud_origins` names the origins of the Fluxbee Cloud page that may frame the hive's exposures ([Cloud's origins](#clouds-origins)). |
 | `sync_hint` | `POST /hives/{hive}/sync-hint` | Trigger a sync hint workflow. |
 | `inventory` | `GET /inventory`<br>`GET /inventory/summary`<br>`GET /inventory/{hive}`<br>`GET /hives/{hive}/inventory/summary`<br>`GET /hives/{hive}/status` | Read global or per-hive inventory, including system-wide node visibility. |
 | `opa_compile_apply` | `POST /opa/policy` | Compile the user OPA policy on the motherbee and apply it on every hive (one global policy). |

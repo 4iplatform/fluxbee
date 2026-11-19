@@ -1318,6 +1318,26 @@ open exposure's key. `/acme/status` shows the certificate's names and DNS resolu
 - hive.yaml's `web:` section is retired: Archi's own host is the exposure Cloud publishes with the
   upstream `archi`. A `web:` left in hive.yaml is ignored.
 
+**Cloud's origins** (since 0.1.150, [io-web-v2-stage-2-2](../io-web-v2-stage-2-2.md) §2).
+`publish_cloud_endpoint` takes an optional `cloud_origins`: the origins of the page of the Fluxbee
+Cloud that manages this hive, `https://cloud.fluxbee.ai` for one, the only page that may frame its
+exposures.
+
+- Each is `https://<host>` with an optional port, lowercase as written, with no path (not even
+  `/`), no `:443` and never an IP; at most 4, none twice. Anything else is refused
+  (`INVALID_REQUEST`, naming the origin and the rule) before anything is minted.
+- Absent keeps the ones kept, so a run that only rotates a lost token names none. `[]` clears
+  them: no page frames an exposure, which then opens only in its own tab.
+- **Changing them is running `publish_cloud_endpoint` again**, in a plan the operator confirms, and
+  that rotates Cloud's token: say so before staging it, and the new token goes to the Cloud's
+  operator at once (§4.5.1). Ask the operator for the origins; never guess them.
+- An origin outside the hive's own domain is taken, but the session cookie does not travel into
+  its page, so an exposure does not open inside it.
+- When SY.admin could not write them to its file, the run's `warning` says so: it holds them in
+  memory and writes them again every minute. To see the origins kept, read `/web/status`:
+  `web.cloud_origins`, and what the edge took, `routes.acknowledged_frame_origins`.
+- Nothing changes for you: your own page works the same inside Cloud's frame as on your port.
+
 ### 4.4 SY nodes
 
 Every `SY.*` node is a core node, system infrastructure (an `RT.*` name is the router's own, a
@@ -1761,7 +1781,8 @@ Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fl
   their private channel (Fluxbee Cloud's token goes to the Cloud's operator, never in a chat).
 - If the operator lost it: it is not kept anywhere they can read. For the Cloud's token, publishing
   again (`publish_cloud_endpoint`, a plan they confirm) mints a new one, which the Cloud must get at
-  once; say so before staging it. One publish runs at a time: one asked while another runs is
+  once; say so before staging it. A run that changes Cloud's origins (`cloud_origins`, §4.3.2)
+  mints a new one the same way. One publish runs at a time: one asked while another runs is
   refused at once, `BUSY` with `payload.retryable` true, nothing read or minted (since 0.1.139), so
   offer to stage it again once the other has answered.
 - A step of those three actions never carries `executor_fill`: SY.admin's executor would run it
