@@ -290,6 +290,24 @@ async fn main() -> Result<(), SyEdgeError> {
         &registry,
     )
     .await;
+    // A channel whose secret the vault did not give at boot (the vault not reachable yet, as when
+    // the ingress restarts before the motherbee answers) refuses every request until it resolves:
+    // it is asked again every 30 s (FINDINGS A-353). With every secret resolved it asks nothing.
+    {
+        let dispatcher = Arc::clone(&dispatcher);
+        let registry = Arc::clone(&registry);
+        let (self_ilk, self_name) = (self_ilk.clone(), self_name.clone());
+        let vault_hive = config.vault_hive.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(30));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                resolve_secrets(&dispatcher, &self_ilk, &self_name, &vault_hive, &registry).await;
+            }
+        });
+    }
 
     // The public listener's TLS (docs/acme-edge-certificates-v1.md §4), shared by the acceptor,
     // the TLS command task, the vault notices of the loop below and the awaiting re-reads. `None`

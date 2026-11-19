@@ -4777,6 +4777,15 @@ impl AcmeService {
                 )
             }
         }
+        // A run in flight may be the very order that carries this host: the budget it spent at its
+        // start would read as held until it ends (FINDINGS A-354). It ends within seconds.
+        if lock(&self.slot).is_some() {
+            return answer(
+                "pending",
+                Some("an ACME run is in flight: read it again shortly".to_string()),
+                None,
+            );
+        }
         let orderable = self.orderable_names(&settings, &view);
         let renew_at = leaf.map(|leaf| renewal_point(&state, leaf));
         match decide(&view, &settings, &state, renew_at, &orderable, now) {

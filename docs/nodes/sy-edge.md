@@ -69,7 +69,9 @@ the secret cannot be read it starts AWAITING and re-reads on its own (see TLS be
    converts a file that still holds capability keys, see State on disk), and the web hosts from
    `web_routes_path` (`WebRouteTable::load`).
 5. Fetches channel secrets from the vault for rows that carry only a `secret_ref` or
-   `verify_token_ref` (`resolve_secrets`).
+   `verify_token_ref` (`resolve_secrets`). A channel whose secret the vault did not give (the
+   vault not reachable yet, as when the ingress restarts before the motherbee answers) refuses
+   every request, 401, until it resolves: the edge asks again every 30 s (FINDINGS A-353).
 6. If a public listener is configured (ingress role, or `SY_EDGE_HTTP_LISTEN`): resolves the TLS
    mode (`TlsMode::resolve`) and builds it, then starts the HTTP frontend (`run_frontend`).
    - `vault`: one read of the secret (`start_vault_tls`). If it cannot be served, the edge starts

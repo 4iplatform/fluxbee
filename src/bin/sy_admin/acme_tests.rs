@@ -2082,6 +2082,29 @@ async fn a_test_order_carries_every_name_and_never_falls_back() {
 // The published hosts (docs/io-web-v2-stage-2-1.md §5.2)
 // ---------------------------------------------------------------------------------------------
 
+/// FINDINGS A-354: while an ACME run is in flight, a published host the leaf does not cover reads
+/// pending, not held: the run may be the very name-change order that carries it, whose start spent
+/// the budget that holds the host otherwise (on 8.x, 2026-11-19: `held` for the order's 8 s).
+#[tokio::test]
+async fn a_host_reads_pending_while_a_run_is_in_flight() {
+    let h = Harness::on();
+    h.install_first().await;
+    h.advance(DAY);
+    h.publish(&[ARCHI]);
+    h.service.check_once().await;
+    assert_eq!(h.service.host_certificate(ARCHI)["state"], "covered");
+    let shop = format!("shop.{NAME}");
+    h.publish(&[ARCHI, shop.as_str()]);
+    h.service.check_once().await;
+    assert_eq!(
+        h.service.host_certificate(&shop)["state"],
+        "held",
+        "the budget holds a second name-change order"
+    );
+    let _slot = h.service.try_begin(RunKind::Check).expect("the slot");
+    assert_eq!(h.service.host_certificate(&shop)["state"], "pending");
+}
+
 /// A published host the leaf this account issued misses is ordered at once, outside the cap of one
 /// issuance per third of the lifetime: the order carries the main name and the host, and replaces
 /// the leaf. Its view goes from pending to covered.
