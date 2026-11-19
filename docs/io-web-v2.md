@@ -609,7 +609,7 @@ two stages (Archi in its own tab, then in Cloud's iframe), §12.4's "limits and 
 exposure", and §12.6's steps 2 and 3, which become one. Stage 2.1's exposures, links, sessions and
 registry stay as built.
 
-**Status:** agreed in the talk of 2026-11-19. The points of §13.8 come next in the same talk; then
+**Status:** agreed in the talk of 2026-11-19. The point of §13.9 comes next in the same talk; then
 the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.1.
 
 ### 13.1 Decisions
@@ -834,12 +834,38 @@ comando"*).
     answer is not authenticated, while this datum is the permission to frame Archi.
   - A field of `enable_exposure`, named by Cloud at each enable.
 
-### 13.8 Open: the talk's next points, one at a time
+### 13.8 The `Origin` check on what writes (decided 2026-11-19, option (a))
 
-1. **The `Origin` check on the methods that write** (2.1 §4 already had it for 2.2). Every exposure
-   of every hive shares the site `fluxbee.ai`, so `SameSite=Strict` does not stop a request from a
-   sibling host, another hive's exposure included.
-2. **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
-   gate measures (the SSE cadence, the cut).
+- **Why.** Every `*.fluxbee.ai` host is one site (decision 4), and `SameSite=Strict` stops other
+  sites only, never a sibling. Take a page on a sibling host, such as a third party's exposure on
+  another hive with a hostile page or an XSS. While the operator has Archi open, it can send `POST
+  https://archi.<id>/api/chat`: the browser attaches the session cookie, io.web forwards it, and
+  Archi takes it as typed by the operator. The page cannot read the answer, but the message goes
+  in. `/api/chat` needs no `session_id` (`src/bin/sy_architect.rs:440-445`) and reads its body as
+  JSON whatever its `Content-Type` (:10068-10080), so a plain form, which a browser sends with no
+  preflight, is enough.
+- **The rule.** io.web answers 403, and forwards nothing, when a request writes (POST, PUT, PATCH,
+  DELETE) or opens a WebSocket without coming from the exposure's own page.
+  - From its own page means `Sec-Fetch-Site: same-origin` (or `none`), which every current browser
+    sends.
+  - Without that header, it means an `Origin` equal to `https://<the exposure's host>`.
+  - A request with neither header is not a browser's cross-origin request, and passes.
+  - This is the algorithm of Go's `net/http.CrossOriginProtection` (Go 1.25).
+  - Reads (GET, HEAD) pass as they are.
+- **Archi.** Its page calls its own host only, inside Cloud's frame too: `Sec-Fetch-Site` compares
+  the page that asks with the host it asks. Nothing changes for Archi.
+- **Third parties, later.** A legitimate write from another origin into a system, such as an
+  identity provider's or a payment's POST back, is refused. When single sign-on comes with Cloud as
+  the provider, the exposure also admits Cloud's origins.
+- **Not taken:**
+  - Making each hive a site of its own (`fluxbee.ai` in the Public Suffix List) would stop the
+    siblings at the cookie, but would make Cloud's page another site too: the iframe would become
+    a third party, against decision 4.
+  - Not checking leaves the example open.
+
+### 13.9 Open: the talk's last point
+
+- **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
+  gate measures (the SSE cadence, the cut).
 
 Then the build design, its review, the releases and the gate on 8.x.
