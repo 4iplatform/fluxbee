@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.148** (2026-11-18), and PROD runs **0.1.148** (the router, the Go
+> Contract as of **fluxbee 0.1.149** (2026-11-19), and PROD runs **0.1.149** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1369,6 +1369,17 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.149
+
+- **The door comes back by itself after a restart of the hive's edge** (FINDINGS A-353): when the
+  edge restarted before the hive's vault answered it, the door answered 401 to every request until
+  the edge was restarted by hand (on PROD, for 2 minutes after 0.1.148's installation, on
+  2026-11-19 from 02:34 to 02:36 UTC). Now the edge asks the vault again every 30 s, and the door
+  answers again within about 30 s of the vault. A 401 with the right token is then transient:
+  send it again after 30 s; if it stays, tell the operator.
+- **A new exposure's `certificate.state` reads `pending` while its certificate is ordered**, never
+  `held` for those seconds (A-354); `held` means only that it waits for the hive's own limits.
+
 ### 0.1.148
 
 - **New: exposures** (§5.8), listed by `list_cloud_actions`. Six ops publish a web host of the hive, `<label>.<hive public host>`,
@@ -1694,6 +1705,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.149:** on PROD, 2026-11-19 at 03:11Z (00:11 ART), through the public door with Cloud's token
+(`lab/DEPLOYMENTS.md`, 0.1.149): with the hive's vault frozen and its edge restarted, the door
+answered 401, then 200 3.6 s after the vault answered again, with no restart; a new exposure's
+certificate read `pending`, then `covered` at 9.1 s, never `held`.
 
 **0.1.148:** on PROD, 2026-11-19 from 02:35Z (23:35 ART on 2026-11-18), through the public door with
 Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.148): every op of §5.8. `list_cloud_actions` names the six;

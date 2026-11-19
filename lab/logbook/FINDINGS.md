@@ -423,8 +423,11 @@ no change required
     restarted with sessions and routes back within 3 s; 46 PASS. **Stage 2.1 is complete.** Found
     by the gate: A-353 (Cloud's door down 2 min after the deploy: the edge never asked the vault
     again for a channel secret it missed at boot) and A-354 (a host read `held` during its own
-    order), both built on `coa/fix-149` for 0.1.149. **Next:** 0.1.149, then stage 2.2 (the
-    transparent proxy, Archi in its own tab; A-351).
+    order), both built on `coa/fix-149` for 0.1.149.
+    **0.1.149, A-353 and A-354** ✅ live and checked on 8.x (2026-11-19): with SY.vault frozen and
+    the edge restarted, Cloud's door came back 3.6 s after the thaw with no restart; a new host read
+    pending, then covered in 9.1 s, never held; 12 PASS. **Next:** stage 2.2 (the transparent
+    proxy, Archi in its own tab; A-351), a design talk first.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -523,8 +526,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### General
 
-- A-353 🔴 SY.edge never asks the vault again for a channel secret it could not fetch at boot: the channel refuses every request (401) until a restart (high; SY.edge; found by 0.1.148's gate: Cloud's door down 2 min after the deploy; built on `coa/fix-149` for 0.1.149).
-- A-354 🔵 A published host reads `held` while its own name-change order runs (low; SY.admin's ACME; found by 0.1.148's gate; built on `coa/fix-149` for 0.1.149).
 
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
@@ -1630,7 +1631,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-354 [General/admin] 🔵 low (found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code) — a published host reads `held` while its own name-change order runs
+### A-354 [General/admin] ✅ VALIDATED ON 8.x (0.1.149, 2026-11-19; a new exposure host read pending, then covered at 9.1 s, never held) (low; found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code) — a published host reads `held` while its own name-change order runs
 
 - **Why:** `host_certificate` (`src/bin/sy_admin/acme.rs` ~4724) asks `decide`, whose
   `gate_name_change` holds a host by the name-change budget (one order per 15 min); the order that
@@ -1642,7 +1643,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not cover reads `pending` (`a_host_reads_pending_while_a_run_is_in_flight`, which fails without
   it).
 
-### A-353 [General/edge] 🔴 high (found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code; there since the edge's warm start) — SY.edge never asks the vault again for a channel secret it could not fetch at boot
+### A-353 [General/edge] ✅ VALIDATED ON 8.x (0.1.149, 2026-11-19; with SY.vault frozen and the edge restarted, Cloud's door answered 401, then 200 3.6 s after the thaw, with no restart) (high; found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code; there since the edge's warm start) — SY.edge never asks the vault again for a channel secret it could not fetch at boot
 
 - **Why:** the edge resolves a channel's secret at boot, at an `EDGE_OPEN_URL` and at a
   `VAULT_SECRET_CHANGED` (`resolve_secrets`, `src/bin/sy_edge.rs` ~3435; its calls ~285, ~477,
