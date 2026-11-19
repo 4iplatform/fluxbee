@@ -509,6 +509,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   with §13.9.
 - A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
 - A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
+- A-356, A-357 🔵 SY.admin's executor contract: `publish_cloud_endpoint`'s `cloud_node` among the required fields (low); `vault_assign`'s lists read as strings (medium); built for 0.1.151.
 - A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
 ### Archi
@@ -1644,6 +1645,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-357 [General/admin] 🔵 BUILT for 0.1.151 (`coa/fix-151-contract`) (medium; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run; there since `vault_assign`'s contract) — the executor's schema reads `vault_assign`'s lists as strings, so a plan step that passes a list is refused
+
+- **Why:** `vault_assign`'s optional fields `assigned_nodes` and `assigned_ilks` were typed
+  `array<string>` (`admin_action_body_optional_fields`, `src/bin/sy_admin.rs` ~18063-18072), and
+  `admin_contract_field_schema` (~2240) makes an array only of a type written `T[]` (~2265); any
+  other type falls to a string. Archi's executor validates a plan step against that schema, so a
+  step that assigns a secret to nodes with a list fails with "expected string".
+- **Fix:** both typed `string[]`, as every other list field is; the test
+  `the_executor_s_schemas_take_lists_as_arrays_and_cloud_node_as_optional`.
+
+### A-356 [General/admin] 🔵 BUILT for 0.1.151 (`coa/fix-151-contract`) (low; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run) — `publish_cloud_endpoint`'s `cloud_node` sits among the required fields, so every plan step must name it
+
+- **Why:** its description says "Optional. Defaults to IO.cloud@<hive>", but it was listed in
+  `admin_action_body_required_fields` (`src/bin/sy_admin.rs` ~17831), whose fields go into the
+  executor schema's `required`.
+- **Fix:** moved to `admin_action_body_optional_fields`, beside `cloud_origins`; the same test.
+- **Seen with it (info, no change):** Archi's execution report keeps only an allowlist of answer
+  fields (`PAYLOAD_FIELDS`, `src/bin/sy_architect/execution_report.rs` ~72): `warning` is in it,
+  `cloud_origins` and `cloud_origins_persisted` are not. Archi learns of an origins write that
+  failed through the warning, and its handbook sends it to `GET /web/status` for the origins.
 
 ### A-355 [io.web] 🔵 design, for the next Rust SDK release (found 2026-11-19 by io.web stage 2.2's design review; read in the code) — Fluxbee's own ports are listed in SY.admin alone, and io.web needs them too
 
