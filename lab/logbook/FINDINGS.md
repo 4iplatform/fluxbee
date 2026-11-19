@@ -116,7 +116,8 @@ no change required
       3b ✅ 0.1.121, the installation file in use; 3c ✅ 0.1.122, the operator's action; stage 4
       ✅ 0.1.123, SY.admin's installation update with its automatic step. Next, stage 5: the blob
       folders' members (A-181's first half) and A-188.
-   2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
+   2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142;
+      decided on 2026-11-19 for io.web stage 2.2: the proxy has no wait of its own).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
    4. io.web's stage 2, on the operator's definition of its security.
@@ -428,6 +429,12 @@ no change required
     the edge restarted, Cloud's door came back 3.6 s after the thaw with no restart; a new host read
     pending, then covered in 9.1 s, never held; 12 PASS. **Next:** stage 2.2 (the transparent
     proxy, Archi in its own tab; A-351), a design talk first.
+    **Stage 2.2's design talk (2026-11-19):** what is left was redefined with the operator
+    ([io-web-v2](../../docs/io-web-v2.md) §13): a transparent proxy, straight to Cloud's iframe (no
+    stage in its own tab); no time, size or rewrite of the proxy's own (A-142 settled for the
+    proxy); SSE frame by frame; what is open cut at once when the access ends; a renewal
+    interrupts nobody; A-351 agreed. The talk goes on with §13.7 (the headers and Cloud's origin,
+    the `Origin` check, observability and the gate), then the build design.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -491,15 +498,16 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### io.web
 
-- Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12): stage 2.1 building, the board's item 31
-  ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)); then 2.2, the transparent proxy, and
-  2.3, Cloud's iframe.
-- A-142 (Archi) bites here once stage 2 proxies Archi.
+- Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12): stage 2.1 complete, the board's item 31
+  ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)). What is left was redefined on
+  2026-11-19 (§13): one stage 2.2, a transparent proxy straight to Cloud's iframe; its talk goes on
+  with §13.7.
+- A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
 - A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
 
 ### Archi
 
-- A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
+- A-142 🔵 Archi's chat answers only when its turn ends, and the edge waits 30 s: decided for io.web stage 2.2 (2026-11-19, io-web-v2 §13.3: the proxy has no wait of its own); built with 2.2.
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -1686,7 +1694,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   token in a third party's logs.
 - **For 2.2's design:** per exposure, the edge passes the client's cookies for the upstream (scoped
   to the exposure's host), and io.web removes `__Host-fluxbee_session` (and any `__Host-fluxbee_*`)
-  before it proxies, and never forwards a `Set-Cookie` of that name from the upstream. Archi and
+  before it proxies, and never forwards a `Set-Cookie` of that name from the upstream. Agreed in the
+  talk of 2026-11-19 ([io-web-v2](../../docs/io-web-v2.md) §13.3). Archi and
   io.web set or read no cookie today.
 
 ### A-350 [General/orchestrator] ✅ BUILT (0.1.148, 2026-11-18, by its tests: io.cloud and io.api ignore a `node.*_target` in their config.json; the operator's call of 2026-11-18: build it) (medium; found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-io-web`; read in the code, not run; there since the IO nodes' spawn config) — a node's config can name its control authority: IO.cloud's relay of Cloud's ops can be pointed at another node
@@ -8900,7 +8909,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   the primary. A read still goes to the path's hive. A test covers both
   (`identity_writes_go_to_the_primary_whatever_hive_the_path_names`).
 
-### A-142 [Archi] 🟡 OPEN, for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
+### A-142 [Archi] 🔵 DECIDED for io.web stage 2.2 (2026-11-19: the proxy has no wait of its own); was OPEN for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
 
 - **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
   (`handle_chat_message`, src/bin/sy_architect.rs). A turn can last minutes: since 0.1.95 each
@@ -8914,6 +8923,9 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
 - **Fix, in Archi's chapter (the operator, 2026-11-03), before stage 2 proxies Archi:** either the
   edge's wait for Archi's routes covers a turn, or Archi's chat answers at once and the page follows
   the turn by its session (the page already refreshes sessions and streams messages).
+- **2026-11-19, decided for stage 2.2** ([io-web-v2](../../docs/io-web-v2.md) §13.1 decision 3,
+  §13.3): the proxy is transparent and has no wait of its own; the edge's two 30-second limits go
+  for exposure hosts, and a turn lasts what Archi takes. Archi does not change. Built with 2.2.
 
 ### A-141 ✅ VALIDATED ON 8.x (0.1.95, 2026-11-03: at the upgrade frontdesk waited for the vault and started its AI; found 2026-11-02, sweeping the journals of WF Case 4's gate) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
 

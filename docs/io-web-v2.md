@@ -12,6 +12,10 @@
   reverse proxy for exposures that Cloud publishes and enables through io.cloud, each with its own
   host, its sessions minted from a one-time link, and enablements that expire. §12 supersedes §10's
   open questions and §9's step 2.
+- Stage 2.1, §12.6's step 1, is complete (0.1.145 to 0.1.148; its gate passed on 2026-11-18). What
+  is left was **redefined with the operator on 2026-11-19 (§13)**: a transparent proxy, straight to
+  Cloud's iframe. §13 supersedes §12.3's two stages (own tab, then iframe), §12.4's limits per
+  exposure, and §12.6's steps 2 and 3.
 - FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are live since 0.1.99
   (2026-11-04, checked on 8.x):
   io.web's handshakes have slots of their own, and the proxy gives each client a share, has
@@ -588,7 +592,205 @@ live) with the edge, io.web and io.cloud; R4, Cloud's catalog, opened them to Cl
    Archi in its own tab (2a).
 3. **The iframe** (2b), when Cloud needs Archi inside its page.
 
+Steps 2 and 3 became one step on 2026-11-19: §13.
+
 Each with its review and its gate on 8.x. Stage 2.1's build design, with the operator's decisions
 of 2026-11-13: [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md). It corrects §12.1 and §12.2 where the
 code differs: one certificate serves every host, a name per host; an exposure's host is
 `<label>.<main host>`; Cloud-only needs a new rule, since Archi reaches every listed action today.
+
+---
+
+## 13. What is left, redefined (the operator, 2026-11-19): a transparent proxy, straight to Cloud's iframe
+
+The operator's words are quoted in Spanish; everything else is the decision as agreed in that
+conversation. The code was read first: §13.2. For what is left of stage 2, §13 supersedes §12.3's
+two stages (Archi in its own tab, then in Cloud's iframe), §12.4's "limits and timeouts per
+exposure", and §12.6's steps 2 and 3, which become one. Stage 2.1's exposures, links, sessions and
+registry stay as built.
+
+**Status:** agreed in the talk of 2026-11-19. The points of §13.7 come next in the same talk; then
+the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.1.
+
+### 13.1 Decisions
+
+1. **What io.web is for:** the website of a system, with its backend, its JavaScript and its calls
+   to its own server (*"la idea es que io.web sea para sistemas complejos o websites con backend o
+   JS, llamados internos"*). Artifacts are not io.web's: a static file that the edge hands a
+   browser, with everything it runs inside it (§7 is unchanged).
+2. **Straight to the target: Archi inside Cloud's iframe** (*"el sistema final es io.web que este en
+   un iframe dentro del sistema fluxbee cloud"*). There is no stage in its own tab first: the
+   system is in alpha and has no users (*"tal vez valga la pena ir directo"*).
+3. **A transparent reverse proxy.** What Archi does on its local port it does the same inside
+   Cloud's iframe (*"archi deberia funcionar igual que como funciona dentro de fluxbee, en el puerto
+   local, por eso el reverse proxy debe ser lo mas transparente posible"*). Fluxbee adds three
+   things only:
+   1. **the entry:** Cloud's one-time link, redeemed for the session cookie (built in 2.1);
+   2. **the end:** a disable, an unpublish or the end of the access cuts everything of the
+      exposure at once, what is open included (§13.4);
+   3. **the permission** for Cloud's page to frame it (`frame-ancestors`; §13.7, point 1).
+
+   It adds no time, no size and no rewrite of its own: the application's own rule (*"el timeout
+   tiene que ser el de archi interno, el reverse proxy no veo porque tenga que cambiar la
+   dinamica"*).
+4. **One domain.** Everything runs under `fluxbee.ai`: Cloud's page on `cloud.fluxbee.ai` while
+   Fluxbee Cloud's team develops it, the same domain afterwards (*"todo va a correr bajo
+   fluxbee.ai"*). For the browser, Cloud's page and every exposure host (`*.hive-<id>.fluxbee.ai`)
+   are then one site. The iframe is not a third party, and 2.1's cookie (`__Host-`,
+   `SameSite=Strict`) travels inside it as it is, with no partitioned cookie. A hive with a domain
+   of its own inside Cloud's iframe would need one; that is not a case today.
+5. **The cookie stays.** The operator asked whether it could be avoided (*"si se pueden evitar
+   mejor"*). A transparent proxy cannot avoid it: the browser must carry, on every request of the
+   page (the HTML, its calls, its streams), something that shows it came in through Cloud, and only
+   a cookie travels by itself without a change to the site.
+   - A token in the URL breaks the sites that use absolute paths, and leaves the credential in the
+     history and the logs.
+   - With no session, the host is open to anyone for the whole window, and every host is public in
+     the Certificate Transparency logs.
+   - A header the site sends itself is no longer transparent.
+
+   It costs nothing more: it is built (2.1), and decision 4 keeps it first-party.
+6. **Only the web.** An exposure admits only the browser that came in through Cloud's link, so no
+   script and no other system uses it. The API for machines stays io.api and io.cloud (*"abrir una
+   api por el reverse proxy no es para eso"*). §12.2's "its own API if it has one", for a
+   third-party system, becomes what its own page calls.
+7. **A renewal interrupts nobody** (the operator's choice of option (a)):
+   - a session passes to the exposure's new enablement on its next request: its cookie is signed
+     again with the new key;
+   - what is open is cut only when the exposure is left without access (§13.4).
+
+   Cloud's way to throw everyone out is a disable and a new enable, as 2.1 §3.4 already had it for
+   a stolen cookie. This replaces 2.1 §3.4's row for a renewal, where the previous enablement's
+   sessions ran to its end.
+
+### 13.2 What exists (read in the code, 2026-11-19)
+
+**Archi's website** (`src/bin/sy_architect.rs`):
+
+- axum, on `127.0.0.1:3000` unless `JSR_ARCHITECT_LISTEN` or hive.yaml's `architect.listen` says
+  otherwise (:92, :235-237, :6450-6459). 2.1 §2.2 made Archi's address io.web's own constant; since
+  that setting can move it, io.web reads the same one (for the build design).
+- One HTML page at `/` (:7725-7727). Its JavaScript does everything on the same host, with URLs
+  built from the page's own path (:19172-19183):
+  - the chat, `POST /api/chat`, which answers when the agent's turn ends (:10068-10091); each model
+    call may take up to 600 s (:259) and a turn makes several (FINDINGS A-142);
+  - uploads, `POST /api/software/upload`, multipart, up to 132 MiB (:109-111, :6563);
+  - the chats, `GET`, `POST` and `DELETE` under `/api/sessions` (:20911-20967);
+  - the status every 15 s and the chats every 5 s, every 60 s and 15 s while the page is hidden
+    (:19187-19190);
+  - the live messages, an SSE stream (:21849): Archi reads its messages every 1 s and sends one
+    event per new message, a ping every 5 s, and at most 16 streams (:8656-8660, :8691-8751).
+- No WebSocket, no cookie, no `Content-Security-Policy`, no `X-Frame-Options`, and no check of
+  `Host` or `Origin` (:9866-). Archi runs behind the proxy unchanged (D10).
+
+**The edge** (`src/bin/sy_edge.rs`):
+
+- An exposure host takes GET and HEAD only, with no body and no `Upgrade` (:4764-4800).
+- It waits 30 s for io.web's response head, and cuts io.web's body after 30 s of silence (:4347,
+  :4998). The first is A-142.
+- It relays io.web's body frame by frame as each arrives (:5016-5040), and its paced stream
+  writes through and holds nothing (:4240-4275). Neither the edge nor io.web compresses. An error
+  in io.web's body cuts the client's connection.
+- It sets the forwarding headers itself and never passes the client's; `Cookie` keeps only its
+  `__Host-` pairs (:4835-, A-351).
+- It adds its own security headers to every answer that lacks them (:3965-3977, :5929-5938):
+  `cache-control: no-store`, `x-content-type-options: nosniff`, `referrer-policy: no-referrer`,
+  `x-robots-tag`, and `content-security-policy: default-src 'none'; frame-ancestors 'none'`. It
+  sends no `Strict-Transport-Security`.
+- Its defenses, by default: 256 connections per address (:139); 128 proxied requests in flight, 16
+  per address (:144-147); the pace it asks of slow peers.
+
+**io.web** (`nodes/io/io-web/src/web.rs`) forwards nothing. Its own answers carry `default-src
+'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` (:518-532).
+
+**The upstream** that SY.admin records has a kind, a hive or an address, and a port, and no scheme
+(`WebExposureUpstream`, `crates/fluxbee_sdk/src/protocol.rs:797-805`).
+
+### 13.3 The pass-through
+
+- **Every method an application uses, with its body streamed** both ways and never held whole;
+  never `CONNECT` or `TRACE` (a tunnel, an echo). HTTP/1.1 at the edge and at io.web.
+- **No limit of the proxy's own:** no wait for an answer, no cut for silence, no size. The edge's
+  two 30-second limits go for exposure hosts, which settles A-142 for the proxy. A connection ends
+  when the browser or the application closes it, or when the access ends (§13.4).
+  - The session's 30 minutes idle never end an open page: Archi's page calls every 5 to 60 s.
+- **The defenses against whoever has no session stay** (§13.2). io.web answers 401 from the
+  headers, before reading a byte of a body (2.1 §3.3), so no body crosses without a session.
+- **Streams:** every frame goes on as it arrives, at the edge and at io.web, never gathered and
+  never compressed, so an SSE event reaches the browser when the application writes it (*"que el
+  texto fluya palabra por palabra en tiempo real"*). Archi's chat answers whole, at its turn's end;
+  its live messages are the SSE stream. The gate measures the cadence: Archi's ping every 5 s
+  arrives every 5 s.
+- **WebSockets** (§12.4): `Upgrade: websocket` crosses the edge and io.web, which then copy bytes
+  both ways; §13.4's cut applies to them.
+- **The forwarding headers** are the edge's, and io.web passes them to the upstream with the public
+  `Host`.
+- **Cookies** (A-351): the system's own cookies pass. Fluxbee's (`__Host-fluxbee_*`) are removed
+  before the upstream, and a `Set-Cookie` of that name from the upstream never reaches the browser.
+  2.1's sliding cookie is added to proxied answers.
+- **The application's headers pass untouched.** What Fluxbee adds is §13.7, point 1.
+
+### 13.4 The end: what is open is cut at once
+
+- io.web keeps, per exposure, what is open: requests waiting for the upstream's answer, streams and
+  WebSockets.
+- When the exposure is left without access, io.web cuts all of it at once (*"io.web mata el socket
+  activo al instante y no espera a que termine ese request"*). That happens with a disable, an
+  unpublish, or the end of its last enablement by io.web's own clock.
+  - **A request still waiting** (Archi's chat): io.web answers 401 and closes its connection to the
+    upstream. Archi gets what it gets today when its tab is closed mid-turn.
+  - **An open stream:** io.web ends it, and the edge cuts the browser's connection. The browser's
+    `EventSource` tries again, gets 401 and stops.
+  - **A WebSocket:** both sides are closed.
+- **A renewal ends nothing** (decision 7): the exposure keeps its access, and each session moves to
+  the new enablement on its next request. A session that makes no request between a renewal and
+  the previous enablement's end fails at its next one, and Cloud's link brings it back; Archi's
+  page calls at least every 60 s.
+- **The bound:** in 2.1's gate a disable reached io.web, acknowledged, in 0.57 s; the cut travels
+  with it. 2.2's gate measures it.
+
+### 13.5 Third-party systems: to keep in mind (the operator's example, Odoo; not urgent)
+
+- An Odoo installed in the infrastructure and used through the edge is an exposure with the
+  upstream `{kind: hive, hive: <worker>, port}`: recorded since 2.1, dialled from 2.2.
+- **WebSockets on a second port.** From version 16, Odoo's live bus is a WebSocket at
+  `/websocket`. With workers, Odoo serves it on a port of its own (`gevent_port`, 8072), apart from
+  the web (8069). An exposure is one host and one port, so Odoo with workers needs a second route
+  for that path: a change to §12.2's model, decided when Odoo comes.
+- **Forwarding headers.** Odoo trusts them only with `proxy_mode = True` in its configuration;
+  without it, it builds `http://` links. That is part of installing it behind Fluxbee.
+- **The iframe.** Forum reports say Odoo's login page (and, in 17, its web client) sends
+  `X-Frame-Options` and `frame-ancestors 'self'`, which refuse a frame from Cloud's origin. With
+  the application's headers untouched it would not show in Cloud's iframe. When it comes, either
+  io.web replaces those headers with Cloud's origin for that exposure (the one exception to
+  decision 3), or the system opens in its own tab. To be read in Odoo's code then.
+- **Two logins.** Fluxbee's cookie opens the door, like an invisible VPN, and Odoo keeps its own
+  login. Single sign-on (OpenID Connect) comes later, with a prerequisite: a session knows its
+  exposure but not its person, since Cloud's link names nobody. Cloud, which holds people's logins,
+  would name the person in the link and be Odoo's OpenID provider. This meets §10's question 2
+  (who may enter Archi).
+- **The upstream's scheme** (http or https, and the certificate of an internal https upstream) is
+  not recorded (§13.2). It is open until the first third-party exposure.
+
+### 13.6 Withdrawn
+
+- Two stages, Archi in its own tab and then in Cloud's iframe (§12.3's 2a and 2b): straight to the
+  iframe (decision 2).
+- The partitioned cookie (`SameSite=None; Partitioned`): one domain does not need it (decision 4).
+- Limits and timeouts of the proxy's own, per exposure (§12.4) or per kind of upstream (a proposal
+  of 2026-11-19, with figures): the application's rule (decision 3).
+- Sessions without a cookie (a token in the URL, or no session): decision 5.
+
+### 13.7 Open: the talk's next points, one at a time
+
+1. **The headers Fluxbee adds**, on io.web's own answers and on proxied ones, under decision 3 and
+   §12.4's grade A. That includes where io.web learns Cloud's origin for `frame-ancestors`: the hive
+   does not know it today (`publish_cloud_endpoint` opens the hive's door for Cloud; it does not
+   name Cloud's page).
+2. **The `Origin` check on the methods that write** (2.1 §4 already had it for 2.2). Every exposure
+   of every hive shares the site `fluxbee.ai`, so `SameSite=Strict` does not stop a request from a
+   sibling host, another hive's exposure included.
+3. **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
+   gate measures (the SSE cadence, the cut).
+
+Then the build design, its review, the releases and the gate on 8.x.

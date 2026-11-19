@@ -243,7 +243,7 @@ with a tenant's deletion, or by the operator's hand.
 | --- | --- | --- |
 | `disable_exposure` | io.web drops the exposure's enablements and keys when the push arrives: every link and session fails at the next request | SY.admin waits for io.web's answer (5 s), then re-pushes every 60 s; the enablement's `until` bounds even a partitioned io.web |
 | The enablement ends | io.web's own clock, against the `until` it holds | — |
-| A renewal, Q4 (a) | a new enablement, `K` and slot. The previous enablement's sessions run to its `until`; new links come from the new one only | ≤ 8 h |
+| A renewal, Q4 (a) | a new enablement, `K` and slot. The previous enablement's sessions run to its `until`; new links come from the new one only. Stage 2.2 changes this: a session passes to the new enablement on its next request ([io-web-v2.md](io-web-v2.md) §13.1, decision 7) | ≤ 8 h |
 | `unpublish_exposure` | the same as a disable; the edge's route goes, and the door answers 404 | — |
 | A stolen cookie | valid until idle or the enablement's end; Cloud's remedy is a disable and a new enable (new `K`). A deny-list keyed by `sid` is the 2.2 logout's hook | 30 min idle, 8 h |
 | io.web restarts | sessions survive: both slots are re-read. Links issued before the restart are refused | — |
