@@ -429,6 +429,10 @@ no change required
     the edge restarted, Cloud's door came back 3.6 s after the thaw with no restart; a new host read
     pending, then covered in 9.1 s, never held; 12 PASS. **Next:** stage 2.2 (the transparent
     proxy, Archi in its own tab; A-351), a design talk first.
+    **0.1.150, stage 2.2's R1, the Rust SDK alone** ✅ live and checked on 8.x (2026-11-19):
+    `IO_WEB_EXPOSURES` can carry `cloud_origins`, absent while empty; io.web acknowledging the set,
+    the door reading the exposures, Archi closed; 10 PASS, no model call. R2, the three binaries, is
+    being built ([io-web-v2-stage-2-2](../../docs/io-web-v2-stage-2-2.md) §8).
     **Stage 2.2's design talk (2026-11-19):** what is left was redefined with the operator
     ([io-web-v2](../../docs/io-web-v2.md) §13): a transparent proxy, straight to Cloud's iframe (no
     stage in its own tab); no time, size or rewrite of the proxy's own (A-142 settled for the

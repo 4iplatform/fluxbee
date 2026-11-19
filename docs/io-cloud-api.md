@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.149** (2026-11-19), and PROD runs **0.1.149** (the router, the Go
+> Contract as of **fluxbee 0.1.150** (2026-11-19), and PROD runs **0.1.150** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1368,6 +1368,12 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.150
+
+- **Nothing changes for Cloud.** The set SY.admin sends io.web can carry the origins of
+  Cloud's page (io.web stage 2.2's first release, the Rust SDK alone); nothing sends them yet. Stage
+  2.2 brings Archi inside Cloud's iframe (docs/io-web-v2.md §13).
 
 ### 0.1.149
 

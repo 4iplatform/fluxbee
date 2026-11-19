@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.149** | 2026-11-19 | `0874f4e0` | motherbee + spokes (core), two small fixes 0.1.148's gate found: A-353 (SY.edge asks the vault again every 30 s for a channel secret it missed at boot, where Cloud's door refused every request until a restart) and A-354 (a host reads pending, not held, while its own ACME order runs) | ✅ live, checked on 8.x | snap `pre-fix-0-1-149` (all 4 VMs) · `apt install fluxbee=0.1.148` + 0.1.148's `update_installation` (nothing one-way) |
+| **0.1.150** | 2026-11-19 | `671dc2ca` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.2's R1 ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): `IO_WEB_EXPOSURES` carries `cloud_origins`, the origins of the Fluxbee Cloud page that may frame the exposures, absent on the wire while empty; SY.admin and io.web send and read none before R2 | ✅ live, checked on 8.x | snap `pre-websdk-0-1-150` (all 4 VMs) · `apt install fluxbee=0.1.149` + 0.1.149's `update_installation` (nothing one-way) |
+| **0.1.149** | 2026-11-19 | `0874f4e0` | motherbee + spokes (core), two small fixes 0.1.148's gate found: A-353 (SY.edge asks the vault again every 30 s for a channel secret it missed at boot, where Cloud's door refused every request until a restart) and A-354 (a host reads pending, not held, while its own ACME order runs) | ✅ replaced by 0.1.150 | snap `pre-fix-0-1-149` (deleted 2026-11-19) · `apt install fluxbee=0.1.148` + 0.1.148's `update_installation` (nothing one-way) |
 | **0.1.148** | 2026-11-18 | `90996258` | motherbee + spokes (core), small changes in one release: io.web stage 2.1's R4 (the Rust SDK's Cloud catalog names the six exposure ops: Cloud reaches them; SY.admin's Cloud catalog carries what the relay sends, within a mesh reply), A-352 (`send_node_message` refuses the protected SYSTEM actions and SY.vault's writes) and A-350 (io.cloud and io.api take the nodes they answer to from no config.json); io.web stage 2.1's full gate | ✅ replaced by 0.1.149 | snap `pre-web21r4-0-1-148` (deleted 2026-11-19) · `apt install fluxbee=0.1.147` + 0.1.147's `update_installation` (nothing one-way; Cloud's exposure ops closed again, published exposures kept) |
 | **0.1.147** | 2026-11-18 | `56be48ee` | motherbee + spokes (core), io.web stage 2.1's R3, the binaries, one branch per binary ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): SY.admin (the exposures' registry and six actions, Fluxbee Cloud's own access class, io.web's keys among the node-only vault keys, `web:` retired; ACME certifies the published hosts read live, DNS first, name-change orders outside the cap, and no exposure host can hold the main name's renewal), SY.edge (only `__Host-` cookies to io.web, at most 64 web hosts), io.web (the exposures' set from SY.admin alone, one-time links, the session cookie), io.cloud (the six ops translated, closed until R4; a non-string envelope tenant refused) | ✅ replaced by 0.1.148 | snap `pre-web21-0-1-147` (deleted 2026-11-18) · `apt install fluxbee=0.1.146` + 0.1.146's `update_installation` (nothing one-way; `archi.<id>` routed again by `web:`) |
 | **0.1.146** | 2026-11-13 | `39f33517` | motherbee + spokes (core), the router alone, io.web stage 2.1's R2 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): A-349 (no turn of Fluxbee Cloud's channel, a message IO.cloud sends or one addressed to it by name, for SY.storage nor for cognition), and `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` protected, SY.admin@motherbee alone (`web_service_actions` in system.rego, both wasm rebuilt) | ✅ replaced by 0.1.147 | snap `pre-router-0-1-146` (deleted 2026-11-18) · `apt install fluxbee=0.1.145` + 0.1.145's `update_installation` (nothing one-way; Cloud's requests stored in `turns` again) |
@@ -158,6 +159,36 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.150 — io.web's set can carry Cloud's origins (io.web stage 2.2's R1, the Rust SDK alone)
+
+- **Date:** 2026-11-19 (ART) · **Previous version:** 0.1.149 · **Commit:** `671dc2ca`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** io.web stage 2.2, redefined with the operator on 2026-11-19 ([io-web-v2](../docs/io-web-v2.md)
+  §13): a transparent proxy, straight to Cloud's iframe. Its build design
+  ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md)) puts the shared code alone first (METHOD §9).
+- **What changed (`coa/web22-sdk`, one commit):** `IoWebExposuresPayload.cloud_origins` (the Rust
+  SDK), `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, with its wire test. SY.admin and
+  io.web build the set with none (three literals), so nothing changes on the wire before R2.
+- **Build:** CI green on `671dc2ca`. Build on fb-build 17:50:33–18:14:08Z (23.6 min), publish 13 s.
+- **The deploy:** the gate's mark at 18:14:46Z; `ops deploy 0.1.150 --snapshot pre-websdk-0-1-150
+  --drop pre-fix-0-1-149` in 297 s (snapshots 32.3 s, the motherbee's apt 150.1 s, its admin on the
+  version 49.2 s, the spokes answering 11.5 s, the update's call 22.1 s, the hives on the target
+  15.6 s, health 6.9 s). On the target after the update's call: the motherbee 4.6 s, egress1 27.3 s,
+  ingress1 and worker1 36.2 s. The update (`upd-1795112341195`) closed with every hive on the target,
+  core hash `4c17979042d1be8c`. Health clean.
+- **Checked on 8.x (the gate, gate0250, 18:24–18:25Z; `scratchpad/gate-tools/r150_gate.py`,
+  git-ignored; 10 PASS, no model call):** the smoke (`run_node AI.gate0250s@worker1` `RUNNING` at
+  9.0 s on 0.1.150, killed, stopped; the stopped `AI.gate0233` read); io.web running and
+  acknowledging SY.admin's set (the generation it holds equal to the one pushed), the edge's routes
+  acknowledged; `list_exposures` through Cloud's door, Archi's exposure closed; `https://archi.<id>/`
+  io.web's 401; 0 usage records. A first run at 18:21Z failed every step that calls ops.py, because
+  the tool was started outside the repo's root (its paths are relative): no node was touched; it ran
+  again from the root.
+- **PROD after the gate:** all four hives on 0.1.150; snapshot `pre-websdk-0-1-150` on each VM,
+  `pre-fix-0-1-149` deleted. Archi's exposure published and closed; `AI.gate0250s` purged.
+- **Rollback:** the snapshot `pre-websdk-0-1-150` (all 4 VMs), or `apt install fluxbee=0.1.149` +
+  0.1.149's `update_installation`: nothing one-way.
 
 ## 0.1.149 — SY.edge asks the vault again for a channel secret, and a host reads pending during its own order (A-353, A-354)
 
