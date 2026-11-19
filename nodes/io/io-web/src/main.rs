@@ -25,6 +25,12 @@
 
 mod access;
 mod exposures;
+mod headers;
+mod open;
+mod proxy;
+#[cfg(test)]
+mod testing;
+mod upstream;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -71,7 +77,11 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, RwLock};
 use tracing_subscriber::EnvFilter;
 
-use exposures::{boot_second, unix_now, Exposures, VaultKeys, EXPOSURES_FILE, KEY_RETRY};
+use exposures::{
+    boot_second, run_access_clock, unix_now, Exposures, VaultKeys, EXPOSURES_FILE, KEY_RETRY,
+};
+use proxy::Proxy;
+use upstream::{archi_from_hive_yaml, Upstreams};
 use web::{WebSetup, WebState, WebStatus};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -254,8 +264,26 @@ async fn main() -> Result<(), DynError> {
         sender.clone(),
     ));
     tokio::spawn(run_key_retries(Arc::clone(&exposures)));
+    tokio::spawn(run_access_clock(Arc::clone(&exposures)));
 
     let web_setup = WebSetup::motherbee();
+    // Where each exposure's upstream is (docs/io-web-v2-stage-2-2.md §4.2): Archi where hive.yaml
+    // says it listens, read once now; the workers from the registry, at each request.
+    let upstreams = Upstreams::new(
+        archi_from_hive_yaml(&config.config_dir),
+        web_setup.registry.clone(),
+    );
+    match upstreams.archi() {
+        Ok(address) => tracing::info!(
+            archi = %address,
+            "IO.web dials Archi's exposure where hive.yaml's architect.listen says Archi listens"
+        ),
+        Err(reason) => tracing::error!(
+            reason = %reason,
+            "IO.web has no address for Archi: Archi's exposure answers 502 until io.web restarts \
+             with a hive.yaml it can use"
+        ),
+    }
     let web_status = Arc::new(WebStatus::new());
     let (configured, configured_rx) =
         watch::channel(boot_state.current_state == IoNodeLifecycleState::Configured);
@@ -277,7 +305,10 @@ async fn main() -> Result<(), DynError> {
         Arc::clone(&web_status),
         configured_rx,
         loaded_rx,
-        Arc::clone(&exposures),
+        Arc::new(Proxy {
+            exposures: Arc::clone(&exposures),
+            upstreams,
+        }),
     ));
 
     let state = RuntimeState {

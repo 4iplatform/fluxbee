@@ -33,8 +33,11 @@ fluxbee-sdk = { path = "../../crates/fluxbee_sdk" }
 futures-util = "0.3"
 hmac = "0.12"
 http-body-util = "0.1"
-# io.web's HTTP/1 server, as the edge serves its door: hyper's builder with its head-read timer.
-hyper = { version = "1", features = ["server", "http1"] }
+# io.web's HTTP/1 server, as the edge serves its door: hyper's builder with its head-read timer;
+# and its client to each exposure's upstream, hyper's connection-level one, as the edge dials io.web
+# (docs/io-web-v2-stage-2-2.md §4.2). The workspace build unifies `client` through reqwest, but
+# io-web built alone (`scripts/publish-io-runtime.sh`) gets only what is named here.
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 nix = { version = "0.28", features = ["fs"] }
 regex = "1"

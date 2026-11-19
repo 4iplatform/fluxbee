@@ -14,7 +14,13 @@
 //! - **At boot** io.web loads its file, then the keys, before its port opens (`main.rs`).
 //! - **Links and sessions** (`access`): io.web mints a link for an exposure's current enablement
 //!   when SY.admin asks, redeems it once, on its host, within 120 s and only if minted since io.web's
-//!   boot, and answers with a session cookie that it checks on every request (§3.2, §3.3).
+//!   boot, and answers with a session cookie that it checks on every request (§3.2, §3.3). A
+//!   session moves to its exposure's newest enablement at its next request (stage 2.2 §4.6).
+//! - **Cloud's origins** come with the set, and the file keeps them (stage 2.2 §4.6a): the pages
+//!   that may frame the exposures (`headers::Framing`).
+//! - **What is open** on each exposure is registered with the session's check, and cut once the
+//!   exposure is left without access: by a push, or by io.web's own clock at its last
+//!   enablement's end (`open`, `run_access_clock`; stage 2.2 §4.7).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,19 +35,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fluxbee_sdk::protocol::{
     IoWebAccessLinkRequest, IoWebAccessLinkResponse, IoWebEnablement, IoWebEnablementKey,
     IoWebExposure, IoWebExposuresPayload, IoWebExposuresResponse, IoWebKeyState,
-    IO_WEB_ERROR_ENABLEMENT_UNKNOWN, IO_WEB_ERROR_EXPOSURE_UNKNOWN, IO_WEB_ERROR_KEY_UNAVAILABLE,
-    IO_WEB_ERROR_STALE_GENERATION, WEB_ENABLEMENT_ID_PREFIX, WEB_EXPOSURE_ID_PREFIX,
+    WebExposureUpstream, IO_WEB_ERROR_ENABLEMENT_UNKNOWN, IO_WEB_ERROR_EXPOSURE_UNKNOWN,
+    IO_WEB_ERROR_KEY_UNAVAILABLE, IO_WEB_ERROR_STALE_GENERATION, WEB_ENABLEMENT_ID_PREFIX,
+    WEB_EXPOSURE_ID_PREFIX,
 };
 use fluxbee_sdk::vault::{web_exposure_vault_key, WEB_SESSION_KEY_RESOURCE_TYPE};
 use fluxbee_sdk::{RouterDispatcher, VaultCallerOwned, VaultClient, VaultValueResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::access::{
     fresh_token, link_id, secret_from_hex, session_set_cookie, sid_prefix, EnablementKeys,
     LinkCode, SessionToken, LINK_LIFETIME_S, SESSION_IDLE_S, SESSION_SLIDE_S,
 };
+use crate::headers::Framing;
+use crate::open::{self, Gate, Registration};
 
 /// The bound of one key read (§5.5).
 pub const KEY_READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -54,6 +64,9 @@ pub const ENTER_PATH: &str = "/.fluxbee/enter";
 const FILE_SCHEMA_VERSION: u32 = 1;
 /// The state of an enablement's key between its push and its read.
 const NOT_READ_YET: &str = "not read yet";
+/// The access clock sleeps at most this long before it reads the wall clock again, so a clock set
+/// forward by hand still cuts within it (`run_access_clock`).
+const CLOCK_RECHECK: Duration = Duration::from_secs(60);
 
 /// The wall clock in Unix seconds, the unit of every time of the exposures.
 pub fn unix_now() -> u64 {
@@ -139,13 +152,19 @@ pub struct Exposures {
     links_redeemed: AtomicU64,
     links_refused: AtomicU64,
     sessions_minted: AtomicU64,
+    /// Wakes the access clock when a set is installed, so it sleeps until the new set's ends.
+    clock: Notify,
 }
 
-/// The set held: its generation and its exposures, each with its keys.
+/// The set held: its generation, its exposures, each with its keys, and Cloud's origins.
 #[derive(Default)]
 struct Held {
     generation: u64,
     exposures: Vec<HeldExposure>,
+    /// As SY.admin pushed them: what the file keeps and the status shows.
+    cloud_origins: Vec<String>,
+    /// What they give the headers: only the origins that pass io.web's own check.
+    framing: Arc<Framing>,
 }
 
 struct HeldExposure {
@@ -158,6 +177,10 @@ struct HeldExposure {
     x: Option<String>,
     /// Its enablements, newest last, as `wire` lists them.
     enablements: Vec<HeldEnablement>,
+    /// Its access's end: its enablements' latest `until`, 0 without any.
+    until: u64,
+    /// What is open on it, and its cut, carried over by each push to the same exposure.
+    gate: Arc<Gate>,
 }
 
 struct HeldEnablement {
@@ -206,13 +229,17 @@ enum KeyLog {
     Changes,
 }
 
-/// io.web's file: the set without secrets (§2.3).
+/// io.web's file: the set without secrets (§2.3), and Cloud's origins (stage 2.2 §4.6a), so a
+/// restart keeps them and SY.admin's next push of the same generation is acknowledged without a
+/// read. Absent while there are none, so an io.web before 2.2 still reads a file with none.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExposuresFile {
     schema_version: u32,
     generation: u64,
     exposures: Vec<IoWebExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cloud_origins: Vec<String>,
 }
 
 /// What the edge said of a request, for the logs (§3.2): its `X-Request-Id` and
@@ -256,7 +283,6 @@ impl LinkRefusal {
 #[derive(Debug, Default)]
 pub struct SessionRefusal {
     pub reason: &'static str,
-    pub exposure_id: Option<String>,
     pub enablement_id: Option<String>,
     /// The cookie is kept: its enablement is live, but io.web does not hold its key yet (a
     /// restart before the vault answered, §3.4), and it serves again once the retry reads it. Any
@@ -264,9 +290,129 @@ pub struct SessionRefusal {
     pub kept: bool,
 }
 
+/// A request with a valid session, registered on its exposure (`Exposures::admit`): where it
+/// goes, what its answer's headers name, and its session's cookie when it slides or moves.
+pub struct Admitted {
+    /// The session's enablement, the one its cookie names.
+    pub enablement_id: String,
+    pub upstream: WebExposureUpstream,
+    pub framing: Arc<Framing>,
+    pub slide: Option<Slide>,
+    /// What is open of it, with the exposure's cut (`open`), until it is dropped.
+    pub open: Registration,
+}
+
+/// A session's cookie again, with `active = now`: it slid (its last activity 60 s old), or it
+/// moved to the exposure's newest enablement (stage 2.2 §4.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slide {
+    pub set_cookie: String,
+    pub moved: Option<Moved>,
+}
+
+/// A session moved by a renewal, for its log line: never the cookie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    /// The first 8 hex of its `sid`.
+    pub sid: String,
+    pub from: String,
+    pub to: String,
+    pub max_age: u64,
+}
+
 impl Held {
     fn by_host(&self, host: &str) -> Option<&HeldExposure> {
         self.exposures.iter().find(|exposure| exposure.host == host)
+    }
+
+    /// A session cookie's value on `host` (§3.3): its exposure while its tag verifies over the
+    /// host, its enablement is live with its key held and it was active within 30 min; with the
+    /// cookie again once its last activity is 60 s old, or at once when the exposure's newest
+    /// enablement is another one whose key io.web holds (stage 2.2 §4.6). Otherwise why not, and
+    /// whether the cookie is kept: only while its enablement is live and its key not read yet
+    /// (§3.4).
+    fn session(
+        &self,
+        host: &str,
+        value: &str,
+        now: u64,
+    ) -> Result<(&HeldExposure, &HeldEnablement, Option<Slide>), SessionRefusal> {
+        let Some(exposure) = self.by_host(host) else {
+            return Err(SessionRefusal {
+                reason: "the host is no exposure's",
+                ..SessionRefusal::default()
+            });
+        };
+        // Built only for a refusal: a request that serves allocates nothing for it.
+        let refused = |reason: &'static str, enablement: Option<&HeldEnablement>| SessionRefusal {
+            reason,
+            enablement_id: enablement.map(|enablement| enablement.wire.enablement_id.clone()),
+            kept: false,
+        };
+        let Some(token) = SessionToken::parse(value) else {
+            return Err(refused("a malformed session cookie", None));
+        };
+        if exposure.x.as_deref() != Some(token.x) {
+            return Err(refused("another exposure's session", None));
+        }
+        let Some(enablement) = exposure
+            .enablements
+            .iter()
+            .find(|enablement| enablement.e.as_deref() == Some(token.e))
+        else {
+            return Err(refused("its enablement is not one io.web holds", None));
+        };
+        if now >= enablement.wire.until {
+            return Err(refused("its enablement has ended", Some(enablement)));
+        }
+        let KeyState::Ready(keys) = &enablement.key else {
+            // Its key may yet be read (every 30 s): the cookie is kept, to serve then, as a session
+            // survives a restart of io.web whose first read of the key failed (§3.4).
+            return Err(SessionRefusal {
+                kept: true,
+                ..refused(
+                    "io.web holds no key for its enablement yet",
+                    Some(enablement),
+                )
+            });
+        };
+        if !token.verifies(keys, host) {
+            return Err(refused("its tag does not verify", Some(enablement)));
+        }
+        let idle = now.saturating_sub(token.active);
+        if idle > SESSION_IDLE_S {
+            return Err(refused("idle for more than 30 min", Some(enablement)));
+        }
+        // A renewal interrupts nobody (io-web-v2 §13.1, decision 7): the session is minted again
+        // under the newest enablement at once, its `sid` and `issued` kept. Its previous
+        // enablement stays in the set until its own end, so its key verifies the old cookie
+        // meanwhile.
+        if let Some((newest, e, newest_keys)) = exposure.newer_than(enablement, now) {
+            let value =
+                SessionToken::mint(newest_keys, host, token.x, e, token.sid, token.issued, now);
+            let max_age = SESSION_IDLE_S.min(newest.wire.until - now);
+            let moved = Moved {
+                sid: sid_prefix(token.sid).to_string(),
+                from: enablement.wire.enablement_id.clone(),
+                to: newest.wire.enablement_id.clone(),
+                max_age,
+            };
+            let slide = Slide {
+                set_cookie: session_set_cookie(&value, max_age),
+                moved: Some(moved),
+            };
+            return Ok((exposure, enablement, Some(slide)));
+        }
+        if idle < SESSION_SLIDE_S {
+            return Ok((exposure, enablement, None));
+        }
+        let value = SessionToken::mint(keys, host, token.x, token.e, token.sid, token.issued, now);
+        let max_age = SESSION_IDLE_S.min(enablement.wire.until - now);
+        let slide = Slide {
+            set_cookie: session_set_cookie(&value, max_age),
+            moved: None,
+        };
+        Ok((exposure, enablement, Some(slide)))
     }
 
     /// The live enablements, with their exposure: `now` is before their end.
@@ -327,7 +473,8 @@ impl Held {
 
 impl HeldExposure {
     /// `wire` as io.web holds it, with the keys `previous` holds for the enablements that stay at
-    /// the same slot and version; the others wait for their read.
+    /// the same slot and version (the others wait for their read), and `previous`'s gate, or a new
+    /// one, closed until `install` opens it.
     fn new(wire: IoWebExposure, previous: Option<&HeldExposure>) -> Self {
         let enablements = wire
             .enablements
@@ -351,8 +498,32 @@ impl HeldExposure {
         Self {
             host: wire.host.to_ascii_lowercase(),
             x: uuid_hex(&wire.exposure_id, WEB_EXPOSURE_ID_PREFIX),
+            until: wire
+                .enablements
+                .iter()
+                .map(|enablement| enablement.until)
+                .max()
+                .unwrap_or(0),
+            gate: previous.map_or_else(|| Gate::new(false), |previous| Arc::clone(&previous.gate)),
             enablements,
             wire,
+        }
+    }
+
+    /// The exposure's newest enablement when it is another one than `current`, live, with its key
+    /// held: the one a session of `current` moves to (stage 2.2 §4.6).
+    fn newer_than(
+        &self,
+        current: &HeldEnablement,
+        now: u64,
+    ) -> Option<(&HeldEnablement, &str, &EnablementKeys)> {
+        let newest = self.enablements.last()?;
+        if newest.wire.enablement_id == current.wire.enablement_id || now >= newest.wire.until {
+            return None;
+        }
+        match (&newest.e, &newest.key) {
+            (Some(e), KeyState::Ready(keys)) => Some((newest, e.as_str(), keys)),
+            _ => None,
         }
     }
 
@@ -447,6 +618,7 @@ impl Exposures {
             links_redeemed: AtomicU64::new(0),
             links_refused: AtomicU64::new(0),
             sessions_minted: AtomicU64::new(0),
+            clock: Notify::new(),
         }
     }
 
@@ -472,7 +644,7 @@ impl Exposures {
             Ok(Some(set)) => {
                 let (generation, count) = (set.generation, set.exposures.len());
                 if generation > self.held().generation {
-                    self.install(set);
+                    self.install(set, now);
                     tracing::info!(
                         path = %path,
                         generation,
@@ -491,6 +663,7 @@ impl Exposures {
                 "IO.web cannot read its exposures file: it holds none until SY.admin pushes its set"
             ),
         }
+        self.clock.notify_one();
         self.read_missing_keys(now, KeyLog::Every).await;
     }
 
@@ -518,7 +691,8 @@ impl Exposures {
             return self.answer(false, now);
         }
         let generation = set.generation;
-        let changed = self.install(set);
+        let changed = self.install(set, now);
+        self.clock.notify_one();
         self.save();
         self.read_missing_keys(now, KeyLog::Every).await;
         let view = self.view(now);
@@ -528,6 +702,7 @@ impl Exposures {
             exposures = %view["exposures"],
             enabled = %view["enabled"],
             keys_unavailable = %view["keys_unavailable"],
+            cloud_origins = %view["cloud_origins"],
             "IO.web applied its exposures"
         );
         self.answer(changed, now)
@@ -548,15 +723,18 @@ impl Exposures {
     }
 
     /// The set held becomes `set`, at once: what it no longer holds is gone before any key is
-    /// read. The keys of the enablements that stay at the same slot and version are kept. Whether
-    /// the exposures changed.
-    fn install(&self, set: IoWebExposuresPayload) -> bool {
+    /// read. The keys of the enablements that stay at the same slot and version are kept, and each
+    /// exposure's gate. An exposure the set leaves without access at `now`, or drops, is cut at
+    /// once (stage 2.2 §4.7). Whether the set changed, its origins included.
+    fn install(&self, set: IoWebExposuresPayload, now: u64) -> bool {
         let mut held = self.held_mut();
-        let changed = !held
-            .exposures
-            .iter()
-            .map(|exposure| &exposure.wire)
-            .eq(set.exposures.iter());
+        let origins_changed = held.cloud_origins != set.cloud_origins;
+        let changed = origins_changed
+            || !held
+                .exposures
+                .iter()
+                .map(|exposure| &exposure.wire)
+                .eq(set.exposures.iter());
         for gone in held
             .exposures
             .iter()
@@ -567,8 +745,11 @@ impl Exposures {
                 host = %gone.host,
                 "IO.web dropped an exposure: its links and sessions fail from now on"
             );
+            if let Some(open) = gone.gate.close() {
+                log_cut(gone, open, "the set no longer holds the exposure");
+            }
         }
-        let exposures = set
+        let exposures: Vec<HeldExposure> = set
             .exposures
             .into_iter()
             .map(|wire| {
@@ -588,11 +769,60 @@ impl Exposures {
                 HeldExposure::new(wire, previous)
             })
             .collect();
+        for exposure in &exposures {
+            if now < exposure.until {
+                exposure.gate.open();
+            } else if let Some(open) = exposure.gate.close() {
+                log_cut(exposure, open, "the set leaves it no live enablement");
+            }
+        }
+        let (framing, skipped) = Framing::new(&set.cloud_origins);
+        for origin in &skipped {
+            tracing::warn!(
+                origin = ?origin,
+                "IO.web writes none of Cloud's origins that is not https://<lowercase host>[:port] \
+                 into a header: this one frames nothing"
+            );
+        }
+        if origins_changed {
+            tracing::info!(
+                cloud_origins = ?set.cloud_origins,
+                framing = ?framing.origins,
+                "IO.web holds Cloud's origins: the pages that may frame the exposures"
+            );
+        }
         *held = Held {
             generation: set.generation,
             exposures,
+            cloud_origins: set.cloud_origins,
+            framing: Arc::new(framing),
         };
         changed
+    }
+
+    /// The clock's cut (stage 2.2 §4.7): every exposure whose last enablement has ended by `now`
+    /// is cut, under the write lock, so a request whose session was checked just before is either
+    /// registered and cut, or refused once it registers (`Gate::register`).
+    pub fn close_ended(&self, now: u64) {
+        let held = self.held_mut();
+        for exposure in &held.exposures {
+            if now >= exposure.until {
+                if let Some(open) = exposure.gate.close() {
+                    log_cut(exposure, open, "its last enablement ended");
+                }
+            }
+        }
+    }
+
+    /// The end of the access of the first exposure the clock will close: the earliest `until` of
+    /// the exposures still open.
+    fn next_access_end(&self) -> Option<u64> {
+        self.held()
+            .exposures
+            .iter()
+            .filter(|exposure| !exposure.gate.is_closed())
+            .map(|exposure| exposure.until)
+            .min()
     }
 
     /// Reads the key of every live enablement whose key io.web does not hold (`read_keys`).
@@ -691,6 +921,7 @@ impl Exposures {
                     .iter()
                     .map(|exposure| exposure.wire.clone())
                     .collect(),
+                cloud_origins: held.cloud_origins.clone(),
             }
         };
         match write_file(&self.file, &file) {
@@ -815,15 +1046,24 @@ impl Exposures {
     }
 
     /// Whether `host` is an exposure's.
+    #[cfg(test)]
     pub fn knows_host(&self, host: &str) -> bool {
         self.held().by_host(host).is_some()
     }
 
-    /// The id of the exposure of `host`, for the logs.
-    pub fn exposure_of(&self, host: &str) -> Option<String> {
-        self.held()
-            .by_host(host)
-            .map(|exposure| exposure.wire.exposure_id.clone())
+    /// The id of the exposure of `host` and its gate, for a refusal's log line and its count.
+    pub fn gate_of(&self, host: &str) -> Option<(String, Arc<Gate>)> {
+        self.held().by_host(host).map(|exposure| {
+            (
+                exposure.wire.exposure_id.clone(),
+                Arc::clone(&exposure.gate),
+            )
+        })
+    }
+
+    /// What Cloud's origins give io.web's own answers' headers.
+    pub fn framing(&self) -> Arc<Framing> {
+        Arc::clone(&self.held().framing)
     }
 
     /// A `GET /.fluxbee/enter` on `host` (§3.2): the `Set-Cookie` of a new session once the code
@@ -947,70 +1187,40 @@ impl Exposures {
         })
     }
 
-    /// A session cookie's value on `host` (§3.3): `Ok` while its tag verifies over the host, its
-    /// enablement is live with its key held and it was active within 30 min; with the cookie again,
-    /// `active = now`, once its last activity is 60 s old. Otherwise why not, and whether the
-    /// cookie is kept: only while its enablement is live and its key not read yet (§3.4).
+    /// A request with a session cookie on `host`, at `now` (§3.3, stage 2.2 §4.6, §4.7): admitted
+    /// while its session serves (`Held::session`), and registered on its exposure in the same turn
+    /// of the read lock, so no cut falls between the check and the registration. A gate already
+    /// closed by the clock refuses it, even when its `now` was taken before the end.
+    pub fn admit(&self, host: &str, value: &str, now: u64) -> Result<Admitted, SessionRefusal> {
+        let held = self.held();
+        let (exposure, enablement, slide) = held.session(host, value, now)?;
+        let Some(open) = exposure.gate.register() else {
+            return Err(SessionRefusal {
+                reason: "its exposure's access has ended",
+                enablement_id: Some(enablement.wire.enablement_id.clone()),
+                kept: false,
+            });
+        };
+        Ok(Admitted {
+            enablement_id: enablement.wire.enablement_id.clone(),
+            upstream: exposure.wire.upstream.clone(),
+            framing: Arc::clone(&held.framing),
+            slide,
+            open,
+        })
+    }
+
+    /// The session check alone, its cookie again when it slides or moves.
+    #[cfg(test)]
     pub fn session(
         &self,
         host: &str,
         value: &str,
         now: u64,
     ) -> Result<Option<String>, SessionRefusal> {
-        let held = self.held();
-        let Some(exposure) = held.by_host(host) else {
-            return Err(SessionRefusal {
-                reason: "the host is no exposure's",
-                ..SessionRefusal::default()
-            });
-        };
-        // Built only for a refusal: a request that serves allocates nothing for it.
-        let refused = |reason: &'static str, enablement: Option<&HeldEnablement>| SessionRefusal {
-            reason,
-            exposure_id: Some(exposure.wire.exposure_id.clone()),
-            enablement_id: enablement.map(|enablement| enablement.wire.enablement_id.clone()),
-            kept: false,
-        };
-        let Some(token) = SessionToken::parse(value) else {
-            return Err(refused("a malformed session cookie", None));
-        };
-        if exposure.x.as_deref() != Some(token.x) {
-            return Err(refused("another exposure's session", None));
-        }
-        let Some(enablement) = exposure
-            .enablements
-            .iter()
-            .find(|enablement| enablement.e.as_deref() == Some(token.e))
-        else {
-            return Err(refused("its enablement is not one io.web holds", None));
-        };
-        if now >= enablement.wire.until {
-            return Err(refused("its enablement has ended", Some(enablement)));
-        }
-        let KeyState::Ready(keys) = &enablement.key else {
-            // Its key may yet be read (every 30 s): the cookie is kept, to serve then, as a session
-            // survives a restart of io.web whose first read of the key failed (§3.4).
-            return Err(SessionRefusal {
-                kept: true,
-                ..refused(
-                    "io.web holds no key for its enablement yet",
-                    Some(enablement),
-                )
-            });
-        };
-        if !token.verifies(keys, host) {
-            return Err(refused("its tag does not verify", Some(enablement)));
-        }
-        let idle = now.saturating_sub(token.active);
-        if idle > SESSION_IDLE_S {
-            return Err(refused("idle for more than 30 min", Some(enablement)));
-        }
-        if idle < SESSION_SLIDE_S {
-            return Ok(None);
-        }
-        let value = SessionToken::mint(keys, host, token.x, token.e, token.sid, token.issued, now);
-        let max_age = SESSION_IDLE_S.min(enablement.wire.until - now);
-        Ok(Some(session_set_cookie(&value, max_age)))
+        self.held()
+            .session(host, value, now)
+            .map(|(_, _, slide)| slide.map(|slide| slide.set_cookie))
     }
 
     /// NODE_STATUS_GET's `extensions.web.exposures` (§5.5).
@@ -1030,6 +1240,16 @@ impl Exposures {
             .live(now)
             .filter(|(_, enablement)| !enablement.key.is_ready())
             .count();
+        let per_exposure: Vec<Value> = held
+            .exposures
+            .iter()
+            .map(|exposure| {
+                let mut view = exposure.gate.view();
+                view["exposure_id"] = json!(exposure.wire.exposure_id);
+                view["host"] = json!(exposure.host);
+                view
+            })
+            .collect();
         json!({
             "generation": held.generation,
             "exposures": held.exposures.len(),
@@ -1039,8 +1259,58 @@ impl Exposures {
             "links_redeemed": self.links_redeemed.load(Ordering::Relaxed),
             "links_refused": self.links_refused.load(Ordering::Relaxed),
             "sessions_minted": self.sessions_minted.load(Ordering::Relaxed),
+            "cloud_origins": held.cloud_origins,
+            "per_exposure": per_exposure,
         })
     }
+}
+
+/// io.web's own clock (stage 2.2 §4.7): it sleeps until the earliest end of an exposure's access,
+/// cuts what is open on the exposures ended by then (`Exposures::close_ended`), and sleeps again;
+/// each set installed wakes it to read the new ends. It reads the wall clock at least every
+/// `CLOCK_RECHECK`.
+pub async fn run_access_clock(exposures: Arc<Exposures>) {
+    loop {
+        let installed = exposures.clock.notified();
+        tokio::pin!(installed);
+        installed.as_mut().enable();
+        let wait = exposures
+            .next_access_end()
+            .map_or(CLOCK_RECHECK, |end| until_unix(end).min(CLOCK_RECHECK));
+        tokio::select! {
+            () = tokio::time::sleep(wait) => exposures.close_ended(unix_now()),
+            () = &mut installed => {}
+        }
+    }
+}
+
+/// How long until the wall clock reads `end`, in Unix seconds: zero once it does.
+fn until_unix(end: u64) -> Duration {
+    (UNIX_EPOCH + Duration::from_secs(end))
+        .duration_since(SystemTime::now())
+        .unwrap_or_default()
+}
+
+/// The cut's line: what was open on `exposure` when its gate closed, and why.
+fn log_cut(exposure: &HeldExposure, open: open::Held, why: &'static str) {
+    if open.total() == 0 {
+        tracing::debug!(
+            exposure_id = %exposure.wire.exposure_id,
+            host = %exposure.host,
+            why,
+            "IO.web closed an exposure with nothing open on it"
+        );
+        return;
+    }
+    tracing::info!(
+        exposure_id = %exposure.wire.exposure_id,
+        host = %exposure.host,
+        waiting = open.waiting,
+        streams = open.streams,
+        websockets = open.websockets,
+        why,
+        "IO.web cut what was open on an exposure: it is left without access"
+    );
 }
 
 fn log_key(want: &KeyWant, key: &KeyState) {
@@ -1082,8 +1352,7 @@ fn read_file(path: &Path) -> Result<Option<IoWebExposuresPayload>, String> {
     Ok(Some(IoWebExposuresPayload {
         generation: file.generation,
         exposures: file.exposures,
-        // The file keeps them from stage 2.2's R2 on (io-web-v2-stage-2-2 §4.5).
-        cloud_origins: Vec::new(),
+        cloud_origins: file.cloud_origins,
     }))
 }
 
@@ -1118,7 +1387,7 @@ pub(crate) mod testing {
     //! A set, its keys and its file, for the tests of io.web.
 
     use super::*;
-    use fluxbee_sdk::protocol::{WebExposureKeySlot, WebExposureUpstream};
+    use fluxbee_sdk::protocol::WebExposureKeySlot;
     use fluxbee_sdk::VaultMetadata;
     use std::sync::atomic::AtomicUsize;
 
@@ -1244,14 +1513,12 @@ pub(crate) mod testing {
         }
     }
 
+    /// An exposure of Archi's kind: the tests dial Archi at their own test upstream.
     pub fn exposure(id: &str, host: &str, enablements: Vec<IoWebEnablement>) -> IoWebExposure {
         IoWebExposure {
             exposure_id: id.to_string(),
             host: host.to_string(),
-            upstream: WebExposureUpstream::Hive {
-                hive: "worker1".to_string(),
-                port: 8080,
-            },
+            upstream: WebExposureUpstream::Archi {},
             enablements,
         }
     }
@@ -1771,5 +2038,68 @@ mod tests {
             serde_json::to_value(vec![shop(Vec::new())]).unwrap()
         );
         remove(&exposures);
+    }
+
+    /// Cloud's origins come with the set and stay with it (stage 2.2 §4.6a): the file keeps them,
+    /// so a restart brings them back before SY.admin's next push, which, at the same generation,
+    /// is acknowledged without a read; a set without origins writes none, so the file reads as
+    /// before 2.2. A change of the origins alone is a change of the set.
+    #[tokio::test]
+    async fn a_restart_keeps_cloud_s_origins() {
+        let origins = vec![
+            "https://cloud.fluxbee.ai".to_string(),
+            "https://fluxbee.ai".to_string(),
+        ];
+        let keys = MapKeys::new();
+        keys.put(SHOP_ID, WebExposureKeySlot::A, 4, 1);
+        let mut framed = set(3, vec![enabled_shop()]);
+        framed.cloud_origins = origins.clone();
+        let before = holding("origins", keys.clone(), BOOT, framed.clone()).await;
+        let path = before.file().to_path_buf();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["cloud_origins"], json!(origins));
+        assert_eq!(before.framing().origins, origins, "the headers name them");
+
+        let after = Exposures::new(path.clone(), keys.clone(), BOOT + 100);
+        after.load_at_boot(BOOT + 100).await;
+        assert_eq!(after.view(BOOT + 100)["cloud_origins"], json!(origins));
+        assert_eq!(after.framing().origins, origins);
+        let reads = keys.read_count();
+        let again = after.apply_push(framed.clone(), BOOT + 101).await;
+        assert!(
+            matches!(
+                again,
+                IoWebExposuresResponse::Ok {
+                    generation: 3,
+                    changed: false,
+                    ..
+                }
+            ),
+            "{again:?}"
+        );
+        assert_eq!(
+            keys.read_count(),
+            reads,
+            "the same generation reads nothing"
+        );
+
+        // The origins alone change: a newer generation, a changed set, and the file without them.
+        let unframed = set(4, vec![enabled_shop()]);
+        let cleared = after.apply_push(unframed, BOOT + 102).await;
+        assert!(
+            matches!(
+                cleared,
+                IoWebExposuresResponse::Ok {
+                    generation: 4,
+                    changed: true,
+                    ..
+                }
+            ),
+            "{cleared:?}"
+        );
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written.get("cloud_origins").is_none(), "{written}");
+        assert!(after.framing().origins.is_empty());
+        remove(&before);
     }
 }

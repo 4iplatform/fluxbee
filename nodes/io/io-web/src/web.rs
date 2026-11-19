@@ -8,10 +8,13 @@
 //!   certificate included, fails inside the handshake, so none of its requests is ever read. The
 //!   registry is read once more after the handshake, before the connection is served.
 //! - **For how long:** each connection checks the registry every `registry_recheck`, and is cut
-//!   once its hive stops being a connected ingress, as the router cuts a WAN link.
-//! - **What:** HTTP/1.1 only, with a head-read timeout. Each request is answered by its host, its
-//!   session cookie and its path (`respond`, docs/io-web-v2-stage-2-1.md §5.5); its body is never
-//!   read.
+//!   once its hive stops being a connected ingress, as the router cuts a WAN link. A WebSocket's
+//!   tunnel runs inside its connection's scope, so it is cut the same way.
+//! - **What:** HTTP/1.1 only, with a head-read timeout and upgrades. Each request is answered by its
+//!   host, its session cookie and its path (`respond`, docs/io-web-v2-stage-2-1.md §5.5): a
+//!   request whose session serves goes to its exposure's upstream (`proxy`,
+//!   docs/io-web-v2-stage-2-2.md §4); any other gets one of io.web's own answers, from its headers
+//!   alone, before a byte of its body is read.
 //! - **When:** once its config is in use and its exposures are loaded, the file's set and its keys
 //!   (`run`).
 //! - **When it cannot:** without its material, its registry or its port it serves nobody, says why
@@ -20,7 +23,9 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -30,9 +35,11 @@ use fluxbee_sdk::mesh::{
 };
 use fluxbee_sdk::peer_slots::{PeerSlot, PeerSlots};
 use fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
-use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, COOKIE, HOST, SET_COOKIE};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::header::{
+    HeaderMap, HeaderValue, ALLOW, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE, UPGRADE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -44,7 +51,10 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use crate::access::{session_clear_cookie, SESSION_COOKIE};
-use crate::exposures::{unix_now, Exposures, RequestTrace, SessionRefusal, ENTER_PATH};
+use crate::exposures::{unix_now, RequestTrace, SessionRefusal, ENTER_PATH};
+use crate::headers::{self, Framing};
+use crate::proxy::{self, BoxError, Exchange, Proxy, RequestBody, Tunnels, UpstreamBody};
+use crate::upstream;
 
 /// Why io.web serves nobody: NODE_STATUS_GET's `last_error.code`. The motherbee's mesh material
 /// (`ca.crt`, `cert.crt`, `cert.key`) cannot be read or used.
@@ -55,8 +65,9 @@ pub const HIVE_REGISTRY_UNAVAILABLE: &str = "hive_registry_unavailable";
 pub const LISTEN_FAILED: &str = "listen_failed";
 
 /// Read and write buffer per connection: twice the edge door's 64 KiB, so a head the door admitted
-/// still fits with the headers the edge adds. A longer head is refused (431).
-const MAX_BUF_SIZE: usize = 128 * 1024;
+/// still fits with the headers the edge adds. A longer head is refused (431). The same buffer on
+/// each connection to an upstream.
+pub const MAX_BUF_SIZE: usize = 128 * 1024;
 /// A failed accept (out of descriptors, say) waits this long before the next one.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Connections closed at the cap are logged at most once per interval, with their count.
@@ -70,7 +81,9 @@ pub struct WebLimits {
     pub handshake_timeout: Duration,
     /// Every request head must arrive within this, timed from the handshake or from the previous
     /// answer: one byte, or an h2 preface, never holds a connection longer, and a keep-alive
-    /// connection idle that long is closed (hyper's head timer, as on the edge's door, A-87).
+    /// connection idle that long is closed (hyper's head timer, as on the edge's door, A-87). It
+    /// times the head only: a request then waits for its upstream, and an answer streams, as long
+    /// as the application takes.
     pub header_read_timeout: Duration,
     /// How often each connection checks that its hive is still a connected ingress, and the port
     /// that the registry can be read.
@@ -210,7 +223,7 @@ pub async fn run(
     status: Arc<WebStatus>,
     mut configured: watch::Receiver<bool>,
     mut loaded: watch::Receiver<bool>,
-    exposures: Arc<Exposures>,
+    proxy: Arc<Proxy>,
 ) {
     // Either sender gone means the process is going.
     if configured.wait_for(|configured| *configured).await.is_err()
@@ -228,7 +241,7 @@ pub async fn run(
             }
         }
     };
-    serve(listener, acceptor, &setup, &status, exposures).await;
+    serve(listener, acceptor, &setup, &status, proxy).await;
 }
 
 /// The material, then the port: an acceptor that admits only a connected ingress, and the
@@ -250,7 +263,7 @@ async fn open(setup: &WebSetup) -> Result<(TcpListener, TlsAcceptor), WebState> 
 
 /// A TLS acceptor that presents `material`'s leaf and admits a client certificate from the mesh CA
 /// only when `registry` lists its hive as a connected ingress, at each handshake.
-fn acceptor(
+pub(crate) fn acceptor(
     material: &MeshTlsMaterial,
     registry: &HiveRegistry,
 ) -> Result<TlsAcceptor, MeshTlsError> {
@@ -273,12 +286,12 @@ fn registry_state(registry: &HiveRegistry) -> WebState {
 /// The accept loop: one task per connection, at most `max_handshakes` of them in their handshake
 /// (`max_handshakes_per_source` from one address) and `max_connections` past it, and the registry
 /// checked every `registry_recheck` for the state (the first time at once).
-async fn serve(
+pub(crate) async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     setup: &WebSetup,
     status: &WebStatus,
-    exposures: Arc<Exposures>,
+    proxy: Arc<Proxy>,
 ) {
     let connections = Arc::new(Semaphore::new(setup.limits.max_connections));
     let handshakes = Arc::new(Semaphore::new(setup.limits.max_handshakes));
@@ -323,7 +336,7 @@ async fn serve(
                     setup.limits.clone(),
                     (handshake, source),
                     Arc::clone(&connections),
-                    Arc::clone(&exposures),
+                    Arc::clone(&proxy),
                 ));
             }
         }
@@ -352,9 +365,10 @@ impl Refusals {
     }
 }
 
-/// One connection: the handshake under its timeout, holding its handshake slots; a connection slot
-/// from then on, to the end; the registry once more; then HTTP, until the peer or the head timer
-/// ends it, or until its hive is no longer a connected ingress.
+/// One connection: TCP keepalive on its socket; the handshake under its timeout, holding its
+/// handshake slots; a connection slot from then on, to the end; the registry once more; then HTTP,
+/// a WebSocket's tunnel included, until the peer or the head timer ends it, or until its hive is no
+/// longer a connected ingress.
 async fn connection(
     tcp: TcpStream,
     peer: SocketAddr,
@@ -363,8 +377,11 @@ async fn connection(
     limits: WebLimits,
     handshake: (OwnedSemaphorePermit, PeerSlot),
     connections: Arc<Semaphore>,
-    exposures: Arc<Exposures>,
+    proxy: Arc<Proxy>,
 ) {
+    // With no wait of io.web's own on a request, an edge gone without a FIN would otherwise hold
+    // this connection, and its upstream's, for ever (stage 2.2 §3.1).
+    upstream::keep_alive(&tcp);
     let handshaken = tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp)).await;
     drop(handshake);
     let tls = match handshaken {
@@ -413,7 +430,7 @@ async fn connection(
         registry.role(hive) == Some(HiveRole::Ingress)
     });
     tokio::select! {
-        served = serve_http(tls, hive.clone(), limits.header_read_timeout, exposures) => {
+        served = serve_http(tls, limits.header_read_timeout, proxy) => {
             if let Err(err) = served {
                 tracing::debug!(peer = %peer, hive = %hive, error = %err, "IO.web connection ended");
             }
@@ -428,60 +445,51 @@ async fn connection(
     }
 }
 
-/// One connection's HTTP: HTTP/1 only, with no protocol sniffing, no HTTP/2 and no upgrade. Its
-/// head timer starts before the first byte (`WebLimits::header_read_timeout`).
+/// One connection's HTTP: HTTP/1 only, with no protocol sniffing and no HTTP/2. Its head timer
+/// starts before the first byte (`WebLimits::header_read_timeout`). It takes upgrades: once hyper
+/// hands an upgraded connection over, its WebSocket's tunnel runs here, inside the connection's
+/// scope, where it keeps the connection's permit and a demoted ingress still cuts it (stage 2.2
+/// §4.1); hyper's own future ends the moment it hands the connection over.
 async fn serve_http<IO>(
     io: IO,
-    hive: String,
     header_read_timeout: Duration,
-    exposures: Arc<Exposures>,
+    proxy: Arc<Proxy>,
 ) -> Result<(), hyper::Error>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req: Request<Incoming>| {
-        let response = respond(&exposures, &req, unix_now());
-        // The path without its query, so neither a link's code nor any query reaches the journal
-        // (docs/io-web-v2.md §11.3); never a cookie. The request id is the edge's.
-        tracing::debug!(
-            hive = %hive,
-            method = %req.method(),
-            host = request_host(req.headers()).unwrap_or_default(),
-            path = req.uri().path(),
-            status = response.status().as_u16(),
-            request_id = header_text(req.headers(), "x-request-id"),
-            "IO.web answered"
-        );
-        std::future::ready(Ok::<_, Infallible>(response))
-    });
+    let tunnels = Arc::new(Tunnels::default());
+    let service = {
+        let tunnels = Arc::clone(&tunnels);
+        service_fn(move |request: Request<Incoming>| {
+            let proxy = Arc::clone(&proxy);
+            let tunnels = Arc::clone(&tunnels);
+            async move {
+                let request = request.map(|body| body.map_err(BoxError::from).boxed_unsync());
+                Ok::<_, Infallible>(respond(&proxy, request, unix_now(), &tunnels).await)
+            }
+        })
+    };
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
         .max_buf_size(MAX_BUF_SIZE);
-    http.serve_connection(TokioIo::new(io), service).await
+    let served = http
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades()
+        .await;
+    let tunnel = tunnels.take();
+    if let Some(tunnel) = tunnel {
+        tunnel.await;
+    }
+    served
 }
-
-/// The placeholder page a valid session gets, on any path, where stage 2.2 reaches the exposure's
-/// upstream (docs/io-web-v2-stage-2-1.md §3.3): text only, so it renders under its own policy,
-/// which loads nothing; and nothing that names a version or anything internal.
-const PAGE: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fluxbee</title>
-</head>
-<body>
-<h1>Fluxbee</h1>
-<p>This address is served by Fluxbee.</p>
-</body>
-</html>
-"#;
 
 /// The page a redeemed link answers with, beside the session's cookie (§3.2). It moves on to `/`
 /// at once with a refresh, not a 303: a `SameSite=Strict` cookie is withheld from a redirect inside
 /// a navigation that began on another site (Cloud's), and is sent on a navigation this page starts.
-const ENTER_PAGE: &str = r#"<!doctype html>
+/// Inside Cloud's frame the refresh runs in the frame.
+pub(crate) const ENTER_PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -495,8 +503,8 @@ const ENTER_PAGE: &str = r#"<!doctype html>
 "#;
 
 /// The fixed 401 page: every refusal of a link or a session answers it, whatever the reason, which
-/// the log alone holds (§3.2, §3.3).
-const UNAUTHORIZED_PAGE: &str = r#"<!doctype html>
+/// the log alone holds (§3.2, §3.3), and so does a request still waiting when its exposure is cut.
+pub(crate) const UNAUTHORIZED_PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -510,114 +518,253 @@ const UNAUTHORIZED_PAGE: &str = r#"<!doctype html>
 </html>
 "#;
 
+/// The fixed 403 page of the Origin check (stage 2.2 §4.1): a write or a WebSocket that does not
+/// come from the exposure's own page. Which header refused it, the log alone holds.
+pub(crate) const FORBIDDEN_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fluxbee</title>
+</head>
+<body>
+<h1>Fluxbee</h1>
+<p>This address takes this request only from its own page.</p>
+</body>
+</html>
+"#;
+
+/// The fixed 502 page (stage 2.2 §4.2): the exposure's upstream was not reached, or gave no answer
+/// io.web can pass. What failed, the log alone holds.
+pub(crate) const BAD_GATEWAY_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fluxbee</title>
+</head>
+<body>
+<h1>Fluxbee</h1>
+<p>This address cannot be reached right now. Try again shortly.</p>
+</body>
+</html>
+"#;
+
 /// The paths io.web keeps for itself on every host (§5.5): no session needed, and never an
-/// upstream's in stage 2.2.
+/// upstream's.
 const RESERVED_PREFIX: &str = "/.fluxbee/";
 /// io.web's health check, under the reserved prefix so that it never shadows an upstream's own.
 const HEALTHZ_PATH: &str = "/.fluxbee/healthz";
 
-/// Every answer's policy: it loads nothing, its own origin included; no page may frame it; no
-/// `<base>` and no form target. `base-uri`, `form-action` and `frame-ancestors` do not fall back to
-/// `default-src`, so each is named.
-const CONTENT_SECURITY_POLICY: &str =
-    "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-/// Every answer's headers: the edge door's set, with io.web's policy.
-const SECURITY_HEADERS: [(&str, &str); 5] = [
-    ("content-security-policy", CONTENT_SECURITY_POLICY),
-    ("x-content-type-options", "nosniff"),
-    ("referrer-policy", "no-referrer"),
-    ("cache-control", "no-store"),
-    ("x-robots-tag", "noindex, nofollow, noarchive"),
-];
+/// What a 405 names: what a web host serves, every method an application uses but `CONNECT` and
+/// `TRACE`, which the edge refuses first.
+const ALLOWED_METHODS: &str = "GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE";
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const HTML: &str = "text/html; charset=utf-8";
 
+/// An answer's body: one of io.web's own, whole, or an upstream's, streamed
+/// (`proxy::UpstreamBody`).
+pub enum WebBody {
+    Own(Full<Bytes>),
+    Upstream(UpstreamBody),
+}
+
+impl WebBody {
+    pub fn empty() -> Self {
+        Self::Own(Full::new(Bytes::new()))
+    }
+}
+
+impl Body for WebBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self.get_mut() {
+            Self::Own(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map(|frame| frame.map(|frame| frame.map_err(|never| match never {}))),
+            Self::Upstream(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Own(body) => body.is_end_stream(),
+            Self::Upstream(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Own(body) => body.size_hint(),
+            Self::Upstream(body) => body.size_hint(),
+        }
+    }
+}
+
 /// io.web's answer to one request at `now`, from its host, its session cookie and its path
-/// (docs/io-web-v2-stage-2-1.md §3, §5.5). Its body is never read: a 401 comes from the headers
-/// alone. HEAD gets GET's answer, whose body hyper does not send.
+/// (docs/io-web-v2-stage-2-1.md §3, §5.5; docs/io-web-v2-stage-2-2.md §4.1). A refusal comes from
+/// the headers alone, before a byte of the body is read.
 ///
-/// - `/.fluxbee/` is reserved on every host: `GET /.fluxbee/enter` redeems a link, any other method
-///   there answers 401 and never redeems; `/.fluxbee/healthz` is 200; any other is 404.
-/// - A host that is no exposure's is 404.
-/// - Any other path needs a valid session: then GET and HEAD get the placeholder page, with the
-///   cookie again once its last activity is 60 s old, and another method 404. Without one, the
-///   fixed 401 page, which clears a session cookie that is not valid; more than one is not valid.
-///   A cookie whose enablement is live but whose key io.web has not read yet is kept (§3.4).
+/// - `/.fluxbee/` is reserved on every host and never reaches an upstream: `GET /.fluxbee/enter`
+///   redeems a link, any other method there answers 401 and never redeems; `GET` and `HEAD` of
+///   `/.fluxbee/healthz` are 200; any other path there is 404.
+/// - A host that is no exposure's is 404; `CONNECT` and `TRACE` are 405 (the edge refuses both
+///   first).
+/// - Any other request needs a valid session: without one, the fixed 401 page, which clears a
+///   session cookie that is not valid (more than one is not valid; one whose enablement is live
+///   but whose key io.web has not read yet is kept, §3.4).
+/// - Then the Origin check (`origin_refusal`): a write or a WebSocket from another page answers
+///   the fixed 403 page.
+/// - Then the request goes to its exposure's upstream, whatever its method (`proxy::forward`).
 ///
-/// Every answer carries `SECURITY_HEADERS`.
-fn respond<B>(exposures: &Exposures, request: &Request<B>, now: u64) -> Response<Full<Bytes>> {
-    let method = request.method();
-    let readable = *method == Method::GET || *method == Method::HEAD;
-    let headers = request.headers();
-    let host = request_host(headers).unwrap_or_default();
-    match request.uri().path() {
-        HEALTHZ_PATH if readable => answer(StatusCode::OK, TEXT, "ok\n", None),
-        ENTER_PATH if *method == Method::GET => {
+/// io.web's own answers carry `headers::set_own_headers`; the upstream's, §13.7's table.
+pub async fn respond(
+    proxy: &Proxy,
+    request: Request<RequestBody>,
+    now: u64,
+    tunnels: &Tunnels,
+) -> Response<WebBody> {
+    let exposures = &proxy.exposures;
+    let framing = exposures.framing();
+    let method = request.method().clone();
+    let readable = method == Method::GET || method == Method::HEAD;
+    let host = request_host(request.headers()).unwrap_or_default();
+    let path = request.uri().path();
+    match path {
+        HEALTHZ_PATH if readable => return answer(StatusCode::OK, TEXT, "ok\n", None, &framing),
+        ENTER_PATH if method == Method::GET => {
+            let headers = request.headers();
             let trace = RequestTrace {
                 request_id: header_text(headers, "x-request-id"),
                 forwarded_for: header_text(headers, "x-forwarded-for"),
             };
-            match exposures.redeem(&host, link_code(request.uri().query()), now, trace) {
-                Some(set_cookie) => answer(StatusCode::OK, HTML, ENTER_PAGE, Some(set_cookie)),
-                None => unauthorized(None),
-            }
+            return match exposures.redeem(&host, link_code(request.uri().query()), now, trace) {
+                Some(set_cookie) => {
+                    answer(StatusCode::OK, HTML, ENTER_PAGE, Some(set_cookie), &framing)
+                }
+                None => unauthorized(None, &framing),
+            };
         }
         // A HEAD never redeems, nor any other method.
-        ENTER_PATH => unauthorized(None),
-        path if path.starts_with(RESERVED_PREFIX) => not_found(),
-        _ if !exposures.knows_host(&host) => not_found(),
-        _ => match session_cookie(headers) {
-            SessionCookie::Absent => unauthorized(None),
-            SessionCookie::Several => refused_session(
-                &host,
-                &SessionRefusal {
-                    reason: "more than one session cookie",
-                    exposure_id: exposures.exposure_of(&host),
-                    ..SessionRefusal::default()
-                },
-            ),
-            SessionCookie::One(value) => match exposures.session(&host, value, now) {
-                Ok(slid) if readable => answer(StatusCode::OK, HTML, PAGE, slid),
-                Ok(_) => not_found(),
-                Err(refusal) => refused_session(&host, &refusal),
-            },
-        },
+        ENTER_PATH => return unauthorized(None, &framing),
+        path if path.starts_with(RESERVED_PREFIX) => return not_found(&framing),
+        _ => {}
     }
+    let Some((exposure_id, gate)) = exposures.gate_of(&host) else {
+        return not_found(&framing);
+    };
+    if method == Method::CONNECT || method == Method::TRACE {
+        let mut refused = answer(
+            StatusCode::METHOD_NOT_ALLOWED,
+            TEXT,
+            "method not allowed\n",
+            None,
+            &framing,
+        );
+        refused
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static(ALLOWED_METHODS));
+        return refused;
+    }
+    let request_id = header_text(request.headers(), "x-request-id");
+    let mut exchange = Exchange::new(request_id, &host, &method, path, exposure_id, gate);
+    let admitted = match session_cookie(request.headers()) {
+        SessionCookie::Absent => {
+            exchange.refuse(401, "no session cookie".to_string(), None);
+            return unauthorized(None, &framing);
+        }
+        SessionCookie::Several => {
+            exchange.refuse(401, "more than one session cookie".to_string(), None);
+            return unauthorized(Some(session_clear_cookie()), &framing);
+        }
+        SessionCookie::One(value) => match exposures.admit(&host, value, now) {
+            Ok(admitted) => admitted,
+            Err(refusal) => return refused_session(exchange, refusal, &framing),
+        },
+    };
+    if let Some(why) = origin_refusal(&method, request.headers(), &host) {
+        // Nothing is forwarded, and nothing stays registered.
+        drop(admitted);
+        exchange.refuse(403, why, None);
+        return answer(StatusCode::FORBIDDEN, HTML, FORBIDDEN_PAGE, None, &framing);
+    }
+    proxy::forward(proxy, admitted, request, exchange, tunnels).await
 }
 
-/// The fixed 401 page for a session cookie that does not serve, logged with its exposure, its
-/// host and why (stage 2.1 §5.10). It clears the cookie, unless the cookie may serve once io.web
-/// reads its enablement's key (`SessionRefusal::kept`, §3.4).
-fn refused_session(host: &str, refusal: &SessionRefusal) -> Response<Full<Bytes>> {
-    tracing::debug!(
-        exposure_id = refusal.exposure_id.as_deref().unwrap_or_default(),
-        host = %host,
-        enablement_id = refusal.enablement_id.as_deref().unwrap_or_default(),
-        reason = refusal.reason,
-        "IO.web refused a session"
-    );
-    unauthorized((!refusal.kept).then(session_clear_cookie))
+/// The Origin check (stage 2.2 §4.1; io-web-v2 §13.8): a request that writes, every method but
+/// GET, HEAD and OPTIONS as Go's `CrossOriginProtection` takes it, or a GET with
+/// `Upgrade: websocket`, passes only from the exposure's own page. Every `*.fluxbee.ai` host is one
+/// site, so `SameSite=Strict` stops no sibling's page; this does.
+///
+/// - `Sec-Fetch-Site: same-origin` or `none` passes; any other value is refused.
+/// - Without it, `Origin: https://<host>` passes; any other origin is refused, `null` included.
+/// - With neither header, it passes: a browser's cross-origin request carries one of them, and a
+///   browser always sends `Origin` with a WebSocket's handshake (RFC 6455 §4.1).
+///
+/// Why it is refused, the header and its value, for the log; `None` when it passes.
+fn origin_refusal(method: &Method, headers: &HeaderMap, host: &str) -> Option<String> {
+    let writes = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    let websocket = *method == Method::GET && headers::names_token(headers, &UPGRADE, "websocket");
+    if !writes && !websocket {
+        return None;
+    }
+    let sites: Vec<&HeaderValue> = headers.get_all("sec-fetch-site").iter().collect();
+    if !sites.is_empty() {
+        return sites
+            .into_iter()
+            .find(|site| !matches!(site.as_bytes(), b"same-origin" | b"none"))
+            .map(|site| {
+                format!(
+                    "Sec-Fetch-Site {:?} is not same-origin",
+                    String::from_utf8_lossy(site.as_bytes())
+                )
+            });
+    }
+    let own = format!("https://{host}");
+    headers
+        .get_all(ORIGIN)
+        .iter()
+        .find(|origin| origin.as_bytes() != own.as_bytes())
+        .map(|origin| {
+            format!(
+                "Origin {:?} is not the exposure's own",
+                String::from_utf8_lossy(origin.as_bytes())
+            )
+        })
 }
 
-/// An answer with `SECURITY_HEADERS`, and `set_cookie` when there is one.
+/// The fixed 401 page for a session cookie that does not serve, its reason in the request's line
+/// (stage 2.1 §5.10). It clears the cookie, unless the cookie may serve once io.web reads its
+/// enablement's key (`SessionRefusal::kept`, §3.4).
+fn refused_session(
+    mut exchange: Exchange,
+    refusal: SessionRefusal,
+    framing: &Framing,
+) -> Response<WebBody> {
+    exchange.refuse(401, refusal.reason.to_string(), refusal.enablement_id);
+    unauthorized((!refusal.kept).then(session_clear_cookie), framing)
+}
+
+/// One of io.web's own answers: `headers::set_own_headers` for the set's origins, and
+/// `set_cookie` when there is one.
 fn answer(
     status: StatusCode,
     content_type: &'static str,
     body: &'static str,
     set_cookie: Option<String>,
-) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
+    framing: &Framing,
+) -> Response<WebBody> {
+    let mut response = Response::new(WebBody::Own(Full::new(Bytes::from_static(body.as_bytes()))));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    for (name, value) in SECURITY_HEADERS {
-        headers.insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_static(value),
-        );
-    }
+    headers::set_own_headers(headers, framing);
     // A cookie's value is hex, digits and dots, and its attributes ASCII: always a valid value.
     if let Some(cookie) = set_cookie.and_then(|cookie| HeaderValue::try_from(cookie).ok()) {
         headers.insert(SET_COOKIE, cookie);
@@ -625,16 +772,29 @@ fn answer(
     response
 }
 
-fn not_found() -> Response<Full<Bytes>> {
-    answer(StatusCode::NOT_FOUND, TEXT, "not found\n", None)
+fn not_found(framing: &Framing) -> Response<WebBody> {
+    answer(StatusCode::NOT_FOUND, TEXT, "not found\n", None, framing)
 }
 
-fn unauthorized(set_cookie: Option<String>) -> Response<Full<Bytes>> {
+/// The fixed 401 page, with `set_cookie` when there is one.
+pub(crate) fn unauthorized(set_cookie: Option<String>, framing: &Framing) -> Response<WebBody> {
     answer(
         StatusCode::UNAUTHORIZED,
         HTML,
         UNAUTHORIZED_PAGE,
         set_cookie,
+        framing,
+    )
+}
+
+/// The fixed 502 page.
+pub(crate) fn bad_gateway(framing: &Framing) -> Response<WebBody> {
+    answer(
+        StatusCode::BAD_GATEWAY,
+        HTML,
+        BAD_GATEWAY_PAGE,
+        None,
+        framing,
     )
 }
 
@@ -698,123 +858,47 @@ fn session_cookie(headers: &HeaderMap) -> SessionCookie<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::{EnablementKeys, LinkCode, SessionToken};
+    use crate::access::{EnablementKeys, LinkCode};
     use crate::exposures::testing::*;
     use crate::exposures::{boot_second, Exposures};
-    use fluxbee_sdk::mesh::{MeshCa, IO_WEB_SERVER_NAME};
+    use crate::headers::{OWN_POLICY, PERMISSIONS_POLICY, SECURITY_HEADERS};
+    use crate::testing::{
+        self, answer_to, body_of, client, closed_port, cookie_of, dial, enabled, enabled_with,
+        enter, exchange_as, header, info, material, page, proxy, registry, request, rustls_error,
+        set_cookie, start_serving, start_with, temp_dir, token_of, without_body, Site, BOOT, CLOUD,
+        UNTIL, UPSTREAM_PAGE,
+    };
+    use fluxbee_sdk::mesh::MeshCa;
     use fluxbee_sdk::protocol::{
         IoWebAccessLinkRequest, IoWebAccessLinkResponse, IoWebExposuresResponse,
         WebExposureKeySlot, IO_WEB_ERROR_KEY_UNAVAILABLE,
     };
     use fluxbee_sdk::vault::web_exposure_vault_key;
-    use http_body_util::BodyExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
     use tokio_rustls::client::TlsStream;
     use tokio_rustls::rustls::pki_types::pem::PemObject;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    use tokio_rustls::rustls::pki_types::CertificateDer;
     use tokio_rustls::rustls::{self, AlertDescription, ClientConfig, RootCertStore};
-    use tokio_rustls::TlsConnector;
 
-    const BOOT: u64 = 1_763_121_000;
-    const UNTIL: u64 = BOOT + 8 * 3600;
     const A: WebExposureKeySlot = WebExposureKeySlot::A;
 
-    /// io.web holding no exposure, which never writes its file.
-    fn no_exposures() -> Arc<Exposures> {
-        Arc::new(Exposures::new(
+    /// io.web holding no exposure, which never writes its file, and no upstream it could reach.
+    fn idle() -> Arc<Proxy> {
+        let exposures = Arc::new(Exposures::new(
             PathBuf::from("never-written/exposures.json"),
             MapKeys::new(),
             0,
-        ))
+        ));
+        proxy(exposures, closed_port())
     }
 
-    /// io.web booted at `boot`, holding `shop` and `erp`, each enabled until `UNTIL` (or `shop`
-    /// until `shop_until`) with its key.
-    async fn enabled(label: &str, boot: u64, shop_until: u64) -> Arc<Exposures> {
-        let keys = MapKeys::new();
-        keys.put(SHOP_ID, A, 4, 1);
-        keys.put(ERP_ID, A, 2, 2);
-        holding(
-            label,
-            keys,
-            boot,
-            set(
-                1,
-                vec![
-                    exposure(SHOP_ID, SHOP, vec![enablement(SHOP_ENB, shop_until, A, 4)]),
-                    exposure(ERP_ID, ERP, vec![enablement(ERP_ENB, UNTIL, A, 2)]),
-                ],
-            ),
-        )
-        .await
-    }
-
-    /// A request as the edge forwards it: its host, its request id and the client's address.
-    fn request(method: Method, target: &str, host: &str, cookie: Option<&str>) -> Request<()> {
-        let mut request = Request::builder()
-            .method(method)
-            .uri(target)
-            .header(HOST, host)
-            .header("x-request-id", "0b5a3c1e-7d2f-4a6b-9c8d-1e2f3a4b5c6d")
-            .header("x-forwarded-for", "203.0.113.7");
-        if let Some(cookie) = cookie {
-            request = request.header(COOKIE, cookie);
-        }
-        request.body(()).unwrap()
-    }
-
-    fn enter(code: &str, host: &str) -> Request<()> {
-        request(
-            Method::GET,
-            &format!("{ENTER_PATH}?code={code}"),
-            host,
-            None,
-        )
-    }
-
-    fn page(host: &str, cookie: &str) -> Request<()> {
-        request(Method::GET, "/", host, Some(cookie))
-    }
-
-    fn set_cookie(response: &Response<Full<Bytes>>) -> Option<String> {
-        response
-            .headers()
-            .get(SET_COOKIE)
-            .map(|value| value.to_str().unwrap().to_string())
-    }
-
-    /// The `Cookie` a browser sends back for a `Set-Cookie`.
-    fn cookie_of(set_cookie: &str) -> String {
-        set_cookie.split(';').next().unwrap().to_string()
-    }
-
-    /// The session a `Cookie` carries.
-    fn token_of(cookie: &str) -> SessionToken<'_> {
-        SessionToken::parse(cookie.strip_prefix("__Host-fluxbee_session=").unwrap()).unwrap()
-    }
-
-    async fn body(response: Response<Full<Bytes>>) -> Bytes {
-        response.into_body().collect().await.unwrap().to_bytes()
-    }
-
-    /// A session on `host`, through a link minted and redeemed at `now`: its `Cookie`.
-    fn sign_in(
-        exposures: &Exposures,
-        exposure_id: &str,
-        enablement_id: &str,
-        host: &str,
-        now: u64,
-    ) -> String {
-        let code = link(exposures, exposure_id, enablement_id, now);
-        let entered = respond(exposures, &enter(&code, host), now);
-        assert_eq!(entered.status(), StatusCode::OK);
-        cookie_of(&set_cookie(&entered).expect("a session"))
+    async fn body(response: Response<WebBody>) -> Bytes {
+        body_of(response).await
     }
 
     /// 401 with the fixed page, and a cookie cleared when `clears`.
-    async fn assert_unauthorized(response: Response<Full<Bytes>>, clears: bool, case: &str) {
+    async fn assert_unauthorized(response: Response<WebBody>, clears: bool, case: &str) {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
         assert_eq!(
             set_cookie(&response),
@@ -824,51 +908,10 @@ mod tests {
         assert_eq!(body(response).await, UNAUTHORIZED_PAGE.as_bytes(), "{case}");
     }
 
-    /// A fresh directory of its own under the system's temp dir.
-    fn temp_dir(label: &str) -> PathBuf {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "io-web-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    /// A registry entry as SY.orchestrator writes it for a joined hive.
-    fn info(hive: &str, role: &str) -> String {
-        format!("hive_id: {hive}\nstatus: connected\nrole: {role}\njoin:\n  phase: done\n")
-    }
-
-    /// A registry holding `ingress1`, a connected ingress, and `worker1`, a connected worker.
-    fn registry() -> HiveRegistry {
-        let root = temp_dir("registry");
-        for (hive, role) in [("ingress1", "ingress"), ("worker1", "worker")] {
-            std::fs::create_dir(root.join(hive)).expect("registry entry");
-            std::fs::write(root.join(hive).join("info.yaml"), info(hive, role)).expect("info.yaml");
-        }
-        HiveRegistry::new(root)
-    }
-
-    /// `hive`'s material: a leaf `ca` issues, with `ca`'s certificate as the roots.
-    fn material(ca: &MeshCa, hive: &str) -> MeshTlsMaterial {
-        let leaf = ca.issue_leaf(hive).unwrap();
-        MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap()
-    }
-
-    /// The edge's client: `hive`'s leaf, verifying io.web under its name.
-    fn client(ca: &MeshCa, hive: &str) -> Arc<ClientConfig> {
-        material(ca, hive).client_config_by_name().unwrap()
-    }
-
-    /// io.web's limits, with the registry checked every 20 ms.
-    fn limits() -> WebLimits {
-        WebLimits {
-            registry_recheck: Duration::from_millis(20),
-            ..LIMITS
-        }
+    /// The upstream's own page, as a valid session gets it.
+    async fn assert_upstream_page(response: Response<WebBody>, case: &str) {
+        assert_eq!(response.status(), StatusCode::OK, "{case}");
+        assert_eq!(body(response).await, UPSTREAM_PAGE.as_bytes(), "{case}");
     }
 
     /// io.web's accept loop on a port of its own, over the motherbee leaf `ca` issues, holding no
@@ -878,40 +921,7 @@ mod tests {
         registry: &HiveRegistry,
         limits: WebLimits,
     ) -> (SocketAddr, Arc<WebStatus>) {
-        start_serving(ca, registry, limits, no_exposures()).await
-    }
-
-    /// The same, holding `exposures`.
-    async fn start_serving(
-        ca: &MeshCa,
-        registry: &HiveRegistry,
-        limits: WebLimits,
-        exposures: Arc<Exposures>,
-    ) -> (SocketAddr, Arc<WebStatus>) {
-        install_crypto_provider();
-        let acceptor = acceptor(&material(ca, PRIMARY_HIVE_ID), registry).unwrap();
-        start_with(acceptor, registry, limits, exposures).await
-    }
-
-    /// io.web's accept loop on a port of its own, over `acceptor`.
-    async fn start_with(
-        acceptor: TlsAcceptor,
-        registry: &HiveRegistry,
-        limits: WebLimits,
-        exposures: Arc<Exposures>,
-    ) -> (SocketAddr, Arc<WebStatus>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let setup = WebSetup {
-            listen: listener.local_addr().unwrap(),
-            tls_dir: PathBuf::new(),
-            registry: registry.clone(),
-            limits,
-        };
-        let status = Arc::new(WebStatus::new());
-        let served = Arc::clone(&status);
-        let listen = setup.listen;
-        tokio::spawn(async move { serve(listener, acceptor, &setup, &served, exposures).await });
-        (listen, status)
+        start_serving(ca, registry, limits, idle()).await
     }
 
     /// A local address nothing listens on, for `run` to bind.
@@ -932,16 +942,6 @@ mod tests {
         panic!("the port never left Starting");
     }
 
-    /// A connection to io.web under its name, as the edge dials it.
-    async fn dial(
-        listen: SocketAddr,
-        client: Arc<ClientConfig>,
-    ) -> std::io::Result<TlsStream<TcpStream>> {
-        let tcp = TcpStream::connect(listen).await?;
-        let name = ServerName::try_from(IO_WEB_SERVER_NAME).unwrap();
-        TlsConnector::from(client).connect(name, tcp).await
-    }
-
     /// One request on `archi.example.com` and its answer.
     async fn exchange(
         stream: &mut TlsStream<TcpStream>,
@@ -949,57 +949,6 @@ mod tests {
         path: &str,
     ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
         exchange_as(stream, method, path, "archi.example.com", None).await
-    }
-
-    /// One request on `host`, with `cookie` when there is one, and its answer: the status, the
-    /// headers (lowercase names) and the body.
-    async fn exchange_as(
-        stream: &mut TlsStream<TcpStream>,
-        method: &str,
-        path: &str,
-        host: &str,
-        cookie: Option<&str>,
-    ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-        let cookie = cookie
-            .map(|cookie| format!("Cookie: {cookie}\r\n"))
-            .unwrap_or_default();
-        let request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{cookie}\r\n");
-        stream.write_all(request.as_bytes()).await?;
-        stream.flush().await?;
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).await? == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-            head.push(byte[0]);
-        }
-        let head = String::from_utf8(head).expect("an ASCII head");
-        let mut lines = head.split("\r\n");
-        let status = lines.next().unwrap().split(' ').nth(1).unwrap();
-        let headers: Vec<(String, String)> = lines
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let (name, value) = line.split_once(':').unwrap();
-                (name.trim().to_ascii_lowercase(), value.trim().to_string())
-            })
-            .collect();
-        // A HEAD answer announces the length of the body it does not carry.
-        let length = match method {
-            "HEAD" => 0,
-            _ => header(&headers, "content-length").parse().unwrap(),
-        };
-        let mut body = vec![0u8; length];
-        stream.read_exact(&mut body).await?;
-        Ok((status.parse().unwrap(), headers, body))
-    }
-
-    fn header<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
-        headers
-            .iter()
-            .find(|(header, _)| header == name)
-            .map(|(_, value)| value.as_str())
-            .unwrap_or_default()
     }
 
     /// What a client the handshake refuses gets. In TLS 1.3 its own handshake ends before the
@@ -1013,32 +962,13 @@ mod tests {
         }
     }
 
-    /// The rustls error a TLS stream's I/O error carries.
-    fn rustls_error(err: &std::io::Error) -> Option<&rustls::Error> {
-        err.get_ref()?.downcast_ref::<rustls::Error>()
-    }
-
-    /// Whether the server ends `stream` within `within`: EOF or an error, after whatever it sent.
-    async fn ended(stream: &mut TlsStream<TcpStream>, within: Duration) -> bool {
-        let mut buf = [0u8; 512];
-        timeout(within, async {
-            while let Ok(read) = stream.read(&mut buf).await {
-                if read == 0 {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_ok()
-    }
-
     /// The handshake admits a connected ingress, and refuses a worker (access_denied) and a client
     /// with no certificate (certificate_required): no request of theirs is answered.
     #[tokio::test]
     async fn the_handshake_admits_only_a_connected_ingress() {
         let ca = MeshCa::generate().unwrap();
         let registry = registry();
-        let (listen, status) = start(&ca, &registry, limits()).await;
+        let (listen, status) = start(&ca, &registry, testing::limits()).await;
         assert_eq!(settled(&status).await, WebState::Serving);
 
         let mut ingress = dial(listen, client(&ca, "ingress1"))
@@ -1085,7 +1015,7 @@ mod tests {
         let registry = registry();
         install_crypto_provider();
         let ca_only = TlsAcceptor::from(material(&ca, PRIMARY_HIVE_ID).server_config().unwrap());
-        let (listen, _) = start_with(ca_only, &registry, limits(), no_exposures()).await;
+        let (listen, _) = start_with(ca_only, &registry, testing::limits(), idle()).await;
 
         let mut ingress = dial(listen, client(&ca, "ingress1"))
             .await
@@ -1110,12 +1040,12 @@ mod tests {
     async fn a_connection_is_cut_once_its_hive_is_no_longer_a_connected_ingress() {
         let ca = MeshCa::generate().unwrap();
         let registry = registry();
-        let (listen, _) = start(&ca, &registry, limits()).await;
+        let (listen, _) = start(&ca, &registry, testing::limits()).await;
         let mut ingress = dial(listen, client(&ca, "ingress1")).await.unwrap();
         let (code, _, _) = exchange(&mut ingress, "GET", HEALTHZ_PATH).await.unwrap();
         assert_eq!(code, 200);
         assert!(
-            !ended(&mut ingress, Duration::from_millis(200)).await,
+            !testing::ended(&mut ingress, Duration::from_millis(200)).await,
             "still an ingress: the connection stays open"
         );
 
@@ -1125,7 +1055,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            ended(&mut ingress, Duration::from_secs(2)).await,
+            testing::ended(&mut ingress, Duration::from_secs(2)).await,
             "cut within a few rechecks"
         );
         let _ = std::fs::remove_dir_all(registry.root());
@@ -1139,13 +1069,13 @@ mod tests {
         let registry = registry();
         let limits = WebLimits {
             header_read_timeout: Duration::from_millis(200),
-            ..limits()
+            ..testing::limits()
         };
         let (listen, _) = start(&ca, &registry, limits).await;
         let mut ingress = dial(listen, client(&ca, "ingress1")).await.unwrap();
         ingress.write_all(b"G").await.unwrap();
         ingress.flush().await.unwrap();
-        assert!(ended(&mut ingress, Duration::from_secs(3)).await);
+        assert!(testing::ended(&mut ingress, Duration::from_secs(3)).await);
         let _ = std::fs::remove_dir_all(registry.root());
     }
 
@@ -1158,7 +1088,7 @@ mod tests {
         let limits = WebLimits {
             max_handshakes_per_source: 1,
             handshake_timeout: Duration::from_millis(500),
-            ..limits()
+            ..testing::limits()
         };
         let (listen, _) = start(&ca, &registry, limits).await;
         // A connection that never starts its handshake holds the only slot.
@@ -1190,7 +1120,7 @@ mod tests {
         let registry = registry();
         let limits = WebLimits {
             max_connections: 1,
-            ..limits()
+            ..testing::limits()
         };
         let (listen, _) = start(&ca, &registry, limits).await;
         let _silent = TcpStream::connect(listen).await.unwrap();
@@ -1221,7 +1151,7 @@ mod tests {
             listen,
             tls_dir: missing.clone(),
             registry: registry.clone(),
-            limits: limits(),
+            limits: testing::limits(),
         };
         let status = Arc::new(WebStatus::new());
         let (_configured, configured_rx) = watch::channel(true);
@@ -1231,7 +1161,7 @@ mod tests {
             Arc::clone(&status),
             configured_rx,
             loaded_rx,
-            no_exposures(),
+            idle(),
         ));
         match settled(&status).await {
             WebState::Unavailable { code, message } => {
@@ -1259,7 +1189,7 @@ mod tests {
         let ca = MeshCa::generate().unwrap();
         let scratch = temp_dir("no-registry");
         let registry = HiveRegistry::new(scratch.join("hives"));
-        let (listen, status) = start(&ca, &registry, limits()).await;
+        let (listen, status) = start(&ca, &registry, testing::limits()).await;
         match settled(&status).await {
             WebState::Unavailable { code, .. } => assert_eq!(code, HIVE_REGISTRY_UNAVAILABLE),
             other => panic!("{other:?}"),
@@ -1291,7 +1221,7 @@ mod tests {
             listen,
             tls_dir: tls_dir.clone(),
             registry: registry.clone(),
-            limits: limits(),
+            limits: testing::limits(),
         };
         let status = Arc::new(WebStatus::new());
         let (configured, configured_rx) = watch::channel(false);
@@ -1301,7 +1231,7 @@ mod tests {
             Arc::clone(&status),
             configured_rx,
             loaded_rx,
-            no_exposures(),
+            idle(),
         ));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1334,19 +1264,18 @@ mod tests {
             .to_string()
     }
 
-    /// Every route by host, cookie and path, each answer with the security headers.
+    /// Every route by host, cookie and path. io.web's own answers carry the strict set; a valid
+    /// session reaches the upstream, whose answer carries the application's column of §13.7's
+    /// table and none of the strict set (stage 2.2 §4.4).
     #[tokio::test]
     async fn each_route_answers_with_the_security_headers() {
-        let exposures = enabled("routes", BOOT, UNTIL).await;
-        let session = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
+        let site = enabled("routes", BOOT, UNTIL).await;
+        let session = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
         let with = Some(session.as_str());
         let unknown = "nowhere.hive-k3m9x7q2.fluxbee.ai";
         let not_found = "not found\n";
+        let own_policy = format!("{OWN_POLICY}; frame-ancestors 'none'");
         for (method, path, host, cookie, code, content_type, body_text) in [
-            (Method::GET, "/", SHOP, with, 200, HTML, PAGE),
-            (Method::HEAD, "/", SHOP, with, 200, HTML, PAGE),
-            (Method::GET, "/index.html", SHOP, with, 200, HTML, PAGE),
-            (Method::POST, "/", SHOP, with, 404, TEXT, not_found),
             (Method::GET, "/", SHOP, None, 401, HTML, UNAUTHORIZED_PAGE),
             (
                 Method::DELETE,
@@ -1409,15 +1338,71 @@ mod tests {
             ),
         ] {
             let case = format!("{method} {path} on {host}");
-            let response = respond(&exposures, &request(method, path, host, cookie), BOOT + 20);
+            let response = site
+                .respond(request(method, path, host, cookie), BOOT + 20)
+                .await;
             assert_eq!(response.status().as_u16(), code, "{case}");
             assert_eq!(response.headers()[CONTENT_TYPE], content_type, "{case}");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                own_policy.as_str(),
+                "{case}"
+            );
             for (name, value) in SECURITY_HEADERS {
                 assert_eq!(response.headers()[name], value, "{case}: {name}");
             }
             assert_eq!(body(response).await, body_text.as_bytes(), "{case}");
         }
-        remove(&exposures);
+
+        // A valid session reaches the upstream, on any path and with any method (a write with no
+        // `Origin` and no `Sec-Fetch-Site` passes the Origin check): the upstream's answer, with
+        // the application's headers.
+        let reached = site.upstream.requests().len();
+        for (method, path) in [
+            (Method::GET, "/"),
+            (Method::HEAD, "/"),
+            (Method::GET, "/index.html"),
+            (Method::POST, "/"),
+        ] {
+            let case = format!("{method} {path} with a session");
+            let head = method == Method::HEAD;
+            let response = site
+                .respond(request(method, path, SHOP, with), BOOT + 20)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            let headers = response.headers();
+            assert_eq!(headers[CONTENT_TYPE], "text/html; charset=utf-8", "{case}");
+            assert_eq!(headers["x-content-type-options"], "nosniff", "{case}");
+            assert_eq!(
+                headers["content-security-policy"], "frame-ancestors 'self'",
+                "{case}"
+            );
+            for strict in [
+                "referrer-policy",
+                "cache-control",
+                "x-robots-tag",
+                "permissions-policy",
+            ] {
+                assert!(!headers.contains_key(strict), "{case}: {strict}");
+            }
+            let expected: &[u8] = if head { b"" } else { UPSTREAM_PAGE.as_bytes() };
+            assert_eq!(body(response).await, expected, "{case}");
+        }
+        let seen = site.upstream.requests();
+        assert_eq!(seen.len(), reached + 4, "each one reached the upstream");
+        assert_eq!(
+            seen[reached..]
+                .iter()
+                .map(|seen| (seen.method.clone(), seen.path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Method::GET, "/"),
+                (Method::HEAD, "/"),
+                (Method::GET, "/index.html"),
+                (Method::POST, "/"),
+            ]
+        );
+        remove(site.exposures());
     }
 
     /// The request's host is read as the edge forwards it, in its canonical form; two hosts or
@@ -1448,11 +1433,16 @@ mod tests {
         assert_eq!(host_of(&[""]), None);
     }
 
-    /// The pages render under their own policy, which loads nothing, and name no version and
-    /// nothing internal.
+    /// io.web's own pages render under their own policy, which loads nothing, and name no version
+    /// and nothing internal.
     #[test]
     fn the_pages_load_nothing_and_name_nothing_internal() {
-        for page in [PAGE, ENTER_PAGE, UNAUTHORIZED_PAGE] {
+        for page in [
+            ENTER_PAGE,
+            UNAUTHORIZED_PAGE,
+            FORBIDDEN_PAGE,
+            BAD_GATEWAY_PAGE,
+        ] {
             let page = page.to_ascii_lowercase();
             for load in [
                 "<style", "style=", "<script", "<link", "<img", "<iframe", "<object", "<embed",
@@ -1467,6 +1457,7 @@ mod tests {
                 "motherbee",
                 "ingress",
                 "io.web",
+                "upstream",
                 "9200",
                 "exp:",
                 "enb:",
@@ -1475,29 +1466,33 @@ mod tests {
             }
         }
         assert!(ENTER_PAGE.contains(r#"<meta http-equiv="refresh" content="0; url=/">"#));
+        let policy = Framing::default().own_policy;
+        let policy = policy.to_str().unwrap();
         for directive in [
             "default-src 'none'",
             "base-uri 'none'",
             "form-action 'none'",
             "frame-ancestors 'none'",
         ] {
-            assert!(CONTENT_SECURITY_POLICY.contains(directive), "{directive}");
+            assert!(policy.contains(directive), "{directive}");
         }
     }
 
-    /// Over the wire: a link redeemed, then the page with the session's cookie, with its
-    /// headers; HEAD sends no body, so the connection stays in step for the next request.
+    /// Over the wire: a link redeemed, then the upstream's page with the session's cookie, with
+    /// the application's headers; HEAD reaches the upstream too and sends no body, so the
+    /// connection stays in step for the next request.
     #[tokio::test]
     async fn the_page_goes_out_with_its_headers_and_head_sends_no_body() {
         let now = unix_now();
         let keys = MapKeys::new();
         keys.put(SHOP_ID, A, 4, 1);
         let shop = exposure(SHOP_ID, SHOP, vec![enablement(SHOP_ENB, now + 3600, A, 4)]);
-        let exposures = holding("wire", keys, now - 10, set(1, vec![shop])).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, now);
+        let site = Site::new(holding("wire", keys, now - 10, set(1, vec![shop])).await).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, now);
         let ca = MeshCa::generate().unwrap();
         let registry = registry();
-        let (listen, _) = start_serving(&ca, &registry, limits(), Arc::clone(&exposures)).await;
+        let (listen, _) =
+            start_serving(&ca, &registry, testing::limits(), Arc::clone(&site.proxy)).await;
         let mut ingress = dial(listen, client(&ca, "ingress1")).await.unwrap();
 
         let target = format!("{ENTER_PATH}?code={code}");
@@ -1505,23 +1500,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((status, body.as_slice()), (200, ENTER_PAGE.as_bytes()));
+        for (name, value) in SECURITY_HEADERS {
+            assert_eq!(header(&headers, name), value, "{name}");
+        }
         let cookie = cookie_of(header(&headers, "set-cookie"));
 
         let (status, headers, body) = exchange_as(&mut ingress, "GET", "/", SHOP, Some(&cookie))
             .await
             .unwrap();
-        assert_eq!((status, body.as_slice()), (200, PAGE.as_bytes()));
-        assert_eq!(header(&headers, "content-type"), HTML);
-        for (name, value) in SECURITY_HEADERS {
-            assert_eq!(header(&headers, name), value, "{name}");
-        }
+        assert_eq!((status, body.as_slice()), (200, UPSTREAM_PAGE.as_bytes()));
+        assert_eq!(header(&headers, "content-type"), "text/html; charset=utf-8");
+        assert_eq!(header(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(
+            header(&headers, "content-security-policy"),
+            "frame-ancestors 'self'"
+        );
+        assert_eq!(header(&headers, "cache-control"), "", "no strict set");
         let (status, headers, _) = exchange_as(&mut ingress, "HEAD", "/", SHOP, Some(&cookie))
             .await
             .unwrap();
         assert_eq!(status, 200);
         assert_eq!(
-            header(&headers, "content-security-policy"),
-            CONTENT_SECURITY_POLICY
+            header(&headers, "content-length"),
+            UPSTREAM_PAGE.len().to_string(),
+            "the upstream's HEAD announces its GET's length"
         );
         let (status, _, body) = exchange_as(&mut ingress, "GET", HEALTHZ_PATH, SHOP, None)
             .await
@@ -1534,17 +1536,24 @@ mod tests {
             (status, body.as_slice()),
             (401, UNAUTHORIZED_PAGE.as_bytes())
         );
+        let methods: Vec<Method> = site
+            .upstream
+            .requests()
+            .into_iter()
+            .map(|seen| seen.method)
+            .collect();
+        assert_eq!(methods, [Method::GET, Method::HEAD]);
         let _ = std::fs::remove_dir_all(registry.root());
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A link redeems once, on its host, into a session cookie with every attribute of §3.3 and a
     /// page that moves on to `/`; the cookie then opens the exposure.
     #[tokio::test]
     async fn a_link_redeems_once_and_sets_the_host_cookie() {
-        let exposures = enabled("redeem", BOOT, UNTIL).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
-        let entered = respond(&exposures, &enter(&code, SHOP), BOOT + 15);
+        let site = enabled("redeem", BOOT, UNTIL).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
+        let entered = site.respond(enter(&code, SHOP), BOOT + 15).await;
         assert_eq!(entered.status(), StatusCode::OK);
         let session = set_cookie(&entered).expect("a session");
         let attributes: Vec<&str> = session.split("; ").collect();
@@ -1577,22 +1586,21 @@ mod tests {
         assert_eq!(entered.headers()[CONTENT_TYPE], HTML);
         assert_eq!(body(entered).await, ENTER_PAGE.as_bytes());
 
-        let served = respond(&exposures, &page(SHOP, attributes[0]), BOOT + 16);
-        assert_eq!(served.status(), StatusCode::OK);
-        assert_eq!(body(served).await, PAGE.as_bytes());
+        let served = site.respond(page(SHOP, attributes[0]), BOOT + 16).await;
+        assert_upstream_page(served, "the cookie opens the exposure").await;
 
         assert_unauthorized(
-            respond(&exposures, &enter(&code, SHOP), BOOT + 20),
+            site.respond(enter(&code, SHOP), BOOT + 20).await,
             false,
             "twice",
         )
         .await;
-        let view = exposures.view(BOOT + 20);
+        let view = site.exposures().view(BOOT + 20);
         assert_eq!(view["links_issued"], 1);
         assert_eq!(view["links_redeemed"], 1);
         assert_eq!(view["links_refused"], 1);
         assert_eq!(view["sessions_minted"], 1);
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// The exposure is in the code and the host in its MAC: a link fails on another exposure's
@@ -1600,15 +1608,15 @@ mod tests {
     /// on its own host.
     #[tokio::test]
     async fn a_link_is_refused_on_another_host() {
-        let exposures = enabled("host", BOOT, UNTIL).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
+        let site = enabled("host", BOOT, UNTIL).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
         for host in [
             ERP,
             "nowhere.hive-k3m9x7q2.fluxbee.ai",
             "hive-k3m9x7q2.fluxbee.ai",
         ] {
             assert_unauthorized(
-                respond(&exposures, &enter(&code, host), BOOT + 11),
+                site.respond(enter(&code, host), BOOT + 11).await,
                 false,
                 host,
             )
@@ -1619,49 +1627,51 @@ mod tests {
         let (x, e) = (hex_id(ERP_ID), hex_id(ERP_ENB));
         let elsewhere = LinkCode::mint(&erp_keys, SHOP, &x, &e, &"ab".repeat(16), BOOT + 10);
         assert_unauthorized(
-            respond(&exposures, &enter(&elsewhere, ERP), BOOT + 11),
+            site.respond(enter(&elsewhere, ERP), BOOT + 11).await,
             false,
             "minted for another host",
         )
         .await;
         let its_own = LinkCode::mint(&erp_keys, ERP, &x, &e, &"cd".repeat(16), BOOT + 10);
         assert_eq!(
-            respond(&exposures, &enter(&its_own, ERP), BOOT + 11).status(),
+            site.respond(enter(&its_own, ERP), BOOT + 11).await.status(),
             StatusCode::OK
         );
         assert_eq!(
-            respond(&exposures, &enter(&code, SHOP), BOOT + 12).status(),
+            site.respond(enter(&code, SHOP), BOOT + 12).await.status(),
             StatusCode::OK,
             "the refusals spent nothing"
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A link redeems up to 120 s after it was minted, and not a second later (§3.2).
     #[tokio::test]
     async fn a_link_is_refused_after_120_s() {
-        let exposures = enabled("late", BOOT, UNTIL).await;
-        let late = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
+        let site = enabled("late", BOOT, UNTIL).await;
+        let late = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
         assert_unauthorized(
-            respond(&exposures, &enter(&late, SHOP), BOOT + 10 + 121),
+            site.respond(enter(&late, SHOP), BOOT + 10 + 121).await,
             false,
             "121 s",
         )
         .await;
-        let in_time = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
+        let in_time = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
         assert_eq!(
-            respond(&exposures, &enter(&in_time, SHOP), BOOT + 10 + 120).status(),
+            site.respond(enter(&in_time, SHOP), BOOT + 10 + 120)
+                .await
+                .status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A code changed anywhere, signed with another key, or malformed fails, as do two codes or
     /// none; the genuine one still redeems.
     #[tokio::test]
     async fn a_link_is_refused_tampered() {
-        let exposures = enabled("tampered", BOOT, UNTIL).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
+        let site = enabled("tampered", BOOT, UNTIL).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
         let fields: Vec<&str> = code.split('.').collect();
         let with = |index: usize, value: &str| {
             let mut changed = fields.clone();
@@ -1692,7 +1702,7 @@ mod tests {
             ("empty", String::new()),
         ] {
             assert_unauthorized(
-                respond(&exposures, &enter(&tampered, SHOP), BOOT + 11),
+                site.respond(enter(&tampered, SHOP), BOOT + 11).await,
                 false,
                 case,
             )
@@ -1700,18 +1710,16 @@ mod tests {
         }
         let twice = format!("{ENTER_PATH}?code={code}&code={code}");
         for (case, target) in [("two codes", twice.as_str()), ("no code", ENTER_PATH)] {
-            let response = respond(
-                &exposures,
-                &request(Method::GET, target, SHOP, None),
-                BOOT + 11,
-            );
+            let response = site
+                .respond(request(Method::GET, target, SHOP, None), BOOT + 11)
+                .await;
             assert_unauthorized(response, false, case).await;
         }
         assert_eq!(
-            respond(&exposures, &enter(&code, SHOP), BOOT + 12).status(),
+            site.respond(enter(&code, SHOP), BOOT + 12).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A link minted before io.web's boot is refused after it, one minted in the very second
@@ -1730,10 +1738,15 @@ mod tests {
         // io.web starts again within BOOT + 20, and loads its set and its keys.
         let started = BOOT + 20;
         let file = before.file().to_path_buf();
-        let after = Exposures::new(file.clone(), keys.clone(), boot_second(started));
+        let after = Arc::new(Exposures::new(
+            file.clone(),
+            keys.clone(),
+            boot_second(started),
+        ));
         after.load_at_boot(started).await;
+        let after = Site::new(after).await;
         for (case, code) in [("earlier", &earlier), ("in its last second", &last_second)] {
-            let response = respond(&after, &enter(code, SHOP), started + 1);
+            let response = after.respond(enter(code, SHOP), started + 1).await;
             assert_unauthorized(response, false, case).await;
         }
         let request = IoWebAccessLinkRequest {
@@ -1743,23 +1756,27 @@ mod tests {
         };
         assert!(
             matches!(
-                after.issue_link(&request, started),
+                after.exposures().issue_link(&request, started),
                 IoWebAccessLinkResponse::Error { error_code, .. }
                     if error_code == IO_WEB_ERROR_KEY_UNAVAILABLE
             ),
             "no link in the second it started"
         );
-        let fresh = link(&after, SHOP_ID, SHOP_ENB, started + 1);
+        let fresh = link(after.exposures(), SHOP_ID, SHOP_ENB, started + 1);
         assert_eq!(
-            respond(&after, &enter(&fresh, SHOP), started + 1).status(),
+            after
+                .respond(enter(&fresh, SHOP), started + 1)
+                .await
+                .status(),
             StatusCode::OK
         );
 
         // It stops within the second it minted that link, and its successor, started in it too,
         // refuses the code it spent.
-        let successor = Exposures::new(file, keys, boot_second(started + 1));
+        let successor = Arc::new(Exposures::new(file, keys, boot_second(started + 1)));
         successor.load_at_boot(started + 1).await;
-        let again = respond(&successor, &enter(&fresh, SHOP), started + 1);
+        let successor = Site::new(successor).await;
+        let again = successor.respond(enter(&fresh, SHOP), started + 1).await;
         assert_unauthorized(again, false, "spent before a restart within its second").await;
         remove(&before);
     }
@@ -1767,65 +1784,78 @@ mod tests {
     /// A link of an enablement that has ended is refused, within its 120 s too.
     #[tokio::test]
     async fn a_link_is_refused_of_an_ended_enablement() {
-        let exposures = enabled("ended", BOOT, BOOT + 100).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 90);
+        let site = enabled("ended", BOOT, BOOT + 100).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 90);
         assert_unauthorized(
-            respond(&exposures, &enter(&code, SHOP), BOOT + 100),
+            site.respond(enter(&code, SHOP), BOOT + 100).await,
             false,
             "ended",
         )
         .await;
-        let other = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 90);
+        let other = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 90);
         assert_eq!(
-            respond(&exposures, &enter(&other, SHOP), BOOT + 99).status(),
+            site.respond(enter(&other, SHOP), BOOT + 99).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A HEAD never redeems, so a link's preview never spends it, nor does another method: the
     /// GET after them still redeems.
     #[tokio::test]
     async fn head_never_redeems() {
-        let exposures = enabled("head", BOOT, UNTIL).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
+        let site = enabled("head", BOOT, UNTIL).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
         let target = format!("{ENTER_PATH}?code={code}");
         for method in [Method::HEAD, Method::POST] {
             let case = method.to_string();
-            let response = respond(&exposures, &request(method, &target, SHOP, None), BOOT + 11);
+            let response = site
+                .respond(request(method, &target, SHOP, None), BOOT + 11)
+                .await;
             assert_unauthorized(response, false, &case).await;
         }
-        assert_eq!(exposures.view(BOOT + 11)["links_refused"], 0);
+        assert_eq!(site.exposures().view(BOOT + 11)["links_refused"], 0);
         assert_eq!(
-            respond(&exposures, &enter(&code, SHOP), BOOT + 12).status(),
+            site.respond(enter(&code, SHOP), BOOT + 12).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        assert!(
+            site.upstream.requests().is_empty(),
+            "nothing under /.fluxbee/ reaches an upstream"
+        );
+        remove(site.exposures());
     }
 
-    /// A session serves the page on any path; once its last activity is 60 s old, the answer
-    /// carries the cookie again with `active = now`, the same session, whose 30 min count from
-    /// there.
+    /// A session reaches the upstream on any path, its query passed on; once its last activity is
+    /// 60 s old, the upstream's answer carries the cookie again with `active = now`, the same
+    /// session, whose 30 min count from there.
     #[tokio::test]
     async fn a_session_serves_the_page_and_slides_after_60_s() {
-        let exposures = enabled("slide", BOOT, UNTIL).await;
-        let cookie = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
-        let early = respond(
-            &exposures,
-            &request(Method::GET, "/any/path?x=1", SHOP, Some(&cookie)),
-            BOOT + 69,
-        );
+        let site = enabled("slide", BOOT, UNTIL).await;
+        let cookie = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let early = site
+            .respond(
+                request(Method::GET, "/any/path?x=1", SHOP, Some(&cookie)),
+                BOOT + 69,
+            )
+            .await;
         assert_eq!(early.status(), StatusCode::OK);
         assert_eq!(set_cookie(&early), None, "59 s: no slide");
-        assert_eq!(body(early).await, PAGE.as_bytes());
+        assert_eq!(body(early).await, UPSTREAM_PAGE.as_bytes());
+        let seen = site.upstream.requests();
+        assert_eq!(
+            (seen[0].path.as_str(), seen[0].query.as_deref()),
+            ("/any/path", Some("x=1"))
+        );
 
-        let slid = respond(&exposures, &page(SHOP, &cookie), BOOT + 70);
+        let slid = site.respond(page(SHOP, &cookie), BOOT + 70).await;
         assert_eq!(slid.status(), StatusCode::OK);
         let renewed = set_cookie(&slid).expect("60 s: the cookie again");
         assert!(
             renewed.ends_with("; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=1800"),
             "{renewed}"
         );
+        assert_eq!(body(slid).await, UPSTREAM_PAGE.as_bytes());
         let renewed = cookie_of(&renewed);
         let (old, new) = (token_of(&cookie), token_of(&renewed));
         assert_eq!(
@@ -1834,40 +1864,41 @@ mod tests {
         );
 
         assert_eq!(
-            respond(&exposures, &page(SHOP, &renewed), BOOT + 70 + 1800).status(),
+            site.respond(page(SHOP, &renewed), BOOT + 70 + 1800)
+                .await
+                .status(),
             StatusCode::OK
         );
         assert_unauthorized(
-            respond(&exposures, &page(SHOP, &cookie), BOOT + 10 + 1801),
+            site.respond(page(SHOP, &cookie), BOOT + 10 + 1801).await,
             true,
             "the cookie before the slide",
         )
         .await;
         let head = request(Method::HEAD, "/", SHOP, Some(&renewed));
-        assert_eq!(
-            respond(&exposures, &head, BOOT + 80).status(),
-            StatusCode::OK
-        );
-        remove(&exposures);
+        assert_eq!(site.respond(head, BOOT + 80).await.status(), StatusCode::OK);
+        remove(site.exposures());
     }
 
     /// 30 min without a request end a session: at 1800 s it still serves, at 1801 s it is refused
     /// and its cookie cleared.
     #[tokio::test]
     async fn a_session_ends_after_30_min_idle() {
-        let exposures = enabled("idle", BOOT, UNTIL).await;
-        let cookie = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
+        let site = enabled("idle", BOOT, UNTIL).await;
+        let cookie = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
         assert_eq!(
-            respond(&exposures, &page(SHOP, &cookie), BOOT + 10 + 1800).status(),
+            site.respond(page(SHOP, &cookie), BOOT + 10 + 1800)
+                .await
+                .status(),
             StatusCode::OK
         );
         assert_unauthorized(
-            respond(&exposures, &page(SHOP, &cookie), BOOT + 10 + 1801),
+            site.respond(page(SHOP, &cookie), BOOT + 10 + 1801).await,
             true,
             "idle",
         )
         .await;
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A session ends with its enablement: its cookie's `Max-Age` stops there, and the first
@@ -1875,88 +1906,90 @@ mod tests {
     #[tokio::test]
     async fn a_session_ends_at_the_enablement_s_end() {
         let end = BOOT + 1000;
-        let exposures = enabled("end", BOOT, end).await;
-        let code = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 10);
-        let entered = respond(&exposures, &enter(&code, SHOP), BOOT + 10);
+        let site = enabled("end", BOOT, end).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
+        let entered = site.respond(enter(&code, SHOP), BOOT + 10).await;
         let session = set_cookie(&entered).unwrap();
         assert!(session.ends_with("; Max-Age=990"), "{session}");
         let cookie = cookie_of(&session);
-        let last = respond(&exposures, &page(SHOP, &cookie), end - 1);
+        let last = site.respond(page(SHOP, &cookie), end - 1).await;
         assert_eq!(last.status(), StatusCode::OK);
         let slid = set_cookie(&last).unwrap();
         assert!(slid.ends_with("; Max-Age=1"), "{slid}");
         assert_unauthorized(
-            respond(&exposures, &page(SHOP, &cookie), end),
+            site.respond(page(SHOP, &cookie), end).await,
             true,
             "the end",
         )
         .await;
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A session waits for its key (§3.4): io.web restarted and could not read the key yet, as
     /// with SY.vault or identity not ready, so the session gets the 401 page with its cookie kept,
-    /// not cleared; once the retry reads the key, the same cookie serves the page again.
+    /// not cleared; once the retry reads the key, the same cookie reaches the upstream again.
     #[tokio::test]
     async fn a_session_waits_for_its_key_after_a_restart() {
         let keys = MapKeys::new();
         keys.put(SHOP_ID, A, 4, 1);
         let shop = exposure(SHOP_ID, SHOP, vec![enablement(SHOP_ENB, UNTIL, A, 4)]);
-        let before = holding("waits", keys.clone(), BOOT, set(1, vec![shop])).await;
-        let cookie = sign_in(&before, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
+        let before =
+            Site::new(holding("waits", keys.clone(), BOOT, set(1, vec![shop])).await).await;
+        let cookie = before.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
 
         let vault_key = web_exposure_vault_key(SHOP_ID, A).unwrap();
         keys.answer(&vault_key, Err("SY.vault is not ready".to_string()));
-        let after = Exposures::new(
-            before.file().to_path_buf(),
+        let after = Arc::new(Exposures::new(
+            before.exposures().file().to_path_buf(),
             keys.clone(),
             boot_second(BOOT + 100),
-        );
+        ));
         after.load_at_boot(BOOT + 100).await;
-        assert_eq!(after.view(BOOT + 100)["keys_unavailable"], 1);
+        let after = Site::new(after).await;
+        assert_eq!(after.exposures().view(BOOT + 100)["keys_unavailable"], 1);
         assert_unauthorized(
-            respond(&after, &page(SHOP, &cookie), BOOT + 101),
+            after.respond(page(SHOP, &cookie), BOOT + 101).await,
             false,
             "its key not read yet",
         )
         .await;
+        assert!(after.upstream.requests().is_empty());
 
         keys.put(SHOP_ID, A, 4, 1);
-        after.retry(BOOT + 130).await;
-        let served = respond(&after, &page(SHOP, &cookie), BOOT + 131);
-        assert_eq!(served.status(), StatusCode::OK);
-        assert_eq!(body(served).await, PAGE.as_bytes());
-        remove(&before);
+        after.exposures().retry(BOOT + 130).await;
+        let served = after.respond(page(SHOP, &cookie), BOOT + 131).await;
+        assert_upstream_page(served, "its key read").await;
+        remove(before.exposures());
     }
 
     /// A session is its exposure's alone: on another exposure's host it is refused and cleared
     /// there, and still serves on its own.
     #[tokio::test]
     async fn a_session_of_one_exposure_fails_on_another() {
-        let exposures = enabled("another", BOOT, UNTIL).await;
-        let cookie = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
+        let site = enabled("another", BOOT, UNTIL).await;
+        let cookie = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
         assert_unauthorized(
-            respond(&exposures, &page(ERP, &cookie), BOOT + 11),
+            site.respond(page(ERP, &cookie), BOOT + 11).await,
             true,
             "erp",
         )
         .await;
         assert_eq!(
-            respond(&exposures, &page(SHOP, &cookie), BOOT + 12).status(),
+            site.respond(page(SHOP, &cookie), BOOT + 12).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// A push that drops an exposure's enablement ends each of its sessions at their next
     /// request, and its pending link; the other exposure's session goes on.
     #[tokio::test]
     async fn a_disable_push_ends_every_session_at_once() {
-        let exposures = enabled("disable", BOOT, UNTIL).await;
-        let first = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
-        let second = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 11);
-        let other = sign_in(&exposures, ERP_ID, ERP_ENB, ERP, BOOT + 12);
-        let pending = link(&exposures, SHOP_ID, SHOP_ENB, BOOT + 13);
+        let site = enabled("disable", BOOT, UNTIL).await;
+        let first = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let second = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 11).await;
+        let other = site.sign_in(ERP_ID, ERP_ENB, ERP, BOOT + 12).await;
+        let pending = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 13);
 
         let disabled = set(
             2,
@@ -1965,7 +1998,7 @@ mod tests {
                 exposure(ERP_ID, ERP, vec![enablement(ERP_ENB, UNTIL, A, 2)]),
             ],
         );
-        let answer = exposures.apply_push(disabled, BOOT + 14).await;
+        let answer = site.exposures().apply_push(disabled, BOOT + 14).await;
         assert!(
             matches!(
                 answer,
@@ -1979,35 +2012,35 @@ mod tests {
         );
         for (case, cookie) in [("first", &first), ("second", &second)] {
             assert_unauthorized(
-                respond(&exposures, &page(SHOP, cookie), BOOT + 14),
+                site.respond(page(SHOP, cookie), BOOT + 14).await,
                 true,
                 case,
             )
             .await;
         }
         assert_unauthorized(
-            respond(&exposures, &enter(&pending, SHOP), BOOT + 14),
+            site.respond(enter(&pending, SHOP), BOOT + 14).await,
             false,
             "the pending link",
         )
         .await;
         assert_eq!(
-            respond(&exposures, &page(ERP, &other), BOOT + 14).status(),
+            site.respond(page(ERP, &other), BOOT + 14).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// More than one session cookie is refused and cleared, a valid one among them included;
     /// other cookies beside one are no matter.
     #[tokio::test]
     async fn more_than_one_session_cookie_is_refused() {
-        let exposures = enabled("two", BOOT, UNTIL).await;
-        let one = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
-        let two = sign_in(&exposures, SHOP_ID, SHOP_ENB, SHOP, BOOT + 11);
+        let site = enabled("two", BOOT, UNTIL).await;
+        let one = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let two = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 11).await;
         let both = format!("theme=dark; {one}; {two}");
         assert_unauthorized(
-            respond(&exposures, &page(SHOP, &both), BOOT + 12),
+            site.respond(page(SHOP, &both), BOOT + 12).await,
             true,
             "two",
         )
@@ -2019,49 +2052,282 @@ mod tests {
             .header(COOKIE, two.as_str())
             .body(())
             .unwrap();
-        assert_unauthorized(respond(&exposures, &split, BOOT + 12), true, "two headers").await;
+        assert_unauthorized(site.respond(split, BOOT + 12).await, true, "two headers").await;
         let beside = format!("theme=dark; {one}; lang=en");
         assert_eq!(
-            respond(&exposures, &page(SHOP, &beside), BOOT + 12).status(),
+            site.respond(page(SHOP, &beside), BOOT + 12).await.status(),
             StatusCode::OK
         );
-        remove(&exposures);
+        remove(site.exposures());
     }
 
     /// io.web's health check moved under the reserved prefix, on every host, whose other paths are
     /// 404; `/healthz` is now a path like any other, which a session guards.
     #[tokio::test]
     async fn healthz_moved_under_the_reserved_prefix() {
-        let exposures = enabled("healthz", BOOT, UNTIL).await;
+        let site = enabled("healthz", BOOT, UNTIL).await;
         let unknown = "nowhere.hive-k3m9x7q2.fluxbee.ai";
         for host in [SHOP, unknown, ""] {
             for method in [Method::GET, Method::HEAD] {
                 let case = format!("{method} on '{host}'");
-                let response = respond(
-                    &exposures,
-                    &request(method, HEALTHZ_PATH, host, None),
-                    BOOT + 1,
-                );
+                let response = site
+                    .respond(request(method, HEALTHZ_PATH, host, None), BOOT + 1)
+                    .await;
                 assert_eq!(response.status(), StatusCode::OK, "{case}");
                 assert_eq!(body(response).await, b"ok\n".as_slice(), "{case}");
             }
         }
         let old = request(Method::GET, "/healthz", SHOP, None);
-        assert_unauthorized(respond(&exposures, &old, BOOT + 1), false, "/healthz").await;
+        assert_unauthorized(site.respond(old, BOOT + 1).await, false, "/healthz").await;
         let old = request(Method::GET, "/healthz", unknown, None);
         assert_eq!(
-            respond(&exposures, &old, BOOT + 1).status(),
+            site.respond(old, BOOT + 1).await.status(),
             StatusCode::NOT_FOUND
         );
         for path in ["/.fluxbee/", "/.fluxbee/healthz/", "/.fluxbee/admin"] {
-            let response = respond(
-                &exposures,
-                &request(Method::GET, path, SHOP, None),
-                BOOT + 1,
-            );
+            let response = site
+                .respond(request(Method::GET, path, SHOP, None), BOOT + 1)
+                .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
-        remove(&exposures);
+        remove(site.exposures());
+    }
+
+    /// §13.7's table, Fluxbee's column (stage 2.2 §4.5): every one of io.web's own answers, the
+    /// 401, the 403, the 502, the link's page, a 404, carries the strict set, `Permissions-Policy`
+    /// and a `frame-ancestors` naming Cloud's origins, the ones that pass io.web's check; `'none'`
+    /// without one.
+    #[tokio::test]
+    async fn io_web_s_own_answers_frame_only_for_cloud_s_origins() {
+        let site = enabled_with(
+            "framed",
+            BOOT,
+            UNTIL,
+            &[CLOUD, "https://fluxbee.ai:8443", "https://x'y"],
+        )
+        .await;
+        let framed = format!(
+            "{OWN_POLICY}; frame-ancestors https://cloud.fluxbee.ai https://fluxbee.ai:8443"
+        );
+        let session = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let code = link(site.exposures(), SHOP_ID, SHOP_ENB, BOOT + 10);
+        let mut sibling = request(Method::POST, "/", SHOP, Some(&session));
+        sibling.headers_mut().insert(
+            ORIGIN,
+            HeaderValue::from_static("https://other.hive-k3m9x7q2.fluxbee.ai"),
+        );
+        let cases = [
+            ("401", request(Method::GET, "/", SHOP, None), 401),
+            ("403", sibling, 403),
+            ("404", request(Method::GET, "/.fluxbee/x", SHOP, None), 404),
+            ("enter", enter(&code, SHOP), 200),
+            ("healthz", request(Method::GET, HEALTHZ_PATH, "", None), 200),
+        ];
+        for (case, request, status) in cases {
+            let response = site.respond(request, BOOT + 11).await;
+            assert_eq!(response.status().as_u16(), status, "{case}");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                framed.as_str(),
+                "{case}"
+            );
+            assert_eq!(
+                response.headers()["permissions-policy"],
+                PERMISSIONS_POLICY,
+                "{case}"
+            );
+            for (name, value) in SECURITY_HEADERS {
+                assert_eq!(response.headers()[name], value, "{case}: {name}");
+            }
+        }
+        // The 502: an upstream that is not there.
+        let gone = proxy(Arc::clone(&site.proxy.exposures), closed_port());
+        let failed = answer_to(&gone, without_body(page(SHOP, &session)), BOOT + 11).await;
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(failed.headers()["content-security-policy"], framed.as_str());
+        assert_eq!(body(failed).await, BAD_GATEWAY_PAGE.as_bytes());
+        // The application's own answer frames for the same origins, and its own pages.
+        let proxied = site.respond(page(SHOP, &session), BOOT + 11).await;
+        assert_eq!(
+            proxied.headers()["content-security-policy"],
+            "frame-ancestors 'self' https://cloud.fluxbee.ai https://fluxbee.ai:8443"
+        );
+        assert!(!proxied.headers().contains_key("permissions-policy"));
+        assert_eq!(
+            site.exposures().view(BOOT + 11)["cloud_origins"],
+            json!([CLOUD, "https://fluxbee.ai:8443", "https://x'y"]),
+            "the status shows the origins as SY.admin pushed them"
+        );
+        remove(site.exposures());
+    }
+
+    /// A write with a valid session, as the method and its fetch metadata come.
+    fn write(method: Method, session: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut request = request(method, "/", SHOP, Some(session));
+        for (name, value) in headers {
+            request.headers_mut().append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    /// The Origin check (stage 2.2 §4.1), each row of its algorithm refused: a write or a
+    /// WebSocket's handshake whose `Sec-Fetch-Site` is not same-origin or none; without it, whose
+    /// `Origin` is not the exposure's own, `null` included. The fixed 403 page, nothing forwarded,
+    /// and the refusal counted.
+    #[tokio::test]
+    async fn a_write_from_another_origin_is_refused_403() {
+        let site = enabled("origin-refused", BOOT, UNTIL).await;
+        let session = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let sibling = "https://other.hive-k3m9x7q2.fluxbee.ai";
+        let websocket = [("connection", "Upgrade"), ("upgrade", "websocket")];
+        let mut refused = Vec::new();
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            for metadata in [
+                vec![("sec-fetch-site", "same-site")],
+                vec![("sec-fetch-site", "cross-site")],
+                vec![("sec-fetch-site", "same-site"), ("origin", SHOP_ORIGIN)],
+                vec![
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-site", "same-site"),
+                ],
+                vec![("origin", sibling)],
+                vec![("origin", "null")],
+                vec![("origin", "http://shop.hive-k3m9x7q2.fluxbee.ai")],
+                vec![("origin", "https://shop.hive-k3m9x7q2.fluxbee.ai:8443")],
+            ] {
+                refused.push((method.clone(), metadata));
+            }
+        }
+        refused.push((
+            Method::GET,
+            [&websocket[..], &[("origin", sibling)]].concat(),
+        ));
+        refused.push((
+            Method::GET,
+            [&websocket[..], &[("sec-fetch-site", "same-site")]].concat(),
+        ));
+        refused.push((
+            Method::from_bytes(b"PROPFIND").unwrap(),
+            vec![("origin", sibling)],
+        ));
+        let count = refused.len();
+        for (method, metadata) in refused {
+            let case = format!("{method} {metadata:?}");
+            let response = site
+                .respond(write(method, &session, &metadata), BOOT + 11)
+                .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(set_cookie(&response), None, "{case}");
+            assert_eq!(body(response).await, FORBIDDEN_PAGE.as_bytes(), "{case}");
+        }
+        assert!(
+            site.upstream.requests().is_empty(),
+            "nothing refused reaches the upstream"
+        );
+        let view = site.exposures().view(BOOT + 11);
+        let shop = &view["per_exposure"][0];
+        assert_eq!(shop["exposure_id"], SHOP_ID);
+        assert_eq!(shop["refused"]["403"], count);
+        assert_eq!(
+            shop["open"],
+            json!({"waiting": 0, "streams": 0, "websockets": 0}),
+            "a refused request stays registered nowhere"
+        );
+        remove(site.exposures());
+    }
+
+    const SHOP_ORIGIN: &str = "https://shop.hive-k3m9x7q2.fluxbee.ai";
+
+    /// What the Origin check lets through: a write from the exposure's own page (`Sec-Fetch-Site`
+    /// same-origin or none, or without it its own `Origin`), a write with neither header, and every
+    /// read, GET, HEAD and OPTIONS, whatever page it comes from.
+    #[tokio::test]
+    async fn a_write_from_the_exposure_s_page_passes() {
+        let site = enabled("origin-passes", BOOT, UNTIL).await;
+        let session = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let sibling = "https://other.hive-k3m9x7q2.fluxbee.ai";
+        let cases: Vec<(Method, Vec<(&str, &str)>)> = vec![
+            (Method::POST, vec![("sec-fetch-site", "same-origin")]),
+            (Method::POST, vec![("sec-fetch-site", "none")]),
+            (
+                Method::POST,
+                vec![("sec-fetch-site", "same-origin"), ("origin", sibling)],
+            ),
+            (Method::PUT, vec![("origin", SHOP_ORIGIN)]),
+            (Method::DELETE, vec![]),
+            (Method::PATCH, vec![("sec-fetch-site", "same-origin")]),
+            (
+                Method::GET,
+                vec![("sec-fetch-site", "cross-site"), ("origin", sibling)],
+            ),
+            (Method::HEAD, vec![("origin", sibling)]),
+            (
+                Method::OPTIONS,
+                vec![("origin", sibling), ("sec-fetch-site", "same-site")],
+            ),
+            (
+                Method::GET,
+                vec![
+                    ("connection", "Upgrade"),
+                    ("upgrade", "websocket"),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            ),
+            (
+                Method::GET,
+                vec![
+                    ("connection", "Upgrade"),
+                    ("upgrade", "websocket"),
+                    ("origin", SHOP_ORIGIN),
+                ],
+            ),
+        ];
+        let count = cases.len();
+        for (method, metadata) in cases {
+            let case = format!("{method} {metadata:?}");
+            let response = site
+                .respond(write(method, &session, &metadata), BOOT + 11)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+        }
+        assert_eq!(site.upstream.requests().len(), count);
+        assert_eq!(
+            site.exposures().view(BOOT + 11)["per_exposure"][0]["refused"]["403"],
+            0
+        );
+        remove(site.exposures());
+    }
+
+    /// `CONNECT` and `TRACE` reach no upstream, a session or not: 405, as the edge answers them
+    /// first.
+    #[tokio::test]
+    async fn connect_and_trace_reach_no_upstream() {
+        let site = enabled("tunnel-methods", BOOT, UNTIL).await;
+        let session = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        for method in [Method::CONNECT, Method::TRACE] {
+            let target = if method == Method::CONNECT {
+                "shop.hive-k3m9x7q2.fluxbee.ai:443"
+            } else {
+                "/"
+            };
+            let response = site
+                .respond(
+                    request(method.clone(), target, SHOP, Some(&session)),
+                    BOOT + 11,
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+            assert_eq!(response.headers()[ALLOW], ALLOWED_METHODS, "{method}");
+        }
+        assert!(site.upstream.requests().is_empty());
+        remove(site.exposures());
     }
 
     #[test]

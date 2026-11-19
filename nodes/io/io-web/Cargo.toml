@@ -20,7 +20,13 @@ hyper-util.workspace = true
 io-common = { path = "../common" }
 serde.workspace = true
 serde_json.workspace = true
+# hive.yaml's `architect.listen`, where io.web dials Archi (docs/io-web-v2-stage-2-2.md §4.2): the
+# version fluxbee_sdk reads its YAML with.
+serde_yaml = "0.9"
 sha2.workspace = true
+# TCP keepalive with its timings on io.web's sockets, the edge's and the upstreams' (§3.1, §4.2):
+# the version tokio uses, with `all` for the probe count.
+socket2 = { version = "0.6", features = ["all"] }
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
