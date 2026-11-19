@@ -16136,13 +16136,26 @@ fn admin_catalog_view_refusal(code: &str, detail: &str) -> serde_json::Value {
 /// discovers exactly the provisioning surface it may invoke (create tenant, put token, spawn node)
 /// from ONE source, never a duplicated hardcoded list. The relay authz gate reads the same
 /// `IO_CLOUD_EXPOSED_ACTIONS`, so advertised == enforced.
+/// One action of the Cloud catalog: what IO.cloud's relay sends, without the HTTP routes and the
+/// executor's schema, which Cloud never uses. With them the catalog outgrew a mesh reply's 100 KiB
+/// (FINDINGS A-198) once io.web's exposures joined it (docs/io-web-v2-stage-2-1.md §5.3).
+fn build_cloud_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
+    serde_json::json!({
+        "name": spec.action,
+        "action": spec.action,
+        "read_only": admin_action_is_read_only(spec.action),
+        "description": admin_action_summary(spec.action),
+        "request_contract": admin_action_request_contract(spec.action),
+    })
+}
+
 fn build_cloud_actions_catalog_response() -> (u16, String) {
     let exposed: std::collections::HashSet<&str> =
         IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
     let actions: Vec<serde_json::Value> = INTERNAL_ACTION_REGISTRY
         .iter()
         .filter(|spec| exposed.contains(spec.action))
-        .map(build_admin_action_doc)
+        .map(build_cloud_action_doc)
         .collect();
     (
         200,
@@ -22867,6 +22880,25 @@ async fn handle_send_node_message(
         return invalid(
             "IO_WEB_EXPOSURES and IO_WEB_ACCESS_LINK are sent only by SY.admin's exposure actions",
         );
+    }
+    // Every protected SYSTEM action, and SY.vault's writes, have an action of their own with its
+    // own checks; sent as a plain message they would pass as SY.admin's own and skip them (the
+    // reserved vault keys, the edge's command channel: FINDINGS A-352).
+    if let Some(msg) = req.msg.as_deref().map(str::trim).filter(|msg| {
+        json_router::router::system_policy::is_protected_system_action(msg)
+            || [
+                MSG_VAULT_PUT,
+                MSG_VAULT_DELETE,
+                MSG_VAULT_ROTATE,
+                MSG_VAULT_ROLLBACK,
+                MSG_VAULT_ASSIGN,
+            ]
+            .iter()
+            .any(|write| msg.eq_ignore_ascii_case(write))
+    }) {
+        return invalid(&format!(
+            "{msg} is sent only by its own admin action, never as a plain message (FINDINGS A-352)"
+        ));
     }
     let msg_name = req.msg.clone();
     let msg_type = req.msg_type.trim().to_string();
@@ -29921,7 +29953,13 @@ mod tests {
         // included. (SY.wf-rules launches, restarts and reads its own WF nodes through its rows.)
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             assert!(mesh_admits(relay, action, None, &json!({})).is_ok());
-            assert!(mesh_admits("SY.architect@motherbee", action, None, &json!({})).is_ok());
+            // Archi reaches every exposed action but Fluxbee Cloud's own (`MeshAccess::Cloud`: the
+            // exposures' writes, docs/io-web-v2-stage-2-1.md §5.1).
+            assert_eq!(
+                mesh_admits("SY.architect@motherbee", action, None, &json!({})).is_ok(),
+                mesh_access(action) != Some(MeshAccess::Cloud),
+                "{action}"
+            );
             for other in [
                 "IO.cloud@worker1",
                 "IO.slack@motherbee",

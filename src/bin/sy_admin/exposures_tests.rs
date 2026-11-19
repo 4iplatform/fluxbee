@@ -1904,6 +1904,46 @@ async fn send_node_message_never_carries_io_web_commands() {
         .is_none());
 }
 
+/// FINDINGS A-352: a protected SYSTEM action or one of SY.vault's writes goes only through its own
+/// action; sent as a plain message it would pass as SY.admin's own and skip that action's checks.
+#[tokio::test(start_paused = true)]
+async fn send_node_message_never_carries_a_protected_action_or_a_vault_write() {
+    let mut admin = exposures_admin("a352-plain-message", Some(EDGE));
+    for msg in [
+        "VAULT_PUT",
+        " vault_assign ",
+        "VAULT_DELETE",
+        "VAULT_ROLLBACK",
+        "VAULT_ROTATE",
+        "EDGE_WEB_ROUTES",
+        "edge_tls_reload",
+        "CONFIG_SET",
+    ] {
+        let (status, body) = handle_send_node_message(
+            &admin.ctx,
+            &admin.ctx.rpc,
+            json!({ "node_name": IO_WEB, "msg_type": "system", "msg": msg, "payload": {} }),
+            None,
+        )
+        .await
+        .expect("answered");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(status, 400, "{msg}: {body}");
+        assert_eq!(body["error_code"], "INVALID_REQUEST");
+        assert!(
+            body["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("A-352")),
+            "{body}"
+        );
+    }
+    assert!(admin
+        .harness
+        .next_outgoing_within(Duration::from_millis(50))
+        .await
+        .is_none());
+}
+
 /// §5.1: one exposure write at a time. Another is answered at once, 409 BUSY and retryable, after
 /// its field checks and before anything is read (the ILK) or sent. The link and the list take no
 /// lock.

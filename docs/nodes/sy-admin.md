@@ -927,7 +927,10 @@ other hives keep theirs.
 - **The factory reset** runs it on every hive that runs SY.cognition, the motherbee included
   (`clear_cognitions` in `packaging/fluxbee-factory-reset`).
 - **Only this action clears:** `send_node_message` refuses a `COGNITION_CLEAR`, which would pass as
-  SY.admin's own message without its name or its confirmation.
+  SY.admin's own message without its name or its confirmation. It refuses as well every protected
+  SYSTEM action (the router's list: the edge's commands, io.web's, `CONFIG_SET`, the node
+  lifecycle's) and SY.vault's writes (`VAULT_PUT`, `VAULT_DELETE`, `VAULT_ROTATE`,
+  `VAULT_ROLLBACK`, `VAULT_ASSIGN`): each has its own action with its own checks (FINDINGS A-352).
 
 ```json
 {
@@ -2166,7 +2169,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `hive_status` | `GET /hive/status` | Read the local hive status summary. |
 | `list_hives` | `GET /hives` | List all known hives. |
 | `list_admin_actions` | `GET /admin/actions` | List the admin action catalog: in full over HTTP, compact (each action's name, description and read_only) over the mesh. |
-| `list_cloud_actions` | — (no HTTP route) | List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset. |
+| `list_cloud_actions` | — (no HTTP route) | List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset, each with its name, description, read_only and request contract (no HTTP route nor executor schema: Cloud uses neither, and the reply stays within a mesh frame). |
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
@@ -2212,7 +2215,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_node_status` | `GET /hives/{hive}/nodes/{node_name}/status` | Read the effective runtime status of one node. |
 | `node_help` | `GET /hives/{hive}/nodes/{node_name}/help` | Ask one node to describe itself (NODE_HELP) and return what it says. |
 | `list_tenant_nodes` | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them. |
-| `send_node_message` | `POST /hives/{hive}/nodes/{node_name}/messages` | Send a system message to a node. |
+| `send_node_message` | `POST /hives/{hive}/nodes/{node_name}/messages` | Send a system message to a node: never a protected SYSTEM action nor one of SY.vault's writes, each of which has its own action (FINDINGS A-352). |
 | `list_recent_commands` | `GET /hives/{hive}/commands` | Audit log: list the most recent admin commands executed on this backend (all origins — operator HTTP, internal L2 callers like SY.architect, and executor-plan steps), with redacted params, result status and duration. Read-only. |
 | `node_control_config_get` | `POST /hives/{hive}/nodes/{node_name}/control/config-get` | Send CONFIG_GET to a node that participates in live control-plane config and return its CONFIG_RESPONSE. |
 | `node_control_config_set` | `POST /hives/{hive}/nodes/{node_name}/control/config-set` | Send CONFIG_SET to a node that participates in live control-plane config and return its CONFIG_RESPONSE. |
