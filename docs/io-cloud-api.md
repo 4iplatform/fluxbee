@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.146** (2026-11-13), and PROD runs **0.1.146** (the router, the Go
+> Contract as of **fluxbee 0.1.147** (2026-11-18), and PROD runs **0.1.147** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1378,7 +1378,7 @@ post '{"op":"list_cloud_actions"}'
   any envelope `tenant_id` but `null`. Up to 0.1.146 they answer `INVALID_REQUEST` (an unknown op),
   and in 0.1.147 `UNAUTHORIZED`.
 
-### 0.1.147 (planned)
+### 0.1.147
 
 - **`get_ilk_details` by email refuses an envelope `tenant_id` that is not a string**
   (`INVALID_REQUEST`), where it searched the whole installation, as with no tenant. The ops that
@@ -1694,6 +1694,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.147:** on PROD, 2026-11-19 at 00:42Z (21:42 ART on 2026-11-18), through the public door with
+Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.147): `list_exposures` and `publish_exposure` answered
+`UNAUTHORIZED` (open from 0.1.148); `get_ilk_details` by email with a numeric `tenant_id` answered
+`INVALID_REQUEST`.
 
 **0.1.146:** on PROD, 2026-11-14 at 02:00Z (23:00 ART on 2026-11-13), through the public door with
 Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.146; FINDINGS A-349): a `put_token` and its

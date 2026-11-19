@@ -408,8 +408,13 @@ no change required
     stored; a throwaway IO node's `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` dropped by the router
     and logged, where 0.1.145 delivered them, a control message delivered; 13 PASS, no model call.
     The rows of Cloud's channel stored before were scrubbed by the operator's call (819, 2026-11-13).
-    **R3, the binaries:** `coa/web21-admin`, `coa/web21-edge`, `coa/web21-io-web` and
-    `coa/web21-io-cloud`, each built by an agent in its own worktree and target from `fb4193f6`.
+    **0.1.147, R3, the binaries (SY.admin with ACME, the edge, io.web, io.cloud)** ✅ live and checked
+    on 8.x (2026-11-18): `web:` retired (`archi.<id>` 404 at the door until Cloud publishes it), io.web
+    acknowledging SY.admin's set, no ACME order from the dropped name, the six ops closed to Cloud
+    until R4, io.web's commands refused through `send_node_message` and from any other node; 19
+    PASS, no model call. Its reviews found and fixed one high item (a label Let's Encrypt refuses at
+    order time would have held the main name's renewal) and two medium. Found building it: A-350,
+    A-351 (for 2.2), A-352. **Next:** R4, the Rust SDK's Cloud catalog (0.1.148), then §7's gate.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 

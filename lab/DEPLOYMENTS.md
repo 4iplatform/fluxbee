@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.146** | 2026-11-13 | `39f33517` | motherbee + spokes (core), the router alone, io.web stage 2.1's R2 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): A-349 (no turn of Fluxbee Cloud's channel, a message IO.cloud sends or one addressed to it by name, for SY.storage nor for cognition), and `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` protected, SY.admin@motherbee alone (`web_service_actions` in system.rego, both wasm rebuilt) | ✅ live, checked on 8.x | snap `pre-router-0-1-146` (all 4 VMs) · `apt install fluxbee=0.1.145` + 0.1.145's `update_installation` (nothing one-way; Cloud's requests stored in `turns` again) |
+| **0.1.147** | 2026-11-18 | `56be48ee` | motherbee + spokes (core), io.web stage 2.1's R3, the binaries, one branch per binary ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): SY.admin (the exposures' registry and six actions, Fluxbee Cloud's own access class, io.web's keys among the node-only vault keys, `web:` retired; ACME certifies the published hosts read live, DNS first, name-change orders outside the cap, and no exposure host can hold the main name's renewal), SY.edge (only `__Host-` cookies to io.web, at most 64 web hosts), io.web (the exposures' set from SY.admin alone, one-time links, the session cookie), io.cloud (the six ops translated, closed until R4; a non-string envelope tenant refused) | ✅ live, checked on 8.x | snap `pre-web21-0-1-147` (all 4 VMs) · `apt install fluxbee=0.1.146` + 0.1.146's `update_installation` (nothing one-way; `archi.<id>` routed again by `web:`) |
+| **0.1.146** | 2026-11-13 | `39f33517` | motherbee + spokes (core), the router alone, io.web stage 2.1's R2 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): A-349 (no turn of Fluxbee Cloud's channel, a message IO.cloud sends or one addressed to it by name, for SY.storage nor for cognition), and `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` protected, SY.admin@motherbee alone (`web_service_actions` in system.rego, both wasm rebuilt) | ✅ replaced by 0.1.147 | snap `pre-router-0-1-146` (deleted 2026-11-18) · `apt install fluxbee=0.1.145` + 0.1.145's `update_installation` (nothing one-way; Cloud's requests stored in `turns` again) |
 | **0.1.145** | 2026-11-13 | `6514bded` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.1's R1 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): the messages SY.admin is to send io.web, `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` with their answers, their types and io.web's error codes (no node sends them before R3), and `web_exposure_key:` among the vault prefixes Cloud may not write, so io.cloud's `put_token`, `assign_token` and `delete_token` refuse it | ✅ replaced by 0.1.146 | snap `pre-websdk-0-1-145` (deleted 2026-11-13) · `apt install fluxbee=0.1.144` + 0.1.144's `update_installation` (nothing one-way; Cloud could write a `web_exposure_key:` key again) |
 | **0.1.144** | 2026-11-13 | `3343b49a` | motherbee + spokes (core), the operator's calls on the bug push's findings, one branch per binary: the orchestrator (A-343: no call to Syncthing on the threads that serve its commands; A-346 (b): a config patch, or `run_node`'s config, with a top-level `config` key refused), SY.admin and Archi's handbook (A-346 (a): set_node_config's HTTP help names the route's body; A-344: what `WF_NODE_NOT_DEPLOYED` means and what to do) | ✅ replaced by 0.1.145 | snap `pre-orch-0-1-144` (deleted 2026-11-13) · `apt install fluxbee=0.1.143` + 0.1.143's `update_installation` (nothing one-way; the stalls come back) |
 | **0.1.143** | 2026-11-13 | `93fe0d3a` | motherbee + spokes (core), the Rust SDK alone: A-295 (a Rust node's command channels, two lanes of 1,024 messages or 8 MiB, the system lane first; a message without room is answered `NOT_TAKEN node_busy`, retryable, and a `NOT_TAKEN` ends a pending request), A-309 (a call its caller drops leaves nothing pending), A-269's call (b) (each record one line, escaped, cut at 16 KiB, every Rust binary), A-285's Cloud catalog text; A-336 recorded | ✅ replaced by 0.1.144 | snap `pre-rustsdk-0-1-143` (deleted 2026-11-13) · `apt install fluxbee=0.1.142` + 0.1.142's `update_installation` (nothing one-way; the unbounded channels come back) |
@@ -155,6 +156,82 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.147 — The binaries of io.web's exposures: SY.admin with ACME, the edge, io.web and io.cloud (io.web stage 2.1's R3)
+
+- **Date:** 2026-11-18 (ART) · **Previous version:** 0.1.146 · **Commit:** `56be48ee`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** io.web's stage 2.1 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md)), its third
+  release: the four binaries, a branch each ([METHOD](logbook/METHOD.md) §9), shipped together since
+  each needs the others to work (each green alone). Cloud's six ops stay closed until R4 adds them
+  to the Rust SDK's Cloud catalog (0.1.148).
+- **What changed:**
+  - **SY.admin (`coa/web21-admin`):** the exposures' registry (`exposures.json`, its generation
+    never going back, open = write first, close = act first) and its six actions
+    (`publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`,
+    `issue_exposure_link`, `list_exposures`; `GET /web/exposures`), `MeshAccess::Cloud` and the
+    handler's own check (IO.cloud@motherbee alone: no Archi, no HTTP write route, no executor),
+    the upstream rules (Fluxbee's ports, the motherbee, an ingress or egress, loopback and public
+    ranges, the motherbee's own addresses refused), each enablement's key `K` minted into the
+    free slot owned by IO.web, `NODE_ONLY_VAULT_KEY_PREFIXES` with `web_exposure_key:`,
+    `send_node_message` refusing io.web's two commands, io.web's set pushed every minute, `web:`
+    retired; ACME: the published hosts read live, DNS first, name-change orders outside the cap
+    (one per 15 min, five per 7 days), and a renewal that carries only the main name and the names
+    the served leaf covers; the handbook's section on exposures.
+  - **SY.edge (`coa/web21-edge`):** io.web gets only the client's `__Host-` cookie pairs, a set of
+    more than 64 web hosts refused.
+  - **io.web (`coa/web21-io-web`):** `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` on their own
+    channel from the router-stamped `SY.admin@motherbee` alone; the keys read from the vault as
+    owner (version, resource type, no other reader); the one-time link (120 s, single use, bound to
+    its host, none before io.web's boot) and the `__Host-` session cookie (30 min idle, the
+    enablement's end); `/.fluxbee/healthz`; a session waits for its key after a restart.
+  - **io.cloud (`coa/web21-io-cloud`):** the six ops translated with their own fields only and an
+    envelope tenant refused (they answer `UNAUTHORIZED` until R4); a non-string envelope tenant
+    refused, where `get_ilk_details` by email read it as absent; the reserved-key refusal names the
+    SDK's prefixes. Docs: io-cloud-api §5.8 "Exposures".
+- **Build and review:** each branch built by an agent in its own worktree and target and reviewed
+  once; the reviews of SY.admin and io.web found one high item (an exposure label Let's Encrypt
+  refuses at order time would have held every order, the main name's renewal included: such a
+  label is refused, and a renewal carries no new host) and two medium (SY.admin and io.web
+  disagreed on the current enablement after a short renewal; a session was wiped while io.web did
+  not hold its key yet), each fixed with a test. A usage limit stopped the work on 2026-11-13; the
+  session's scratchpad, which held the worktrees, was wiped meanwhile, and SY.admin's branch, not
+  yet committed, was built again on 2026-11-18. The four branches integrated on daily (one
+  conflict in io-cloud-api §9), re-prefixed `[0.1.146]`; CI green on `56be48ee` (rust-tests,
+  router-dispatcher-guards, posture-guards, admin-catalog-guard).
+- **The deploy:** build on fb-build 00:21:30–00:36:16Z on 2026-11-19 (14.8 min), publish 14 s. The
+  gate's mark at 00:37:00Z; `ops deploy 0.1.147 --snapshot pre-web21-0-1-147 --drop
+  pre-router-0-1-146` in 302 s (snapshots 34.0 s, the motherbee's apt 168.7 s, its admin on the
+  version 39.9 s, the spokes answering 12.8 s, the update's call 26.0 s, the hives on the target
+  5.7 s, health 5.8 s). On the target after the update's call: the motherbee 4.3 s, egress1 21.6 s,
+  ingress1 25.9 s, worker1 30.3 s; SY.admin logged each spoke's core settled (egress1 17.8 s,
+  ingress1 20.1 s, worker1 26.0 s; the deploy's report read the spokes' own records before their
+  settle lines). The update (`upd-1795048879229`) closed with every hive on the target, core hash
+  `f1b079fc041a83bd`. Health clean; the new web line: `exposures=0 enabled=0 cert=none
+  route=acknowledged io.web=running(ack <generation> of <generation>)`.
+- **Checked on 8.x (the gate, gate0247: its baseline on 0.1.146 at 23:35Z on 2026-11-18, then
+  00:42–00:43Z; `scratchpad/gate-tools/r147_gate.py`, git-ignored; 19 PASS, 2 SEE, no model call;
+  §8's R3 gate, §7's step 0 and step 11's refusals):**
+  - **Q2 (a):** `https://archi.<id>/` answered 200 on 0.1.146 and 404 at the door on 0.1.147;
+    `web_status`: no exposure, the registry `none`, io.web acknowledged SY.admin's set.
+  - **ACME:** the configured names are the main name alone; no condition; no order after the
+    deploy (the served leaf, which still covers `archi.<id>`, and the last attempt of 2026-10-23
+    unchanged): a dropped name orders nothing.
+  - **Refusals:** through the public door, `list_exposures` and `publish_exposure` answer
+    `UNAUTHORIZED` (`INVALID_REQUEST`, an unknown op, on 0.1.146) until R4; `GET /web/exposures`
+    lists none (`max` 16) and `POST` has no route (405); `send_node_message` of `IO_WEB_EXPOSURES`
+    refused 400; `get_ilk_details` by email with a numeric `tenant_id` refused `INVALID_REQUEST`; a
+    throwaway IO node's io.web commands still dropped by the router. The executor's 403 and the
+    sessions and links are left to the tests (no exposure exists before R4).
+  - **The smoke:** `run_node AI.gate0247s@worker1` ok in 3.1 s, `RUNNING` at 4.6 s on 0.1.147,
+    killed without purge, `STOPPED`; the stopped `AI.gate0233@worker1` reads `STOPPED`.
+  - **The cost:** 0 usage records.
+- **PROD after the gate:** all four hives on 0.1.147; snapshot `pre-web21-0-1-147` on each VM,
+  `pre-router-0-1-146` deleted (the old Cloud-channel rows A-349's scrub removed went with it).
+  `AI.gate0247s` purged (no history).
+- **Rollback:** the snapshot `pre-web21-0-1-147` (all 4 VMs), or `apt install fluxbee=0.1.146` +
+  0.1.146's `update_installation`: nothing one-way (an exposures.json written meanwhile stays,
+  unread).
 
 ## 0.1.146 — The router alone: Cloud's channel no longer stored, and io.web's commands from SY.admin alone (A-349; io.web stage 2.1's R2)
 
