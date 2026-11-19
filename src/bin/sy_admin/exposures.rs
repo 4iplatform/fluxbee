@@ -578,11 +578,14 @@ pub(crate) fn check_label(label: &str) -> Result<(), String> {
 }
 
 /// An upstream SY.admin takes (§2.2): Archi; a worker of the registry by its hive id; or a private
-/// IP literal that is no hive of the registry. Never one of Fluxbee's own ports.
+/// IP literal that is neither one of the motherbee's own addresses (`own_address`, the real one
+/// [`host_holds_address`]) nor a hive of the registry, which must be readable. Never one of
+/// Fluxbee's own ports.
 pub(crate) fn check_upstream(
     upstream: &WebExposureUpstream,
     admin_hive: &str,
     registry: &HiveRegistry,
+    own_address: &dyn Fn(&IpAddr) -> bool,
 ) -> Result<(), String> {
     match upstream {
         WebExposureUpstream::Archi {} => Ok(()),
@@ -617,14 +620,26 @@ pub(crate) fn check_upstream(
         WebExposureUpstream::Address { address, port } => {
             check_port(*port)?;
             check_private_address(address)?;
-            if let Some(hive) = hive_at_address(registry, address) {
+            // The hive registry never holds the motherbee (sdk/mesh/registry.rs), so its own
+            // addresses (its LAN's, a second NIC's, docker0's) are judged by the host itself.
+            if own_address(&canonical_ip(address)) {
                 return Err(format!(
+                    "upstream.address {address} is one of the motherbee's own addresses: only \
+                     Archi is reached there (upstream {{\"kind\": \"archi\"}})"
+                ));
+            }
+            match hive_at_address(registry, address) {
+                Ok(None) => Ok(()),
+                Ok(Some(hive)) => Err(format!(
                     "upstream.address {address} is the address of hive '{hive}': name the hive \
                      instead (upstream {{\"kind\": \"hive\", \"hive\": \"{hive}\", \"port\": \
                      {port}}})"
-                ));
+                )),
+                Err(reason) => Err(format!(
+                    "upstream.address {address} cannot be told from a hive's: {reason}; an address \
+                     upstream is refused until the registry can be read"
+                )),
             }
-            Ok(())
         }
     }
 }
@@ -704,11 +719,17 @@ fn check_private_address(address: &IpAddr) -> Result<(), String> {
 }
 
 /// The hive of the registry whose recorded `address` is `address`. An address the registry records
-/// as a name is not compared: SY.admin resolves no name.
-fn hive_at_address(registry: &HiveRegistry, address: &IpAddr) -> Option<String> {
+/// as a name is not compared: SY.admin resolves no name. A registry that cannot be read is the
+/// error: it fails closed, since any address might be a hive's.
+fn hive_at_address(registry: &HiveRegistry, address: &IpAddr) -> Result<Option<String>, String> {
     let wanted = canonical_ip(address);
-    registry_hive_entries(registry)
-        .ok()?
+    let entries = registry_hive_entries(registry).map_err(|err| {
+        format!(
+            "the hive registry {} cannot be read ({err})",
+            registry.root().display()
+        )
+    })?;
+    Ok(entries
         .into_iter()
         .find(|entry| {
             entry
@@ -724,7 +745,14 @@ fn hive_at_address(registry: &HiveRegistry, address: &IpAddr) -> Option<String> 
                 })
                 .is_some_and(|recorded| canonical_ip(&recorded) == wanted)
         })
-        .map(|entry| entry.name().to_string())
+        .map(|entry| entry.name().to_string()))
+}
+
+/// Whether this host holds `address` on one of its interfaces: a UDP socket binds to it only
+/// then (Linux answers EADDRNOTAVAIL otherwise). With `net.ipv4.ip_nonlocal_bind=1` every address
+/// binds, and every address upstream is refused: it fails closed.
+pub(crate) fn host_holds_address(address: &IpAddr) -> bool {
+    std::net::UdpSocket::bind(std::net::SocketAddr::new(*address, 0)).is_ok()
 }
 
 /// An exposure id as SY.admin mints it, `exp:<uuid>` hyphenated and lowercase.
@@ -1326,7 +1354,12 @@ async fn publish(
     if let Err(detail) = check_label(&request.label) {
         return invalid(action, detail);
     }
-    if let Err(detail) = check_upstream(&request.upstream, &ctx.hive_id, &hive_registry(ctx)) {
+    if let Err(detail) = check_upstream(
+        &request.upstream,
+        &ctx.hive_id,
+        &hive_registry(ctx),
+        &host_holds_address,
+    ) {
         return invalid(action, detail);
     }
     let Some(_one_write) = ctx.exposures.try_lock() else {

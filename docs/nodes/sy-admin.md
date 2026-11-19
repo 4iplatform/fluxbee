@@ -1917,10 +1917,12 @@ Source: `src/bin/sy_admin/exposures.rs`.
   `admin.public_base_url` (`409 NO_MAIN_HOST` without one); the upstream is `{"kind": "archi"}`
   (one exposure at most), a worker of the registry with its join done and a port
   (`{"kind": "hive", "hive", "port"}`), or a private IP literal (10/8, 172.16/12, 192.168/16,
-  fc00::/7; never loopback, link-local, multicast, broadcast or unspecified) that is no hive's
-  recorded address, with a port (`{"kind": "address", "address", "port"}`); each kind takes only
-  its own fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384, 9000, 9100,
-  9200, 21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
+  fc00::/7; never loopback, link-local, multicast, broadcast or unspecified) that is neither one
+  of the motherbee's own addresses (one a socket on the host binds to: the registry never holds
+  the motherbee) nor a hive's recorded address (a hive registry that cannot be read refuses every
+  address), with a port (`{"kind": "address", "address", "port"}`); each kind takes only its own
+  fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200,
+  21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
 - **One change at a time** (the exposure lock): a publish, enable, disable or unpublish asked
   while another runs answers `409 BUSY` with `payload.retryable: true` at once, after its field
   checks, nothing read or changed. `issue_exposure_link` and `list_exposures` take no lock and

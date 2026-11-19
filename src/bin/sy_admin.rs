@@ -17632,7 +17632,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "upstream",
                 "object",
-                "Where the exposure leads, fixed at publish: {\"kind\": \"archi\"} (Archi on the motherbee, at most one exposure), {\"kind\": \"hive\", \"hive\": <a worker of the registry>, \"port\"} or {\"kind\": \"address\", \"address\": <an IP literal in 10/8, 172.16/12, 192.168/16 or fc00::/7, no hive's>, \"port\"}. Each kind takes only its own fields. Fluxbee's own ports are refused: 22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200, 21027, 22000.",
+                "Where the exposure leads, fixed at publish: {\"kind\": \"archi\"} (Archi on the motherbee, at most one exposure), {\"kind\": \"hive\", \"hive\": <a worker of the registry>, \"port\"} or {\"kind\": \"address\", \"address\": <an IP literal in 10/8, 172.16/12, 192.168/16 or fc00::/7, neither the motherbee's own nor a hive's>, \"port\"}. Each kind takes only its own fields. Fluxbee's own ports are refused: 22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200, 21027, 22000.",
             ),
         ],
         "enable_exposure" => vec![

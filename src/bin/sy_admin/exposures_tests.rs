@@ -790,7 +790,7 @@ async fn publish_exposure_refuses_fluxbee_upstreams() {
     let registry = hive_registry(&admin.ctx);
     let judged = |upstream: Value| {
         let upstream: WebExposureUpstream = serde_json::from_value(upstream).expect("parses");
-        check_upstream(&upstream, "motherbee", &registry)
+        check_upstream(&upstream, "motherbee", &registry, &|_| false)
     };
     for (port, _) in REFUSED_UPSTREAM_PORTS {
         for upstream in [
@@ -903,6 +903,50 @@ async fn publish_exposure_refuses_fluxbee_upstreams() {
         assert!(sent.is_empty());
     }
     assert!(!admin.mesh.registry.exists());
+}
+
+/// §2.2: the hive registry never holds the motherbee, so an address upstream that is one of the
+/// motherbee's own (its LAN's, a second NIC's, docker0's) is judged by the host, which holds it
+/// when a socket binds to it; and a registry that cannot be read refuses every address, since
+/// any might be a hive's.
+#[tokio::test(start_paused = true)]
+async fn publish_exposure_refuses_the_motherbee_s_own_addresses_and_an_unreadable_registry() {
+    let admin = exposures_admin("web21-own-addresses", Some(EDGE));
+    let registry = hive_registry(&admin.ctx);
+    let own: Vec<IpAddr> = ["192.168.1.7", "172.17.0.1", "fd00::7"]
+        .iter()
+        .map(|address| address.parse().expect("an address"))
+        .collect();
+    let holds = |address: &IpAddr| own.contains(address);
+    let judged = |upstream: Value, registry: &HiveRegistry| {
+        let upstream: WebExposureUpstream = serde_json::from_value(upstream).expect("parses");
+        check_upstream(&upstream, "motherbee", registry, &holds)
+    };
+    for address in ["192.168.1.7", "::ffff:192.168.1.7", "172.17.0.1", "fd00::7"] {
+        let upstream = json!({ "kind": "address", "address": address, "port": 8443 });
+        let refused = judged(upstream, &registry).expect_err("the motherbee's own");
+        assert!(
+            refused.contains("the motherbee's own addresses"),
+            "{address}: {refused}"
+        );
+    }
+    let other = json!({ "kind": "address", "address": "192.168.1.8", "port": 8443 });
+    assert_eq!(judged(other.clone(), &registry), Ok(()));
+    // The host holds its loopback: the probe binds to it, and to no address it lacks.
+    assert!(host_holds_address(&IpAddr::from([127, 0, 0, 1])));
+
+    // No registry to read: refused, and saying why.
+    let unreadable = HiveRegistry::new(test_temp_dir("web21-no-registry").join("hives"));
+    let refused = judged(other, &unreadable).expect_err("an unreadable registry");
+    assert!(
+        refused.contains("cannot be read") && refused.contains("refused"),
+        "{refused}"
+    );
+    let worker = json!({ "kind": "hive", "hive": "worker1", "port": 8443 });
+    assert!(
+        judged(worker, &unreadable).is_err(),
+        "nor a worker it cannot read"
+    );
 }
 
 /// §5.1 publish (2): the same label with the same upstream is the same exposure, answered again
