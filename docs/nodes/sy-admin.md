@@ -665,8 +665,9 @@ its next start.
   patch `config` and the replacement `replace`, beside `node_name` and the binding fields. The
   help gives each shape its own fields (`admin_action_http_body`): `request_contract` the HTTP
   body, with `body.description` and `query_params`, and `executor_contract` the args.
-- Archi's SCMD of this route takes the body as the patch too, but always merges and leaves the
-  binding fields in the patch (FINDINGS A-348).
+- Archi's SCMD of this route reads it as this route does (since 0.1.152, FINDINGS A-348): the body
+  as the patch, `?replace=1` (or `true`) from the query, and the binding fields lifted from the
+  body's top level. Up to 0.1.151 it always merged and kept the binding fields in the patch.
 
 ## A runtime package's publish
 

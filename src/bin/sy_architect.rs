@@ -13631,6 +13631,18 @@ fn scmd_path_parts(path: &str) -> (Vec<String>, Option<&str>) {
     (segments, raw_query)
 }
 
+/// A node's runtime binding, as SY.admin names it (`NODE_BINDING_FIELDS` in sy_admin.rs): the
+/// fields `set_node_config` writes to the node's `_system`, never as config keys. SY.admin's
+/// `PUT /hives/{hive}/nodes/{node}/config` lifts them from the top level of the body, and so does
+/// the SCMD of that path (FINDINGS A-348).
+const NODE_BINDING_FIELDS: [&str; 5] = [
+    "runtime",
+    "runtime_version",
+    "requested_runtime_version",
+    "runtime_base",
+    "package_path",
+];
+
 fn translate_scmd(
     local_hive_id: &str,
     parsed: ParsedScmd,
@@ -14561,20 +14573,31 @@ fn translate_scmd(
                 params,
             })
         }
+        // As SY.admin's route reads it (FINDINGS A-348): the body is the node's config patch
+        // itself, `?replace=1` (or `true`) makes it the whole config, and the binding fields at
+        // its top level (`NODE_BINDING_FIELDS`) go to the node's binding, never into its config.
+        // The arm sent every body as a merge, its binding fields kept as config keys.
         ("PUT", ["hives", hive_id, "nodes", node_name, "config"]) => {
-            let config = parsed.body.unwrap_or_else(|| json!({}));
-            if !config.is_object() {
+            let mut config = parsed.body.unwrap_or_else(|| json!({}));
+            let Some(patch) = config.as_object_mut() else {
                 return Err("SCMD body for set_node_config must be a JSON object".into());
+            };
+            let replace = scmd_query_params(raw_query)
+                .get("replace")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let mut params = json!({ "node_name": node_name, "replace": replace });
+            for field in NODE_BINDING_FIELDS {
+                if let Some(value) = patch.remove(field) {
+                    params[field] = value;
+                }
             }
+            params["config"] = config;
             Ok(AdminTranslation {
                 admin_target,
                 action: "set_node_config".to_string(),
                 target_hive: (*hive_id).to_string(),
-                params: json!({
-                    "node_name": node_name,
-                    "config": config,
-                    "replace": false,
-                }),
+                params,
             })
         }
         ("PUT", ["config", "storage"]) => {
@@ -34142,6 +34165,91 @@ mod tests {
         assert_eq!(translated.action, "list_taps");
         assert_eq!(translated.target_hive, "motherbee");
         assert_eq!(translated.params, json!({}));
+    }
+
+    /// FINDINGS A-348: an SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads as SY.admin's route
+    /// reads it. SY.admin's example (the body as the patch) merges; `?replace=1` (or `true`) makes
+    /// the body the whole config; a binding field at the body's top level goes to the node's
+    /// binding, never into its config. The arm read no query and kept the binding fields in the
+    /// patch: both answered ok and did something else (U-10's case for a `runtime_version`).
+    #[test]
+    fn a_node_config_scmd_reads_replace_and_lifts_the_binding_fields() {
+        let admin_src = include_str!("sy_admin.rs");
+        let translate = |raw: &str| translate_scmd("motherbee", parse(raw)).expect(raw);
+        let body = r#"{"behavior":{"kind":"ai_chat"}}"#;
+        let example =
+            format!("curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config -d '{body}'");
+        assert!(admin_src.contains(&example), "SY.admin's example_scmd");
+        let merged = translate(&example);
+        assert_eq!(merged.action, "set_node_config");
+        assert_eq!(merged.target_hive, "motherbee");
+        assert_eq!(
+            merged.params,
+            json!({ "node_name": "AI.sales@motherbee", "replace": false,
+                    "config": { "behavior": { "kind": "ai_chat" } } })
+        );
+
+        for (query, replace) in [
+            ("?replace=1", true),
+            ("?replace=true", true),
+            ("?replace=TRUE", true),
+            ("?replace=0", false),
+            ("?replace=yes", false),
+            ("?replace=", false),
+            ("?other=1", false),
+        ] {
+            for raw in [
+                format!("curl -X PUT /hives/worker1/nodes/AI.sales%40worker1/config{query} -d '{body}'"),
+                format!("curl -X PUT '/hives/worker1/nodes/AI.sales%40worker1/config{query}' -d '{body}'"),
+            ] {
+                let translated = translate(&raw);
+                assert_eq!(translated.target_hive, "worker1", "{raw}");
+                assert_eq!(
+                    translated.params,
+                    json!({ "node_name": "AI.sales@worker1", "replace": replace,
+                            "config": { "behavior": { "kind": "ai_chat" } } }),
+                    "{raw}"
+                );
+            }
+        }
+
+        // A runtime_version rebinds the node: it goes beside the patch, never in it.
+        let rebound = translate(
+            r#"curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config -d '{"runtime_version":"0.1.3","behavior":{"kind":"ai_chat"}}'"#,
+        );
+        assert_eq!(
+            rebound.params,
+            json!({ "node_name": "AI.sales@motherbee", "replace": false,
+                    "runtime_version": "0.1.3",
+                    "config": { "behavior": { "kind": "ai_chat" } } })
+        );
+        // Each binding field SY.admin names, with a replace; a nested one stays in the patch.
+        let every = translate(
+            r#"curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config?replace=1 -d '{"runtime":"ai.sales","runtime_version":"1.2.0","requested_runtime_version":"current","runtime_base":"ai.generic","package_path":"/var/lib/fluxbee/dist/x","ai":{"runtime_version":"kept"}}'"#,
+        );
+        assert_eq!(
+            every.params,
+            json!({ "node_name": "AI.sales@motherbee", "replace": true,
+                    "runtime": "ai.sales", "runtime_version": "1.2.0",
+                    "requested_runtime_version": "current", "runtime_base": "ai.generic",
+                    "package_path": "/var/lib/fluxbee/dist/x",
+                    "config": { "ai": { "runtime_version": "kept" } } })
+        );
+        let start = admin_src
+            .find("const NODE_BINDING_FIELDS: [&str; 5] = [")
+            .expect("SY.admin's binding fields");
+        let theirs = &admin_src[start..start + admin_src[start..].find("];").expect("its end")];
+        for field in NODE_BINDING_FIELDS {
+            assert!(
+                theirs.contains(&format!("\"{field}\"")),
+                "{field}: {theirs}"
+            );
+        }
+        assert!(translate_scmd(
+            "motherbee",
+            parse("curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config -d '[]'")
+        )
+        .is_err());
     }
 
     /// The review of A-288: `DELETE /hives/{hive}/taps` names its tap in the query, as SY.admin's

@@ -165,6 +165,11 @@ SY.admin's route and its `example_scmd` do, in the query, each value decoded onc
 the body names none of the three (`scmd_tap_key_params`, the review of FINDINGS A-288). Before
 0.1.133 the query went unread: an SCMD that named the tap there reached SY.config.routes as `{}`,
 refused with `NOT_FOUND`, and the tap stayed.
+`PUT /hives/{hive}/nodes/{node}/config` reads as SY.admin's route does (FINDINGS A-348, since
+0.1.152): the body is the node's config patch, `?replace=1` (or `true`) makes it the whole config,
+and the binding fields at its top level (`NODE_BINDING_FIELDS`: `runtime`, `runtime_version`,
+`requested_runtime_version`, `runtime_base`, `package_path`) go beside it, to the node's binding,
+never into its config. Before, every body merged, its binding fields stored as config keys.
 
 A recorded mutation whose answer did not come within Archi's wait stays open (`timeout_unknown`),
 as does an `add_hive` whose join runs in the background (`accepted`), and while it is, the same
