@@ -467,13 +467,14 @@ such an answer comes back in a step's `result_preview` (`src/bin/sy_architect/sh
   (`refusal_of_a_plan_whose_secret_would_reach_a_model`, "executor plan validation failed: step s1
   (publish_cloud_endpoint) answers a secret..." or "step s2 (vault_put) takes the answer of step s1
   (publish_cloud_endpoint)..."). The explanation turn (above) is given no secret.
-- **What the operator writes into a plan reaches a model.** SY.admin's plan review
-  (`executor_validate_plan`, which Archi sends every plan to before it runs) gives its model each
-  step as written, args included, when SY.admin's executor has an AI: one call per step, stage
-  `executor_review`. A secret the operator writes into a step's args (a `vault_put`'s value, an
-  `add_hive`'s SSH password) reaches the hive's AI provider there (FINDINGS A-337, SY.admin's to
-  fix). A secret an answer brings does not: the review runs before any step, on the references as
-  written.
+- **What the operator writes into a plan reaches SY.admin's review masked.** SY.admin's plan
+  review (`executor_validate_plan`, which Archi sends every plan to before it runs) gives its
+  model each step when SY.admin's executor has an AI: one call per step, stage `executor_review`.
+  Since 0.1.152 (FINDINGS A-337) the step's args go with every secret masked (a `vault_put`'s or a
+  `vault_rotate`'s value, an `add_hive`'s SSH password or key), as SY.admin's executor log masks
+  them; up to 0.1.151 they went as written and reached the hive's AI provider. A secret an answer
+  brings never did: the review runs before any step, on the references as written. Archi's own
+  model still sees what the operator types into the chat.
 - **What the operator sent is kept masked too**: an executor plan pasted in the chat, or sent to
   `POST /api/executor/plan`, with its steps' secret args masked (a vault value, an SSH password or
   key), as an SCMD's body already was (`sanitize_user_message_for_persistence`); the command line

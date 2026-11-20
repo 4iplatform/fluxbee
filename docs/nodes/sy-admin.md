@@ -1394,6 +1394,14 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   every action in the registry and not mesh-only, args valid against the action's function
   schema, no `<placeholder>` strings. `executor_validate_plan` also runs an LLM review of each
   step against its help (`semantic_review_executor_plan`); issues give `PLAN_REVIEW_FAILED`.
+  Since 0.1.152 (FINDINGS A-337) the review's prompt (`executor_review_prompt`) carries the
+  step's args with every secret masked by the executor log's rules (`redact_executor_secrets`: a
+  field whose name reads as a secret, `ssh_password` and `ssh_key` among them, and the `value` of
+  a vault-shaped `{key, value}`, a `vault_put`'s or a `vault_rotate`'s), each shown as
+  `***REDACTED***` with an object's field names kept (`{"api_key": "***REDACTED***"}`), so a
+  secret the operator wrote into a step never reaches the AI provider there. The review checks
+  that a field is there and its shape, never a secret's value, and its prompt says a masked value
+  is present.
 - **Execution** (`execute_admin_executor_plan`): each step's `$steps.<step_id>.<path>`
   references are resolved first, from the earlier steps' results.
   - **A step with nothing to fill**, with no `executor_fill` (or one that allows no field), is

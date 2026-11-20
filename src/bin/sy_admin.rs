@@ -2407,6 +2407,19 @@ fn redaction_field_is_secret(lower: &str) -> bool {
 }
 
 fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
+    redact_executor_secrets(value, &|_| {
+        serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
+    })
+}
+
+/// `value` with each secret in it, at any depth, replaced by `mask(secret)`: a field whose name
+/// reads as a secret (`redaction_field_is_secret`), and the `value` of a vault-shaped
+/// `{key, value, ...}` object. The executor's log masks a secret whole
+/// (`redact_executor_log_value`); the plan review keeps its shape (`executor_review_mask`).
+fn redact_executor_secrets(
+    value: &serde_json::Value,
+    mask: &dyn Fn(&serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
@@ -2420,20 +2433,39 @@ fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
                 if redaction_field_is_secret(&lower)
                     || (looks_like_vault_payload && lower == "value")
                 {
-                    redacted.insert(
-                        key.clone(),
-                        serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
-                    );
+                    redacted.insert(key.clone(), mask(entry));
                 } else {
-                    redacted.insert(key.clone(), redact_executor_log_value(entry));
+                    redacted.insert(key.clone(), redact_executor_secrets(entry, mask));
                 }
             }
             serde_json::Value::Object(redacted)
         }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(redact_executor_log_value).collect())
-        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| redact_executor_secrets(item, mask))
+                .collect(),
+        ),
         _ => value.clone(),
+    }
+}
+
+/// A secret as the plan review's model reads it (FINDINGS A-337): every value in it but null is
+/// `NODE_SECRET_REDACTION_TOKEN`, and an object keeps its fields' names and an array its length,
+/// so a `vault_put`'s `value` still reads as the object its contract asks for. The review checks
+/// that a field is there and its shape, never a secret's value.
+fn executor_review_mask(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, entry)| (key.clone(), executor_review_mask(entry)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(executor_review_mask).collect())
+        }
+        serde_json::Value::Null => serde_json::Value::Null,
+        _ => serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
     }
 }
 
@@ -3229,6 +3261,42 @@ fn executor_usage_account(
         })
 }
 
+/// The plan review's prompt for one step (`semantic_review_executor_plan`): the action's help and
+/// the step, its args with every secret masked (FINDINGS A-337) by the executor log's rules
+/// (`redact_executor_secrets`) in the review's shape (`executor_review_mask`). The review checks
+/// that a field is there and its shape, never a secret's value, so a secret the operator wrote
+/// into a step (a `vault_put`'s or a `vault_rotate`'s `value`, an `add_hive`'s `ssh_password` or
+/// `ssh_key`) never reaches the AI provider here.
+fn executor_review_prompt(step: &AdminExecutorPlanStep, help_text: &str) -> String {
+    let masked = AdminExecutorPlanStep {
+        args: redact_executor_secrets(&step.args, &executor_review_mask),
+        ..step.clone()
+    };
+    format!(
+        "You are a Fluxbee plan reviewer.\n\
+Review the executor plan step below against the action help contract.\n\
+If the step args are invalid or incomplete — missing required fields, invalid field values, conditional requirements not satisfied — call report_step_issue with a list of specific issues.\n\
+If the step args are correct and complete, do not call report_step_issue.\n\
+\n\
+Important review rules:\n\
+- Validate against `executor_contract.function_schema` when present; it is the source of truth for executor step.args.\n\
+- `request_contract.body` describes the HTTP/SCMD shape only. Do not require or invent `args.body` unless the executor schema explicitly defines a `body` property.\n\
+- Executor step args are flat function args: path params and JSON body fields are siblings under step.args.\n\
+- Do not invent extra acknowledgement, confirmation, approval, or consent fields unless they appear explicitly in the request contract.\n\
+- `confirmation_required=true` is operator/UI metadata, not a step.args field requirement.\n\
+- Do not reject a step for lacking a confirm/ack field when the request contract does not define one.\n\
+- Step output references using `$steps.<step_id>.payload.<field>` are executable string values and must not be rejected as placeholders.\n\
+- `{mask}` stands for a secret masked for this review: the field is present, an object keeps its fields' names, and its value is not shown. Never report a masked value as missing, a placeholder or invalid.\n\
+\n\
+Action help contract:\n{}\n\
+\n\
+Step to review:\n{}",
+        help_text,
+        serde_json::to_string_pretty(&masked).unwrap_or_default(),
+        mask = NODE_SECRET_REDACTION_TOKEN,
+    )
+}
+
 async fn semantic_review_executor_plan(
     runtime: &AdminExecutorAiRuntime,
     plan: &AdminExecutorPlan,
@@ -3248,27 +3316,7 @@ async fn semantic_review_executor_plan(
             }))
             .map_err(|e| e.to_string())?;
 
-        let prompt = format!(
-            "You are a Fluxbee plan reviewer.\n\
-Review the executor plan step below against the action help contract.\n\
-If the step args are invalid or incomplete — missing required fields, invalid field values, conditional requirements not satisfied — call report_step_issue with a list of specific issues.\n\
-If the step args are correct and complete, do not call report_step_issue.\n\
-\n\
-Important review rules:\n\
-- Validate against `executor_contract.function_schema` when present; it is the source of truth for executor step.args.\n\
-- `request_contract.body` describes the HTTP/SCMD shape only. Do not require or invent `args.body` unless the executor schema explicitly defines a `body` property.\n\
-- Executor step args are flat function args: path params and JSON body fields are siblings under step.args.\n\
-- Do not invent extra acknowledgement, confirmation, approval, or consent fields unless they appear explicitly in the request contract.\n\
-- `confirmation_required=true` is operator/UI metadata, not a step.args field requirement.\n\
-- Do not reject a step for lacking a confirm/ack field when the request contract does not define one.\n\
-- Step output references using `$steps.<step_id>.payload.<field>` are executable string values and must not be rejected as placeholders.\n\
-\n\
-Action help contract:\n{}\n\
-\n\
-Step to review:\n{}",
-            help_text,
-            serde_json::to_string_pretty(step).unwrap_or_default()
-        );
+        let prompt = executor_review_prompt(step, &help_text);
 
         let model = create_function_calling_model(
             runtime.provider,
@@ -34146,6 +34194,117 @@ mod tests {
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
         assert_eq!(redacted["payload"]["key"], json!("infra:openai-api-key"));
+    }
+
+    /// FINDINGS A-337: the plan review's prompt carries each step's args with every secret the
+    /// operator wrote into them masked (a `vault_put`'s and a `vault_rotate`'s `value`, an
+    /// `add_hive`'s `ssh_password` and `ssh_key`), so none reaches the AI provider. Each masked
+    /// field is still there, an object with its fields' names, the prompt says what the mask
+    /// means, and the rest of the step goes as written.
+    #[test]
+    fn the_plan_review_s_prompt_holds_no_secret_the_operator_wrote_into_a_step() {
+        let secrets = [
+            "sk-live-0123456789abcdef",
+            "xoxb-1111-2222-secret",
+            "xapp-3333-secret",
+            "hunter2-ssh-password",
+            // The private key's body: the key itself goes with its newlines, escaped in JSON.
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU",
+        ];
+        let ssh_key = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            secrets[4]
+        );
+        let step = |id: &str, action: &str, args: serde_json::Value| AdminExecutorPlanStep {
+            id: id.to_string(),
+            action: action.to_string(),
+            args,
+            executor_fill: None,
+        };
+        let steps = [
+            step(
+                "s1",
+                "vault_put",
+                json!({
+                    "hive": "motherbee",
+                    "key": "openai-main",
+                    "value": { "api_key": secrets[0] },
+                    "metadata": { "resource_type": "openai", "description": "the main key" },
+                }),
+            ),
+            step(
+                "s2",
+                "vault_rotate",
+                json!({
+                    "hive": "motherbee",
+                    "key": "slack-tokens",
+                    "value": { "bot_token": secrets[1], "app_token": secrets[2] },
+                }),
+            ),
+            step(
+                "s3",
+                "add_hive",
+                json!({
+                    "hive_id": "worker2",
+                    "address": "10.0.0.22",
+                    "ssh_user": "admin",
+                    "ssh_password": secrets[3],
+                    "ssh_key": ssh_key,
+                    "harden_ssh": true,
+                }),
+            ),
+        ];
+        let masked = json!(NODE_SECRET_REDACTION_TOKEN);
+        let mut reviewed = Vec::new();
+        for step in &steps {
+            let (_, help) = build_admin_action_help_response(&step.action);
+            let prompt = executor_review_prompt(step, &help);
+            for secret in secrets {
+                assert!(!prompt.contains(secret), "{}: {secret}", step.action);
+            }
+            assert!(prompt.contains(&help), "{}: the help goes", step.action);
+            assert!(
+                prompt.contains(&format!(
+                    "`{NODE_SECRET_REDACTION_TOKEN}` stands for a secret masked for this review"
+                )),
+                "{}: the prompt says what the mask means",
+                step.action
+            );
+            let (_, shown) = prompt
+                .rsplit_once("Step to review:\n")
+                .expect("the step closes the prompt");
+            let shown: serde_json::Value = serde_json::from_str(shown).expect("the step as JSON");
+            assert_eq!(shown["id"], json!(step.id));
+            assert_eq!(shown["action"], json!(step.action));
+            reviewed.push(shown["args"].clone());
+        }
+        assert_eq!(
+            reviewed[0],
+            json!({
+                "hive": "motherbee",
+                "key": "openai-main",
+                "value": { "api_key": masked },
+                "metadata": { "resource_type": "openai", "description": "the main key" },
+            })
+        );
+        assert_eq!(
+            reviewed[1]["value"],
+            json!({ "bot_token": masked, "app_token": masked })
+        );
+        assert_eq!(reviewed[1]["key"], json!("slack-tokens"));
+        assert_eq!(
+            reviewed[2],
+            json!({
+                "hive_id": "worker2",
+                "address": "10.0.0.22",
+                "ssh_user": "admin",
+                "ssh_password": masked,
+                "ssh_key": masked,
+                "harden_ssh": true,
+            })
+        );
+        // The executor's log still masks a secret whole.
+        assert_eq!(redact_executor_log_value(&steps[0].args)["value"], masked);
     }
 
     fn command_log_test_state_dir(tag: &str) -> PathBuf {

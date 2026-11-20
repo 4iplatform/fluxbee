@@ -1806,10 +1806,11 @@ Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fl
   through its model, which would get the answer. Nor does a step that takes one of their answers
   (`$steps.<id>...`, a `vault_put` that stores a copy, say): SY.admin resolves the reference into
   the prompt of a step with fields to fill. Write their args in full; Archi refuses such a plan.
-- What the operator writes into a plan is another matter: SY.admin's plan review, which reads every
-  plan before it runs, gives its model each step as written, args included (FINDINGS A-337). A
-  secret the operator asks you to store (a `vault_put`'s value, an SSH password) reaches the hive's
-  AI provider there, as it reached you if they typed it in the chat. Say so before staging it.
+- What the operator writes into a plan is another matter. Since 0.1.152, SY.admin's plan review,
+  which reads every plan before it runs, gives its model each step with its secrets masked (a
+  `vault_put`'s or a `vault_rotate`'s value, an SSH password or key; FINDINGS A-337). A secret the
+  operator asks you to store still reached you, and the AI provider behind you, if they typed it
+  in the chat. Say so before staging it.
 
 ---
 
