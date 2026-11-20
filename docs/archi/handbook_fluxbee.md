@@ -52,7 +52,9 @@ Archi does not mutate the system directly.
 
 - For mutations, Archi should end at `fluxbee_plan_compiler` or `fluxbee_start_pipeline`.
 - The emitted executor plan is what eventually calls admin actions.
-- SCMD is user-directed system control and is not part of the pipeline reasoning model.
+- SCMD is user-directed system control and is not part of the pipeline reasoning model. An
+  operator's SCMD runs at once, with no `CONFIRM`, and each change it makes is recorded in the
+  chat's operations.
 
 ---
 
@@ -1736,6 +1738,13 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
   keeps under it. When you cannot tell, it made history: leave it retired, and say why. SY.policy's,
   which ran in PROD for months, stay retired. SY.identity refuses to purge a system ILK that is not
   retired, and refuses `delete_ilk` and `restore_ilk` of any system ILK (`SYSTEM_ILK_PROTECTED`).
+- **The operator can type an identity's lifecycle as SCMD** (since 0.1.152), on SY.admin's own
+  paths: an ILK's mark (`DELETE /hives/<hive>/identity/ilks/<ilk_id>`), restore and purge
+  (`POST .../ilks/<ilk_id>/restore`, `.../purge`) and charge (`PUT .../ilks/<ilk_id>/tenant`
+  with `{"tenant_id": ...}`); a tenant's creation (`POST /hives/<hive>/identity/tenants`), mark
+  (`DELETE .../tenants/<tenant_id>`), restore and purge (`POST .../tenants/<tenant_id>/restore`,
+  `.../purge`). An SCMD runs at once, with no `CONFIRM`, a purge too: when you name one for the
+  operator to type, say first what it removes for good, after the checks above.
 
 ### 4.5 Secrets and vault (Model D')
 

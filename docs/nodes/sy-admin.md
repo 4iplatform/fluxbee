@@ -578,8 +578,8 @@ while their rows stay ([SY.identity](sy-identity.md#delete-marks-purge-removes))
   alone, and its answer is the action's: `{hive_id, count, ilk_ids, already_retired}`. Running it
   again marks none. It is a write the operator confirms; Archi reaches it like every action open
   to it and stages it in a plan. Archi's chat has no SCMD for it: SY.architect's `translate_scmd`
-  maps no such path, and a release that maps one lists the action in `admin_action_allows_ai_write`
-  too, or `handle_scmd` would run it untracked, as a read.
+  maps no such path, and a release that maps one lists the action in `is_mutating_admin_action`
+  too, or `handle_scmd` would run it unrecorded, as a read.
 - **`remove_hive` runs it** once the orchestrator removed the hive (`with_system_ilks_retired`),
   and its ok answer names the result in `payload.system_ilks_retired`. A request that does not
   reach SY.identity, which the removal of an unreachable hive restarts (`identity_restart`), is

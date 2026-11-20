@@ -87,8 +87,10 @@ Then `handle_chat_message` looks at each message in this order:
    compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`); once such a plan
    ran, the chat says what each step did ([What the chat says after a confirmed
    plan](#what-the-chat-says-after-a-confirmed-plan)). `CANCEL` or `ABORT` drops it; a dropped
-   plan answers "Plan discarded." in mode `chat`, as a dropped SCMD does (since 0.1.137; before,
-   "Programmer plan discarded." in mode `executor`, which the UI drew as a run marked "done").
+   plan answers "Plan discarded." in mode `chat` (since 0.1.137; before, "Programmer plan
+   discarded." in mode `executor`, which the UI drew as a run marked "done"). An SCMD never waits
+   for a `CONFIRM`: since 0.1.152 the map of SCMD actions waiting for one, which nothing ever
+   filled, is gone, with its `CONFIRM` and `CANCEL` branches.
 2. While something waits for confirmation, other messages get `status: "blocked"`.
 3. `SCMD: <curl-like command>`: an operator command, run at once (see SCMD).
 4. A pasted JSON `executor_plan`: validated and run at once.
@@ -134,8 +136,30 @@ one in a path segment as a space; no node, runtime, hive or vault key name holds
 0.1.137 each segment went as it came, but the vault key's: a node name written `%40` matched no
 node through Archi, and worked over SY.admin's route.
 
-An SCMD typed by the operator runs immediately; a mutating action is recorded in the
-`operations` table (`handle_scmd`, `execute_tracked_admin_translation`).
+An SCMD typed by the operator runs immediately, with no `CONFIRM`; every change it maps is
+recorded in the `operations` table (`handle_scmd`, `execute_tracked_admin_translation`). Two
+lists: `is_mutating_admin_action` says what is a change (what an SCMD records, what
+`fluxbee_system_get` refuses, and what a timed-out record is read back for), and
+`admin_action_allows_ai_write`, unchanged, names the writes it was made for, both purges left out.
+A change outside that list is recorded all the same: an ILK's charge to a tenant
+(`set_ilk_tenant`) and its purge, a tenant's creation, update, sponsor and purge, a tap's add and
+delete, and the user policy's clear (`opa_clear`). Before 0.1.152 the change was that list, so the
+operator's `update_tenant`, `set_tenant_sponsor`, `add_tap`, `delete_tap` and `opa_clear` ran
+unrecorded, as reads.
+
+**An identity's lifecycle** (since 0.1.152, the operator's ask) has SY.admin's own routes, each
+translated as SY.admin's route sends it ([SY.identity](sy-identity.md)):
+`DELETE /hives/{hive}/identity/ilks/{ilk_id}` marks an ILK (`delete_ilk`),
+`POST .../ilks/{ilk_id}/restore` undoes the mark (`restore_ilk`), `POST .../ilks/{ilk_id}/purge`
+removes one already marked, for good (`purge_ilk`), and `PUT .../ilks/{ilk_id}/tenant`
+(`{"tenant_id": ...}`) charges a person to another tenant (`set_ilk_tenant`: only the body's
+`tenant_id` is read, and SY.admin stamps who it is for from the router-stamped caller); for a
+tenant, `POST /hives/{hive}/identity/tenants` creates one (`create_tenant`, the body as its
+fields), `DELETE .../tenants/{tenant_id}` marks it (`delete_tenant`), and
+`POST .../tenants/{tenant_id}/restore` and `.../purge` restore and purge it (`restore_tenant`,
+`purge_tenant`). A purge typed as SCMD runs at once, as every SCMD does (the operator's call of
+2026-11-20). `SCMD: help` gives a mark and then a purge.
+
 `DELETE /hives/{hive}/taps` names its tap (`match_src`, `match_dst`, `target`) in the body or, as
 SY.admin's route and its `example_scmd` do, in the query, each value decoded once and read when
 the body names none of the three (`scmd_tap_key_params`, the review of FINDINGS A-288). Before
@@ -177,8 +201,9 @@ help), so on a busy installation, or for a record left open before the upgrade, 
 gone, and the summary says both. A log that cannot be read leaves it open. The log keeps every
 recorded mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a
 node's run, start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN
-rule, an ILK's or a tenant's change, a node's config, a message to a node, the storage, a WF
-instance's cancel. `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin
+rule, a tap, an ILK's or a tenant's change (a purge included, since 0.1.152), a node's config, a
+message to a node, the storage, a WF instance's cancel. `update`, `sync_hint` and the OPA and
+wf-rules writes (`opa_clear` among them) go another way in SY.admin
 and are not in it, so a timed-out one stays open in that chat, as before: Archi waits for each as
 long as SY.admin does, or longer. An identical request there is refused with a text that says so
 (`operation_error_message`, `open_operation_is_read`): the record cannot be settled in that chat;

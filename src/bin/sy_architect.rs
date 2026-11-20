@@ -403,7 +403,6 @@ struct ArchitectState {
     messages_db: Arc<RwLock<Option<Arc<messages_db::MessagesDb>>>>,
     messages_stream_active: Arc<AtomicUsize>,
     chat_lock: Arc<Mutex<()>>,
-    pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
     cached_status: Arc<RwLock<ArchitectStatus>>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
@@ -717,14 +716,6 @@ struct AdminTranslation {
 }
 
 #[derive(Debug, Clone)]
-struct PendingAdminAction {
-    operation_id: String,
-    translation: AdminTranslation,
-    preview_command: String,
-    created_at_ms: u64,
-}
-
-#[derive(Debug, Clone)]
 struct PlanCompileTraceStep {
     id: String,
     action: String,
@@ -761,7 +752,6 @@ enum PendingConfirmationFlow {
     PipelineConfirm1,
     PipelineConfirm2,
     PlanCompile,
-    Scmd,
 }
 
 impl PendingConfirmationFlow {
@@ -770,7 +760,6 @@ impl PendingConfirmationFlow {
             PendingConfirmationFlow::PipelineConfirm1 => "pipeline_confirm1",
             PendingConfirmationFlow::PipelineConfirm2 => "pipeline_confirm2",
             PendingConfirmationFlow::PlanCompile => "plan_compile",
-            PendingConfirmationFlow::Scmd => "scmd",
         }
     }
 
@@ -785,9 +774,6 @@ impl PendingConfirmationFlow {
             PendingConfirmationFlow::PlanCompile => {
                 "There is a compiled executor plan pending in this chat. Reply CONFIRM to execute it or CANCEL to discard it before starting a new request."
             }
-            PendingConfirmationFlow::Scmd => {
-                "There is a direct SCMD action pending in this chat. Reply CONFIRM to execute it or CANCEL to discard it before starting a new request."
-            }
         }
     }
 
@@ -801,9 +787,6 @@ impl PendingConfirmationFlow {
             }
             PendingConfirmationFlow::PlanCompile => {
                 "A compiled executor plan is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
-            }
-            PendingConfirmationFlow::Scmd => {
-                "A direct SCMD action is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
             }
         }
     }
@@ -6506,7 +6489,6 @@ async fn main() -> Result<(), ArchitectError> {
         messages_db: Arc::new(RwLock::new(initial_messages_db)),
         messages_stream_active: Arc::new(AtomicUsize::new(0)),
         chat_lock: Arc::new(Mutex::new(())),
-        pending_actions: Arc::new(Mutex::new(HashMap::new())),
         cached_status: Arc::new(RwLock::new(initial_status)),
         admin_actions_cache: Arc::new(Mutex::new(None)),
         plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -7274,9 +7256,6 @@ async fn pending_confirmation_flow(
     {
         return Some(PendingConfirmationFlow::PlanCompile);
     }
-    if state.pending_actions.lock().await.contains_key(session_id) {
-        return Some(PendingConfirmationFlow::Scmd);
-    }
     None
 }
 
@@ -7388,20 +7367,6 @@ async fn latest_nonterminal_pipeline_run_for_session(
         .into_iter()
         .rev()
         .find(|run| !is_terminal_pipeline_status(&run.status)))
-}
-
-async fn take_pending_action(
-    state: &ArchitectState,
-    session_id: &str,
-) -> Option<PendingAdminAction> {
-    state.pending_actions.lock().await.remove(session_id)
-}
-
-async fn clear_pending_action(
-    state: &ArchitectState,
-    session_id: &str,
-) -> Option<PendingAdminAction> {
-    state.pending_actions.lock().await.remove(session_id)
 }
 
 /// Section B + D: builds the dedicated architect route profile.
@@ -10238,7 +10203,8 @@ async fn handle_chat_message(
         {
             handle_pipeline_confirm2(state, &session, pipeline_run).await
         } else {
-            // Check plan_compile_pending before SCMD pending — they are distinct confirmation flows.
+            // A plan the plan compiler staged: the one thing left to confirm. An SCMD never
+            // waits for a CONFIRM: it runs as the operator types it.
             let plan_compile_plan = state
                 .plan_compile_pending
                 .lock()
@@ -10327,50 +10293,14 @@ async fn handle_chat_message(
                     }
                 }
             } else {
-                match take_pending_action(state, &resolved_session_id).await {
-                    Some(pending) => {
-                        let action_name = pending.translation.action.clone();
-                        let preview_command = pending.preview_command.clone();
-                        let pending_created_at_ms = pending.created_at_ms;
-                        let mut output = match execute_tracked_admin_translation(
-                            state,
-                            &resolved_session_id,
-                            "ai_confirmed",
-                            pending.translation,
-                            preview_command.clone(),
-                            Some(pending.operation_id),
-                        )
-                        .await
-                        {
-                            Ok(output) => output,
-                            Err(err) => json!({
-                                "status": "error",
-                                "action": action_name,
-                                "confirmed_command": preview_command,
-                                "error": err.to_string()
-                            }),
-                        };
-                        output["confirmed_command"] = Value::String(preview_command);
-                        output["pending_created_at_ms"] = json!(pending_created_at_ms);
-                        output["confirmed_at_ms"] = json!(now_epoch_ms());
-                        let status = chat_status_from_command_output(&output);
-                        ChatResponse {
-                            status,
-                            mode: "scmd".to_string(),
-                            output,
-                            session_id: Some(resolved_session_id.clone()),
-                            session_title: Some(session.title.clone()),
-                        }
-                    }
-                    None => ChatResponse {
-                        status: "error".to_string(),
-                        mode: "chat".to_string(),
-                        output: json!({
-                            "message": "There is no pending action to confirm in this chat."
-                        }),
-                        session_id: Some(resolved_session_id.clone()),
-                        session_title: Some(session.title.clone()),
-                    },
+                ChatResponse {
+                    status: "error".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({
+                        "message": "There is no pending action to confirm in this chat."
+                    }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
                 }
             } // end else (no plan_compile_pending)
         }
@@ -10409,82 +10339,33 @@ async fn handle_chat_message(
             if plan_compile_plan_cancel.is_some() {
                 // plan_compile_pending was present; discard it
                 plan_discarded_response(&resolved_session_id, &session.title)
+            } else if let Some(blocked_response) = handle_blocked_pipeline_control_message(
+                state,
+                &resolved_session_id,
+                trimmed_message,
+            )
+            .await
+            {
+                ChatResponse {
+                    status: blocked_response
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ok")
+                        .to_string(),
+                    mode: "pipeline".to_string(),
+                    output: blocked_response,
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                }
             } else {
-                match clear_pending_action(state, &resolved_session_id).await {
-                    Some(pending) => {
-                        let now = now_epoch_ms();
-                        // Redact secret fields (e.g. ssh_password) before persisting
-                        // params to the operations log — secret-at-rest. The live
-                        // dispatch uses the in-memory translation.params; readers of
-                        // the persisted copy only extract hive_id, so redaction is safe.
-                        let params_json = serde_json::to_string(&redact_json_secret_fields(
-                            &normalize_json(&pending.translation.params),
-                        ))
-                        .unwrap_or_else(|_| "{}".to_string());
-                        let record = ChatOperationRecord {
-                            operation_id: pending.operation_id,
-                            session_id: resolved_session_id.clone(),
-                            scope_id: operation_scope_id(&resolved_session_id),
-                            origin: "ai_write_stage".to_string(),
-                            action: pending.translation.action,
-                            target_hive: pending.translation.target_hive,
-                            params_json,
-                            params_hash: params_hash(&pending.translation.params),
-                            preview_command: pending.preview_command.clone(),
-                            status: "canceled".to_string(),
-                            created_at_ms: pending.created_at_ms,
-                            updated_at_ms: now,
-                            dispatched_at_ms: 0,
-                            completed_at_ms: now,
-                            request_id: String::new(),
-                            trace_id: String::new(),
-                            error_summary: String::new(),
-                        };
-                        let save_result = save_operation(state, &record).await;
-                        ChatResponse {
-                            status: "ok".to_string(),
-                            mode: "chat".to_string(),
-                            output: json!({
-                                "message": format!("Pending action discarded: {}", pending.preview_command),
-                                "pending_created_at_ms": pending.created_at_ms,
-                                "operation_id": record.operation_id,
-                                "tracking_saved": save_result.is_ok(),
-                            }),
-                            session_id: Some(resolved_session_id.clone()),
-                            session_title: Some(session.title.clone()),
-                        }
-                    }
-                    None => {
-                        if let Some(blocked_response) = handle_blocked_pipeline_control_message(
-                            state,
-                            &resolved_session_id,
-                            trimmed_message,
-                        )
-                        .await
-                        {
-                            ChatResponse {
-                                status: blocked_response
-                                    .get("status")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("ok")
-                                    .to_string(),
-                                mode: "pipeline".to_string(),
-                                output: blocked_response,
-                                session_id: Some(resolved_session_id.clone()),
-                                session_title: Some(session.title.clone()),
-                            }
-                        } else {
-                            ChatResponse {
-                                status: "error".to_string(),
-                                mode: "chat".to_string(),
-                                output: json!({
-                                    "message": "There is no pending action to cancel in this chat."
-                                }),
-                                session_id: Some(resolved_session_id.clone()),
-                                session_title: Some(session.title.clone()),
-                            }
-                        }
-                    }
+                ChatResponse {
+                    status: "error".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({
+                        "message": "There is no pending action to cancel in this chat."
+                    }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
                 }
             }
         } // end else (no plan_compile_pending)
@@ -11198,8 +11079,7 @@ async fn explain_executed_plan(
 }
 
 /// The answer to `CANCEL` while a plan the plan compiler staged waits: the plan is dropped, and
-/// the chat says so as Archi's own words, as it does for a dropped SCMD, never as an executor run
-/// (whose card read "done").
+/// the chat says so as Archi's own words, never as an executor run (whose card read "done").
 fn plan_discarded_response(session_id: &str, session_title: &str) -> ChatResponse {
     ChatResponse {
         status: "ok".to_string(),
@@ -12122,6 +12002,10 @@ fn operation_model_summary(record: &ChatOperationRecord) -> String {
     }
 }
 
+/// An operator's SCMD, run as typed, with no CONFIRM: a read goes to SY.admin and back, and every
+/// change (`is_mutating_admin_action`) is recorded in the chat's operations table, whether or not
+/// `admin_action_allows_ai_write` lists it: an ILK's or a tenant's purge, which that list leaves
+/// out, is recorded as any other.
 async fn handle_scmd(
     state: &ArchitectState,
     session_id: &str,
@@ -12145,7 +12029,6 @@ async fn handle_scmd(
             "scmd",
             translated,
             sanitize_user_message_for_persistence(&format!("SCMD: {raw}")),
-            None,
         )
         .await
     } else {
@@ -12198,6 +12081,9 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
+                "An ILK's purge removes for good one already marked deleted: mark it, then purge it (a tenant the same way, under /identity/tenants/{tenant_id}). Each runs at once, as typed.",
+                "SCMD: curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
+                "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge",
                 "The installation's ai.default_provider and ai.providers.<provider>.model are in its installation file (docs/hive-config-update-v1.md §4); SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
             ]
         }
@@ -12929,8 +12815,27 @@ fn system_get_may_run(method: &str, action: &str) -> bool {
     }
 }
 
+/// Whether `action` changes something: an operator's SCMD of it is recorded in the operations
+/// table (`handle_scmd`, `execute_tracked_admin_translation`) and read back when its answer did not
+/// come (`action_in_command_log`), and `fluxbee_system_get` never runs it (`system_get_may_run`).
+/// It is a question of its own, apart from `admin_action_allows_ai_write`, which leaves the purges
+/// out and stays as it was: every action that list names, and the changes an SCMD maps outside
+/// it: an ILK's charge to a tenant and its purge, a tenant's creation, its update, its sponsor and
+/// its purge, a tap, and the global user policy's clear.
 fn is_mutating_admin_action(action: &str) -> bool {
     admin_action_allows_ai_write(action)
+        || matches!(
+            action,
+            "set_ilk_tenant"
+                | "purge_ilk"
+                | "create_tenant"
+                | "update_tenant"
+                | "set_tenant_sponsor"
+                | "purge_tenant"
+                | "add_tap"
+                | "delete_tap"
+                | "opa_clear"
+        )
 }
 
 fn operation_scope_id(session_id: &str) -> String {
@@ -13978,6 +13883,43 @@ fn translate_scmd(
                 params,
             })
         }
+        ("POST", ["hives", hive_id, "identity", "tenants"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for create_tenant must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "create_tenant".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        // A tenant's lifecycle, as SY.admin's routes take it: a delete marks it (reversible), a
+        // restore undoes the mark, a purge removes one already marked, for good. The operator's
+        // SCMD runs each at once, recorded.
+        ("DELETE", ["hives", hive_id, "identity", "tenants", tenant_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "delete_tenant".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "tenant_id": tenant_id }),
+        }),
+        ("POST", ["hives", hive_id, "identity", "tenants", tenant_id, "restore"]) => {
+            Ok(AdminTranslation {
+                admin_target,
+                action: "restore_tenant".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: json!({ "tenant_id": tenant_id }),
+            })
+        }
+        ("POST", ["hives", hive_id, "identity", "tenants", tenant_id, "purge"]) => {
+            Ok(AdminTranslation {
+                admin_target,
+                action: "purge_tenant".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: json!({ "tenant_id": tenant_id }),
+            })
+        }
         ("POST", ["hives", hive_id, "nodes"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
@@ -14075,6 +14017,40 @@ fn translate_scmd(
         ("DELETE", ["hives", hive_id, "identity", "ilks", ilk_id]) => Ok(AdminTranslation {
             admin_target,
             action: "delete_ilk".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "ilk_id": ilk_id }),
+        }),
+        // An ILK's lifecycle past its mark, as SY.admin's routes take it: a restore undoes the
+        // mark, a purge removes an ILK already marked, for good. The operator's SCMD runs each at
+        // once, recorded (`is_mutating_admin_action`).
+        ("POST", ["hives", hive_id, "identity", "ilks", ilk_id, "restore"]) => {
+            Ok(AdminTranslation {
+                admin_target,
+                action: "restore_ilk".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: json!({ "ilk_id": ilk_id }),
+            })
+        }
+        // Only the body's tenant_id, as SY.admin's route reads it: who the change is for, SY.admin
+        // stamps from the router-stamped caller, never from the params.
+        ("PUT", ["hives", hive_id, "identity", "ilks", ilk_id, "tenant"]) => {
+            let body = parsed.body.unwrap_or_else(|| json!({}));
+            if !body.is_object() {
+                return Err("SCMD body for set_ilk_tenant must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_ilk_tenant".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: json!({
+                    "ilk_id": ilk_id,
+                    "tenant_id": body.get("tenant_id").cloned().unwrap_or(Value::Null),
+                }),
+            })
+        }
+        ("POST", ["hives", hive_id, "identity", "ilks", ilk_id, "purge"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "purge_ilk".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({ "ilk_id": ilk_id }),
         }),
@@ -14656,13 +14632,17 @@ fn admin_error_is_admin_timeout(err: &(dyn std::error::Error + 'static)) -> bool
     false
 }
 
+/// Runs a mutation an operator's SCMD asked for (`is_mutating_admin_action`) and records it in the
+/// chat's operations table: a new record, `dispatched`, then its outcome. An equivalent one still
+/// open in the chat (the same action, hive and params) is read first: an open one that a read can
+/// settle is (`reconcile_timeout_unknown_operation`), and one still open refuses the request
+/// `OPERATION_ALREADY_TRACKED`.
 async fn execute_tracked_admin_translation(
     state: &ArchitectState,
     session_id: &str,
     origin: &str,
     translation: AdminTranslation,
     preview_command: String,
-    existing_operation_id: Option<String>,
 ) -> Result<Value, ArchitectError> {
     let params_hash_value = params_hash(&translation.params);
     let existing_match = find_equivalent_operation(
@@ -14673,27 +14653,23 @@ async fn execute_tracked_admin_translation(
         &params_hash_value,
     )
     .await?;
-    if let Some(mut existing) = existing_match.clone() {
-        let existing_id = existing.operation_id.clone();
-        let current_id = existing_operation_id.as_deref();
-        if current_id != Some(existing_id.as_str()) {
-            // Both non-terminal states resolve by asking the hive. Gating on
-            // `timeout_unknown` alone left the `accepted` arm unreachable from production, so a
-            // backgrounded add_hive stayed open forever and every identical retry bounced with
-            // OPERATION_ALREADY_TRACKED.
-            if existing.status == "timeout_unknown" || existing.status == "accepted" {
-                let _ = reconcile_timeout_unknown_operation(state, &mut existing).await;
-            }
-            if !is_terminal_operation_status(&existing.status) {
-                return Ok(json!({
-                    "status": "error",
-                    "action": translation.action,
-                    "error_code": "OPERATION_ALREADY_TRACKED",
-                    "error_detail": operation_error_message(&existing),
-                    "operation_id": existing.operation_id,
-                    "confirmed_command": preview_command,
-                }));
-            }
+    if let Some(mut existing) = existing_match {
+        // Both non-terminal states resolve by asking the hive. Gating on
+        // `timeout_unknown` alone left the `accepted` arm unreachable from production, so a
+        // backgrounded add_hive stayed open forever and every identical retry bounced with
+        // OPERATION_ALREADY_TRACKED.
+        if existing.status == "timeout_unknown" || existing.status == "accepted" {
+            let _ = reconcile_timeout_unknown_operation(state, &mut existing).await;
+        }
+        if !is_terminal_operation_status(&existing.status) {
+            return Ok(json!({
+                "status": "error",
+                "action": translation.action,
+                "error_code": "OPERATION_ALREADY_TRACKED",
+                "error_detail": operation_error_message(&existing),
+                "operation_id": existing.operation_id,
+                "confirmed_command": preview_command,
+            }));
         }
     }
 
@@ -14705,28 +14681,18 @@ async fn execute_tracked_admin_translation(
         &translation.params,
     )))
     .unwrap_or_else(|_| "{}".into());
-    let created_at_ms = existing_match
-        .as_ref()
-        .filter(|record| existing_operation_id.as_deref() == Some(record.operation_id.as_str()))
-        .map(|record| record.created_at_ms)
-        .unwrap_or(now);
-    let origin_value = existing_match
-        .as_ref()
-        .filter(|record| existing_operation_id.as_deref() == Some(record.operation_id.as_str()))
-        .map(|record| record.origin.clone())
-        .unwrap_or_else(|| origin.to_string());
     let mut operation = ChatOperationRecord {
-        operation_id: existing_operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        operation_id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
         scope_id: operation_scope_id(session_id),
-        origin: origin_value,
+        origin: origin.to_string(),
         action: translation.action.clone(),
         target_hive: translation.target_hive.clone(),
         params_json,
         params_hash: params_hash_value,
         preview_command: preview_command.clone(),
         status: "dispatched".to_string(),
-        created_at_ms,
+        created_at_ms: now,
         updated_at_ms: now,
         dispatched_at_ms: now,
         completed_at_ms: 0,
@@ -15580,7 +15546,6 @@ async fn delete_chat_session(
     state: &ArchitectState,
     session_id: &str,
 ) -> Result<SessionDeleteResponse, ArchitectError> {
-    state.pending_actions.lock().await.remove(session_id);
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
@@ -15630,7 +15595,6 @@ async fn delete_chat_session(
 async fn clear_chat_sessions(
     state: &ArchitectState,
 ) -> Result<SessionDeleteResponse, ArchitectError> {
-    state.pending_actions.lock().await.clear();
     let _guard = state.chat_lock.lock().await;
     let db = open_architect_db(state).await?;
     let sessions = ensure_sessions_table(&db).await?;
@@ -32133,7 +32097,6 @@ mod tests {
             messages_db: Arc::new(RwLock::new(None)),
             messages_stream_active: Arc::new(AtomicUsize::new(0)),
             chat_lock: Arc::new(Mutex::new(())),
-            pending_actions: Arc::new(Mutex::new(HashMap::new())),
             cached_status: Arc::new(RwLock::new(ArchitectStatus {
                 status: "loading".to_string(),
                 hive_id: PRIMARY_HIVE_ID.to_string(),
@@ -35240,6 +35203,300 @@ mod tests {
         assert!(admin_action_allows_ai_write("delete_ilk"));
     }
 
+    /// The identity lifecycle in SCMD (0.1.152, the operator's ask): each of SY.admin's routes for
+    /// an ILK's or a tenant's lifecycle, as its catalog writes it (`admin_action_example_scmd`),
+    /// translates to its action on the path's hive, with the params SY.admin's own route sends:
+    /// the path's id, and of a body only what that route reads. SCMD mapped only the mark of an
+    /// ILK, a tenant's update and its sponsor, and answered `unsupported SCMD path` for the rest.
+    #[test]
+    fn the_identity_lifecycle_translates_as_sy_admins_routes() {
+        let admin_src = include_str!("sy_admin.rs");
+        let ilk = "ilk:550e8400-e29b-41d4-a716-446655440000";
+        let tenant = "tnt:550e8400-e29b-41d4-a716-446655440000";
+        for (example, action, params) in [
+            (
+                format!("curl -X POST /hives/motherbee/identity/ilks/{ilk}/restore"),
+                "restore_ilk",
+                json!({ "ilk_id": ilk }),
+            ),
+            (
+                format!(
+                    r#"curl -X PUT /hives/motherbee/identity/ilks/{ilk}/tenant -d '{{"tenant_id":"tnt:550e8400-e29b-41d4-a716-446655440001"}}'"#
+                ),
+                "set_ilk_tenant",
+                json!({ "ilk_id": ilk, "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440001" }),
+            ),
+            (
+                format!("curl -X POST /hives/motherbee/identity/ilks/{ilk}/purge"),
+                "purge_ilk",
+                json!({ "ilk_id": ilk }),
+            ),
+            (
+                r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
+                    .to_string(),
+                "create_tenant",
+                json!({ "name": "Client Co", "domain": "client.example", "status": "active",
+                        "sponsor_tenant_id": "tnt:11111111-1111-1111-1111-111111111111" }),
+            ),
+            (
+                format!("curl -X DELETE /hives/motherbee/identity/tenants/{tenant}"),
+                "delete_tenant",
+                json!({ "tenant_id": tenant }),
+            ),
+            (
+                format!("curl -X POST /hives/motherbee/identity/tenants/{tenant}/restore"),
+                "restore_tenant",
+                json!({ "tenant_id": tenant }),
+            ),
+            (
+                format!("curl -X POST /hives/motherbee/identity/tenants/{tenant}/purge"),
+                "purge_tenant",
+                json!({ "tenant_id": tenant }),
+            ),
+        ] {
+            assert!(
+                admin_src.contains(&example),
+                "SY.admin's catalog writes it so: {example}"
+            );
+            let translated = translate_scmd("motherbee", parse(&example))
+                .unwrap_or_else(|err| panic!("{example}: {err}"));
+            assert_eq!(translated.action, action, "{example}");
+            assert_eq!(translated.admin_target, "SY.admin@motherbee", "{example}");
+            assert_eq!(translated.target_hive, "motherbee", "{example}");
+            assert_eq!(translated.params, params, "{example}");
+            assert!(is_mutating_admin_action(action), "{action}");
+            assert!(!system_get_may_run("POST", action), "{action}");
+        }
+
+        // The path names the hive, and its id is decoded once, as SY.admin's route decodes it.
+        let purge = translate_scmd(
+            "motherbee",
+            parse("curl -X POST /hives/worker1/identity/tenants/tnt%3Aabc/purge"),
+        )
+        .expect("a tenant's purge on worker1");
+        assert_eq!(purge.target_hive, "worker1");
+        assert_eq!(purge.admin_target, "SY.admin@motherbee");
+        assert_eq!(purge.params, json!({ "tenant_id": "tnt:abc" }));
+
+        // set_ilk_tenant reads the body's tenant_id alone: who the change is for is SY.admin's to
+        // stamp, from the router-stamped caller, whatever the body says. Without one it goes as
+        // null, as SY.admin's route sends it, and SY.admin refuses it.
+        let charge = |body: &str| {
+            translate_scmd(
+                "motherbee",
+                parse(&format!(
+                    "curl -X PUT /hives/motherbee/identity/ilks/{ilk}/tenant -d '{body}'"
+                )),
+            )
+        };
+        assert_eq!(
+            charge(r#"{"tenant_id":"tnt:x","on_behalf_of":"operator","status":"active"}"#)
+                .expect("a charge")
+                .params,
+            json!({ "ilk_id": ilk, "tenant_id": "tnt:x" })
+        );
+        assert_eq!(
+            charge("{}").expect("a charge with no tenant").params,
+            json!({ "ilk_id": ilk, "tenant_id": null })
+        );
+        assert!(charge("[]").is_err());
+        assert!(translate_scmd(
+            "motherbee",
+            parse("curl -X POST /hives/motherbee/identity/tenants -d '[]'")
+        )
+        .is_err());
+    }
+
+    /// Every change an SCMD maps is recorded in the chat's operations table
+    /// (`is_mutating_admin_action`), whether or not `admin_action_allows_ai_write` lists it, and
+    /// that list stays as it was, the purges outside it (0.1.152). Before, the two were one list,
+    /// so an operator's set_tenant_sponsor, update_tenant, add_tap, delete_tap and opa_clear ran
+    /// unrecorded. The reads an SCMD's POST maps stay reads, and `fluxbee_system_get` runs them.
+    #[test]
+    fn every_change_an_scmd_maps_is_recorded_and_the_ai_list_keeps_the_purges_out() {
+        let ilk = "ilk:550e8400-e29b-41d4-a716-446655440000";
+        let tenant = "tnt:550e8400-e29b-41d4-a716-446655440000";
+        let node = "/hives/worker1/nodes/AI.sales@worker1";
+        let reads = [
+            "wf_rules_check",
+            "timer_now_in",
+            "timer_convert",
+            "timer_parse",
+            "timer_format",
+            "opa_check",
+            "node_control_config_get",
+        ];
+        let mut changes = Vec::new();
+        for (method, path) in [
+            ("POST", "/admin/runtime-packages/publish".to_string()),
+            ("POST", "/hives".to_string()),
+            ("DELETE", "/hives/worker1".to_string()),
+            ("POST", "/hives/worker1/identity/tenants".to_string()),
+            ("PUT", format!("/hives/worker1/identity/tenants/{tenant}")),
+            (
+                "POST",
+                format!("/hives/worker1/identity/tenants/{tenant}/sponsor"),
+            ),
+            (
+                "DELETE",
+                format!("/hives/worker1/identity/tenants/{tenant}"),
+            ),
+            (
+                "POST",
+                format!("/hives/worker1/identity/tenants/{tenant}/restore"),
+            ),
+            (
+                "POST",
+                format!("/hives/worker1/identity/tenants/{tenant}/purge"),
+            ),
+            (
+                "POST",
+                format!("/hives/worker1/identity/ilks/{ilk}/definition"),
+            ),
+            ("DELETE", format!("/hives/worker1/identity/ilks/{ilk}")),
+            (
+                "POST",
+                format!("/hives/worker1/identity/ilks/{ilk}/restore"),
+            ),
+            ("PUT", format!("/hives/worker1/identity/ilks/{ilk}/tenant")),
+            ("POST", format!("/hives/worker1/identity/ilks/{ilk}/purge")),
+            ("POST", "/hives/worker1/nodes".to_string()),
+            ("POST", format!("{node}/start")),
+            ("POST", format!("{node}/restart")),
+            ("DELETE", format!("{node}/instance")),
+            ("DELETE", node.to_string()),
+            ("POST", format!("{node}/messages")),
+            ("POST", format!("{node}/control/config-get")),
+            ("POST", format!("{node}/control/config-set")),
+            ("PUT", format!("{node}/config")),
+            ("POST", format!("{node}/wf/instances/inst-1/cancel")),
+            ("POST", "/hives/worker1/wf-rules".to_string()),
+            ("POST", "/hives/worker1/wf-rules/compile".to_string()),
+            ("POST", "/hives/worker1/wf-rules/check".to_string()),
+            ("POST", "/hives/worker1/wf-rules/apply".to_string()),
+            ("POST", "/hives/worker1/wf-rules/rollback".to_string()),
+            ("POST", "/hives/worker1/wf-rules/delete".to_string()),
+            (
+                "DELETE",
+                "/hives/worker1/runtimes/ai.sales/versions/1.0.0".to_string(),
+            ),
+            ("POST", "/hives/worker1/routes".to_string()),
+            ("DELETE", "/hives/worker1/routes".to_string()),
+            ("DELETE", "/hives/worker1/routes/tenant.acme.".to_string()),
+            ("POST", "/hives/worker1/vpns".to_string()),
+            ("DELETE", "/hives/worker1/vpns".to_string()),
+            ("DELETE", "/hives/worker1/vpns/WF.*".to_string()),
+            ("POST", "/hives/worker1/taps".to_string()),
+            ("DELETE", "/hives/worker1/taps".to_string()),
+            ("POST", "/hives/worker1/timer/now-in".to_string()),
+            ("POST", "/hives/worker1/timer/convert".to_string()),
+            ("POST", "/hives/worker1/timer/parse".to_string()),
+            ("POST", "/hives/worker1/timer/format".to_string()),
+            ("POST", "/opa/policy".to_string()),
+            ("POST", "/opa/policy/compile".to_string()),
+            ("POST", "/opa/policy/apply".to_string()),
+            ("POST", "/opa/policy/rollback".to_string()),
+            ("POST", "/opa/policy/clear".to_string()),
+            ("POST", "/opa/policy/check".to_string()),
+            ("POST", "/hives/worker1/update".to_string()),
+            ("POST", "/hives/worker1/sync-hint".to_string()),
+            ("PUT", "/config/storage".to_string()),
+        ] {
+            let raw = format!("curl -X {method} {path} -d '{{}}'");
+            let translated = translate_scmd("motherbee", parse(&raw))
+                .unwrap_or_else(|err| panic!("{raw}: {err}"));
+            let action = translated.action.as_str();
+            if reads.contains(&action) {
+                assert!(!is_mutating_admin_action(action), "{raw}: {action}");
+                assert!(system_get_may_run(method, action), "{raw}: {action}");
+            } else {
+                assert!(is_mutating_admin_action(action), "{raw}: {action}");
+                assert!(!system_get_may_run(method, action), "{raw}: {action}");
+                changes.push(action.to_string());
+            }
+        }
+        // The changes outside the AI's list, each recorded all the same.
+        for action in [
+            "purge_ilk",
+            "purge_tenant",
+            "set_ilk_tenant",
+            "create_tenant",
+            "update_tenant",
+            "set_tenant_sponsor",
+            "add_tap",
+            "delete_tap",
+            "opa_clear",
+        ] {
+            assert!(changes.iter().any(|change| change == action), "{action}");
+            assert!(!admin_action_allows_ai_write(action), "{action}");
+        }
+        // The AI's list as it was: the reversible lifecycle, never a purge.
+        for action in [
+            "delete_ilk",
+            "restore_ilk",
+            "delete_tenant",
+            "restore_tenant",
+        ] {
+            assert!(admin_action_allows_ai_write(action), "{action}");
+        }
+        // A recorded change that timed out is read in SY.admin's command log, a purge included;
+        // the global policy's clear goes another way in SY.admin, as the other OPA writes do.
+        for action in [
+            "purge_ilk",
+            "purge_tenant",
+            "set_ilk_tenant",
+            "create_tenant",
+            "update_tenant",
+            "set_tenant_sponsor",
+            "add_tap",
+            "delete_tap",
+        ] {
+            assert!(action_in_command_log(action), "{action}");
+            assert!(open_operation_is_read(action), "{action}");
+        }
+        assert!(!action_in_command_log("opa_clear"));
+    }
+
+    /// An operator's purge that outlasted Archi's wait is settled as any recorded change
+    /// (FINDINGS A-320): the entry its command made in SY.admin's command log closes it, its
+    /// params read as SY.admin logged them (an ILK's charge with the caller SY.admin stamped).
+    #[tokio::test]
+    async fn an_operators_purge_that_timed_out_is_settled_by_the_command_log() {
+        let archi = "l2:SY.architect@motherbee";
+        let (state, mut router) = harness_state();
+        for (raw, logged) in [
+            (
+                "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge",
+                json!({ "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000" }),
+            ),
+            (
+                r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/tenant -d '{"tenant_id":"tnt:1"}'"#,
+                json!({ "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000",
+                        "tenant_id": "tnt:1", "on_behalf_of": "SY.architect@motherbee" }),
+            ),
+        ] {
+            let translated = translate_scmd(PRIMARY_HIVE_ID, parse(raw)).expect(raw);
+            assert!(is_mutating_admin_action(&translated.action), "{raw}");
+            let mut record = timed_out_record(&translated.action, translated.params, 60_000);
+            let entry = command_log_entry(&record, archi, logged, 100, 45_000, "ok", None);
+            let page = json!({ "status": "ok", "action": "list_recent_commands",
+                               "payload": { "commands": [entry], "count": 1, "next_cursor": null },
+                               "error_code": null, "error_detail": null });
+            let (settled, sent) = tokio::join!(
+                settle_open_operation(&state, &mut record),
+                answer_admin_command(&mut router, "list_recent_commands", page),
+            );
+            assert!(settled.expect("the log's answer"), "{raw}");
+            assert_eq!(
+                sent.payload["params"]["action"],
+                json!(record.action),
+                "{}",
+                sent.payload
+            );
+            assert_eq!(record.status, "succeeded_after_timeout", "{raw}");
+        }
+    }
+
     #[test]
     fn translate_publish_runtime_package_scmd() {
         let translated = translate_scmd(
@@ -35365,9 +35622,9 @@ mod tests {
         assert_eq!(line.kind, ImmediateInteractionKind::ToolError);
     }
 
-    /// FINDINGS A-322's review: a plan dropped with CANCEL answers in the chat's own words, as a
-    /// dropped SCMD does: the UI draws it as Archi's message, never as an executor run marked
-    /// "done", and the next turns read it as what Archi said.
+    /// FINDINGS A-322's review: a plan dropped with CANCEL answers in the chat's own words: the
+    /// UI draws it as Archi's message, never as an executor run marked "done", and the next turns
+    /// read it as what Archi said.
     #[test]
     fn a_discarded_plan_answers_as_archis_own_words() {
         let response = plan_discarded_response("sess_1", "Gate");
