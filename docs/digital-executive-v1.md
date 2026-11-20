@@ -1,6 +1,6 @@
 # The Digital Executive v1, and the operator's large topics of 2026-11-20
 
-**Status:** the talk opened on 2026-11-20; nothing is decided yet. This is the single place for the
+**Status:** the talk opened on 2026-11-20; its skeleton agreed the same day (§4). This is the single place for the
 Digital Executive. §1 also keeps the other three large topics the operator raised the same day,
 until each gets a talk and a document of its own.
 
@@ -75,20 +75,58 @@ io.web's track closed the same day. The operator: the IO family's revamp is not 
 
 ---
 
-## 4. The first question: one actor over many hands? (open)
+## 4. The skeleton: one person, born and then hired (agreed 2026-11-20)
 
-The skeleton before the organs: what a Digital Executive is in Fluxbee's identity, and how it
-relates to the nodes that do its work. Asked to the operator on 2026-11-20; see the chat.
+The question: what a Digital Executive is in Fluxbee's identity, and how it relates to the nodes
+that do its work. The example asked: "Laura" answers Ana on WhatsApp as sales, and a week later
+writes to her by email as collections; with today's model those are two agents, two memories, two
+names.
+
+**The operator's answer:** the focus is to imitate a person. *"Una persona no tiene un wapp por cada
+rol (ventas, cobranzas), es una sola que responde según el caso."* Hence:
+
+- **One person, one set of channels.** The executive's channels in and out, at least those that
+  reach humans, are unique: one WhatsApp, one email, one Instagram, one LinkedIn profile. Whoever
+  creates it sees what it can do; the channels do not multiply with its roles.
+- **Born: the basics, the same for everyone.** Creating an executive creates its email, its face,
+  its WhatsApp, its first and last name, its LinkedIn profile and so on, and its human capabilities:
+  an AI agent that holds its "soul" and answers as a human, able to write an email or chat on
+  Instagram. **The core is created the same for all: IO + AI + something more Fluxbee builds that is
+  useful.**
+- **Hired: responsibilities.** When a company hires it, it gets responsibilities, with the
+  capabilities and the roles inside that company. The operator sees roles and capabilities as
+  responsibilities, the word that holds everything: *"si es responsable es porque tiene la
+  capacidad"*.
+- **A solution gives a responsibility; it does not define the executive.** An Archi solution, with
+  its deploy plan and the rest, separates one responsibility from another.
+- **It grows with its responsibilities.** The executive that was one agent becomes more complex
+  with internal agents that handle each task with flows: multi-agent for sure, more responsibility,
+  more agents, always atomized and relative to the problem the company must solve. So Archi must be
+  able to make a custom solution for each responsibility.
+- **The company's people are in Fluxbee, with their roles,** so that the executive knows where to
+  pass a problem: to its supervisor, for one.
+
+**What this is in the model:** option (a) of the question: one actor, many hands. The executive
+is one ILK of its own kind, the one that speaks outward and holds the channels; its memory with each
+person is the executive's; the nodes of its responsibilities keep their own ILKs and work for it.
+Options (b), a label over several agents, and (c), one node that does everything, were not taken.
 
 ---
 
 ## 5. Later questions (not yet)
 
-- Roles and capabilities against solutions: is a role one solution, and what does a template hold?
+- **Next, asked on 2026-11-20:** who speaks to the humans, the soul alone or each responsibility's
+  agents through the executive's channels (see the chat).
+- The core: what "something more" holds besides IO and AI (an agenda: the tasks on timers of §1.2?).
+- The company's people and their roles in Fluxbee. An earlier decision to weigh
+  ([ilk-tenant-model-v1](ilk-tenant-model-v1.md), the operator 2026-10-14 and 10-15): companies,
+  their members and billing live in Fluxbee Cloud; Fluxbee keeps flat relations with no rights, and
+  a tenant is a cost center, never a company. Knowing one's supervisor is new: knowledge for the
+  executive, not a permission.
+- A responsibility against a solution: what a template holds, and what Archi makes to measure.
 - Its definition: which part is the executive's (its personality, who it is) and which is each
-  solution's (what it does).
-- Its channels: the phone and the email it writes from, owned by its ILK, and the IO nodes that
-  carry them.
+  responsibility's (what it does).
+- Its channels: owned by its ILK, and the IO nodes that carry them.
 - Its identity on the internet: `did:web` / `did:webvh` + `agent-card.json`, `did:key` +
   Verifiable Credentials; who issues and who verifies.
 - Fluxbee Cloud's flow: create one, assign a role, add solutions; what Cloud stores and what the hive
