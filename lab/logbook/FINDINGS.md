@@ -439,7 +439,8 @@ no change required
     90 s answer, SSE every 1.0 s, 100 MB whole, a WebSocket, the cookies, the forwarding headers, the
     header table, the Origin check, the cut (every socket closed before the disable's answer), the
     renewal (nothing cut), the clock's end, Archi's page, stream and one chat turn, the restarts; 44
-    PASS, one model call. **Stage 2.2 is built;** left: the iframe in a real browser with Cloud's team.
+    PASS, one model call. **Stage 2.2 is built;** its last step passed on 2026-11-20: the operator saw
+    Archi working inside Cloud's iframe. **io.web's track is closed.**
     **Stage 2.2's design talk (2026-11-19):** what is left was redefined with the operator
     ([io-web-v2](../../docs/io-web-v2.md) §13): a transparent proxy, straight to Cloud's iframe (no
     stage in its own tab); no time, size or rewrite of the proxy's own (A-142 settled for the
@@ -510,10 +511,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### io.web
 
-- Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12): stage 2.1 complete, the board's item 31
-  ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)). What is left was redefined on
-  2026-11-19 (§13): one stage 2.2, a transparent proxy straight to Cloud's iframe; its talk goes on
-  with §13.9.
+- Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12 and §13) complete: stage 2.1 (0.1.145 to
+  0.1.148) and stage 2.2, the transparent proxy straight to Cloud's iframe (0.1.150 and 0.1.151),
+  the board's item 31. The operator saw Archi working inside Cloud's iframe on 2026-11-20: **the
+  track is closed**; what is left below is small and on other binaries.
 - A-142 (Archi) ✅ validated with 0.1.151: no wait of the proxy's own.
 - A-351 ✅ validated on 8.x with 0.1.151: the system's cookies reach its upstream, Fluxbee's never do, and an upstream cannot set Fluxbee's.
 - A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low).

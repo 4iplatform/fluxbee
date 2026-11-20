@@ -5,8 +5,8 @@ Base: `daily_onworking_coa` at `31126b57`, 0.1.149 live. This is the build desig
 code carries `file:line`, read on 2026-11-19.
 
 **Built:** R1 live in 0.1.150 and R2 in 0.1.151 (2026-11-19, `lab/DEPLOYMENTS.md`); §7's gate passed on
-8.x with 0.1.151, but for step 9, the iframe in a real browser inside Cloud's page, which is done with
-Fluxbee Cloud's team once its iframe exists. The builders' deviations, all accepted, are in the
+8.x with 0.1.151; step 9, the iframe in a real browser inside Cloud's page, passed on 2026-11-20, when
+the operator saw Archi working there. The builders' deviations, all accepted, are in the
 ledger's 0.1.151 entry and the logbook of 2026-11-19.
 
 Paths are shortened:
