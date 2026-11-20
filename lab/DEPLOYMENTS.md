@@ -21,6 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
+| **0.1.152** | 2026-11-20 | `9dfe1a4d` | motherbee + spokes (core), two binaries, one branch each: Archi (SY.architect) takes an identity's whole lifecycle in SCMD on SY.admin's own routes (purges included, run directly as every SCMD; each mutation tracked, apart from what Archi's AI may write; the dead staged-action path removed), A-348 (SCMD config `?replace` and the binding fields), A-307's Archi part (`BUSY`), A-327 (the explanation turn reads the prompt cache); SY.admin A-358 (a `hive` upstream at an address io.web refuses is refused at publish, `HIVE_ADDRESS_REFUSED`) and A-337 (the plan review sees no secret; a plan holding the mask refused), the purge help as the code has it | ✅ live, checked on 8.x | snap `pre-archi-0-1-152` (all 4 VMs) · `apt install fluxbee=0.1.151` + 0.1.151's `update_installation` (nothing one-way) |
 | **0.1.151** | 2026-11-19 | `890d258f` | motherbee + spokes (core), io.web stage 2.2's R2, the binaries, one branch per binary ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): io.web a transparent reverse proxy to each exposure's upstream (every method, bodies and streams frame by frame, WebSockets, no wait of its own; the Origin check; the header table; a renewal moves the sessions; what is open cut at once when the access ends), SY.edge the pass-through (every method but CONNECT and TRACE, bodies, WebSockets in their connection's scope, no wait of its own, TCP keepalive, every cookie pair, HSTS, frame_origins), SY.admin `publish_cloud_endpoint`'s `cloud_origins`; with A-356 and A-357 (SY.admin's executor contract) | ✅ live, checked on 8.x | snap `pre-web22-0-1-151` (all 4 VMs) · `apt install fluxbee=0.1.150` + 0.1.150's `update_installation` (nothing one-way; exposures go back to the placeholder; io.web's and the edge's files hold the origins, which their 0.1.150 refuses: each serves SY.admin's next push, within 60 s; 0.1.150's SY.admin drops the origins from its registry, so name them again after coming back) |
 | **0.1.150** | 2026-11-19 | `671dc2ca` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.2's R1 ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): `IO_WEB_EXPOSURES` carries `cloud_origins`, the origins of the Fluxbee Cloud page that may frame the exposures, absent on the wire while empty; SY.admin and io.web send and read none before R2 | ✅ replaced by 0.1.151 | snap `pre-websdk-0-1-150` (deleted 2026-11-19) · `apt install fluxbee=0.1.149` + 0.1.149's `update_installation` (nothing one-way) |
 | **0.1.149** | 2026-11-19 | `0874f4e0` | motherbee + spokes (core), two small fixes 0.1.148's gate found: A-353 (SY.edge asks the vault again every 30 s for a channel secret it missed at boot, where Cloud's door refused every request until a restart) and A-354 (a host reads pending, not held, while its own ACME order runs) | ✅ replaced by 0.1.150 | snap `pre-fix-0-1-149` (deleted 2026-11-19) · `apt install fluxbee=0.1.148` + 0.1.148's `update_installation` (nothing one-way) |
@@ -160,6 +161,72 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.152 — Archi's SCMD identity lifecycle with A-348, A-307's Archi part and A-327; SY.admin's A-358 and A-337
+
+- **Date:** 2026-11-20 (ART) · **Previous version:** 0.1.151 · **Commit:** `9dfe1a4d`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** after io.web's track closed, small changes batched on two binaries (the operator,
+  2026-11-20): the purge the operator could only run through SY.admin's HTTP API (that morning's purge
+  of Fluxbee Cloud's test records), reachable from Archi; and the small open items of both binaries.
+- **What changed (two builder branches, rebased and fast-forwarded):**
+  - `coa/archi-152` (SY.architect): SCMD routes for `restore_ilk`, `set_ilk_tenant`, `purge_ilk`,
+    `create_tenant`, `delete_tenant`, `restore_tenant` and `purge_tenant`, each as SY.admin's HTTP
+    route sends it; `is_mutating_admin_action` its own list, so every mutation typed through SCMD is
+    tracked (`update_tenant`, `set_tenant_sponsor`, `add_tap`, `delete_tap` and `opa_clear` too), while
+    `admin_action_allows_ai_write` is unchanged; the staged-action path nothing fed removed; SCMD
+    help's lifecycle examples; A-348; A-307's Archi part (`EXECUTION_BUSY`); A-327 (the explanation
+    turn is shown the chat's tools with `tool_choice` none).
+  - `coa/admin-152` (SY.admin): A-358 (the worker's registry address checked at publish with io.web's
+    rules, one shared `check_address`, a name resolved within 5 s; `409 HIVE_ADDRESS_REFUSED`, DNS
+    failures retryable; the same exposure published again answers `created: false` with no check);
+    A-337 (the review's prompt masks secrets in shape, `unpublish_artifact`'s link key included; a plan
+    holding the mask refused `400 PLAN_HOLDS_MASKED_VALUE` before its review and run); the help of
+    `purge_ilk` and `purge_tenant` names who may purge (the HTTP API, Archi's SCMD, a plan Archi
+    stages and the operator confirms; never Cloud).
+  - **The operator's calls (2026-11-20):** a purge through SCMD runs directly, as every SCMD (none asks
+    for CONFIRM); Archi's plans may keep purging after the operator's CONFIRM, as SY.admin's executor
+    already allowed.
+- **Review:** one round per branch. Archi: nothing high or medium (four low, recorded in the logbook).
+  SY.admin: two medium, both fixed before the build (M1: the address check broke the idempotent
+  re-publish and read DNS failures as lasting; M2: a literal mask in a plan read as present).
+- **Build:** CI green on each branch and on `9dfe1a4d` after the rebase. Build on fb-build
+  21:55:56–22:10:31Z (14.6 min), publish 18 s.
+- **The deploy:** the gate's mark at 22:11:15Z; `ops deploy 0.1.152 --snapshot pre-archi-0-1-152
+  --drop pre-web22-0-1-151` in 287 s (snapshots 31.5 s, the motherbee's apt 159.2 s, its admin on the
+  version 43.7 s, against 25.6 s for 0.1.151, the spokes answering 9.9 s, the update's call 22.1 s, the
+  hives on the target 6.2 s, health 6.1 s). On the target after the update's call: the motherbee
+  4.3 s, egress1 and ingress1 22.1 s, worker1 26.3 s. The update (`upd-1795212923578`) closed with
+  every hive on the target. Health clean; the web line `open=0 fail=0 origins=1`.
+- **Checked on 8.x (the gate, gate0252, 22:16–22:22Z; `scratchpad/gate-tools/r152_gate.py`,
+  git-ignored; 42 PASS, 9 SEE, 5 FAIL of the tool's own, each read again: PASS):**
+  - **The smoke:** a new node RUNNING in 6.1 s on 0.1.152, stopped; a stopped one reads STOPPED.
+  - **SCMD's identity lifecycle, no model call:** two tenants created; a person registered through
+    Cloud's door, charged to the second, marked, restored, marked and purged; the first tenant marked,
+    restored, marked and purged, the second marked and purged; every call ok in 2.9–4.5 s and tracked;
+    each record reads gone, no ILK holds the person's email; SCMD help lists the purge.
+  - **A-348:** an SCMD merge, then `?replace=1` with a top-level `runtime_version`: the merged key
+    gone, `runtime_version` not a config key.
+  - **A-358:** a worker at a private address publishes (the control); the motherbee and an unknown
+    hive refused `INVALID_REQUEST` as before. No worker at a public address exists on 8.x: its
+    refusal rests on SY.admin's tests.
+  - **A-337 and A-327 (13 model calls in all):** Archi asked in words to stage a one-step `vault_put`
+    with a dummy value (it first asked for the resource type and field, rightly); staged, CONFIRMed:
+    SY.admin's review passed the masked value twice, the step ran; the explanation turn read 76,036
+    tokens from the cache and wrote none (0.1.151's baseline: the first explanation in a while wrote
+    58,438). A plan holding the mask in a `vault_rotate` refused before its review, no model call,
+    the key left at its version 1.
+  - **The tool's FAILs:** the person's id read in the door's `result` (found by email at once); the
+    first ask (Archi asked for two missing values); the code read where Archi's answer has none (it
+    carries SY.admin's detail only: A-361); the key's delete with its tenant in the body, as the help
+    says, where the route reads the query (A-362), then deleted.
+  - **Cleaned:** the vault key, both nodes, the three Archi sessions; the tenants and the person gone.
+- **Found:** A-359 (the executor's fill shows a step's secrets to its model), A-360
+  (`node_control_config_set`'s help names a `postgres_url` the nodes refuse), A-361 (Archi's
+  leftovers, and SY.admin's code dropped from a refused plan's answer), A-362 (`vault_delete`'s
+  `tenant_id`: the help says body, the route reads the query).
+- **Rollback:** snapshot `pre-archi-0-1-152`, or `apt install fluxbee=0.1.151` and 0.1.151's
+  `update_installation`: nothing one-way (no file changes format).
 
 ## 0.1.151 — io.web, a transparent proxy straight to Cloud's iframe (io.web stage 2.2's R2), with A-356 and A-357
 

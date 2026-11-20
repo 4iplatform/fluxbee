@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.151** (2026-11-19), and PROD runs **0.1.151** (the router, the Go
+> Contract as of **fluxbee 0.1.152** (2026-11-20), and PROD runs **0.1.152** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1396,6 +1396,16 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.152
+
+- **A worker the hive records at an address no exposure is led to is refused at publish**
+  (§5.8, the `hive` upstream and `HIVE_ADDRESS_REFUSED`): before, such an exposure was published and
+  answered 502 at every request. The same label and upstream published again still answers
+  `created: false`, without this check. Where the worker is recorded by a name that did not resolve,
+  `error_detail` says so, and sending it again later may pass.
+- Nothing else changes for Cloud. A tenant's or a person's purge stays the operator's (from 0.1.152
+  also through Archi); Cloud marks and restores, as before.
+
 ### 0.1.151
 
 - **An exposure leads to its upstream** (§5.8): with a session, the person uses Archi, or the
@@ -1752,6 +1762,12 @@ post '{"op":"list_cloud_actions"}'
 
 ## 10. Checked live
 
+**0.1.152:** on PROD, 2026-11-20 at 22:18Z (19:18 ART), through the public door with Cloud's token
+(`lab/DEPLOYMENTS.md`, 0.1.152): a person registered with `register_human` in a test tenant; a `hive`
+upstream on a worker at a private address published and unpublished; the motherbee and an unknown
+hive as a `hive` upstream refused `INVALID_REQUEST`, as before. A worker at a public address could not
+be tried on PROD (none is); its refusal is checked by SY.admin's tests.
+
 **0.1.151:** on PROD, 2026-11-19 from 20:12Z (17:12 ART), through the public door with
 Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.151): Cloud's origin `https://cloud.fluxbee.ai` named by the
 operator (Cloud's token rotated then); an exposure to a test system on a worker answered as the system
@@ -1760,7 +1776,7 @@ system's cookies (never Fluxbee's), the public host; the headers of §5.8; a wri
 from a sibling origin refused 403; a disable cut a stream, a waiting request and a WebSocket before
 its answer came; a renewal cut nothing; an enablement's end cut a stream at once; Archi's page,
 status, sessions, messages stream and one chat turn through the proxy. The iframe in a real
-browser inside Cloud's page is checked with Cloud's team.
+browser inside Cloud's page: the operator saw Archi working there on 2026-11-20.
 
 **0.1.149:** on PROD, 2026-11-19 at 03:11Z (00:11 ART), through the public door with Cloud's token
 (`lab/DEPLOYMENTS.md`, 0.1.149): with the hive's vault frozen and its edge restarted, the door

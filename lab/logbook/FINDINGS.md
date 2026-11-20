@@ -448,6 +448,12 @@ no change required
     interrupts nobody; A-351 agreed; the headers Fluxbee adds, and Cloud's origin as a field of
     `publish_cloud_endpoint` (§13.7); the `Origin` check on what writes (§13.8). The talk ends with
     §13.9 (observability and the gate), then the build design.
+32. **0.1.152, two binaries (the operator, 2026-11-20: io.web closed, the IO family not next):** Archi
+    (SY.architect): the identity lifecycle in SCMD, purges included and run directly as every SCMD
+    (the operator's call), tracked apart from what Archi's AI may write, the dead staged-action path
+    removed, A-348, A-307's Archi part, A-327; SY.admin: A-358, A-337 (with the review's M1 and M2),
+    the purge help as the code has it (a plan the operator confirms may purge, the operator's call).
+    ✅ live and checked on 8.x (2026-11-20). Found: A-359 to A-362.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -514,10 +520,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12 and §13) complete: stage 2.1 (0.1.145 to
   0.1.148) and stage 2.2, the transparent proxy straight to Cloud's iframe (0.1.150 and 0.1.151),
   the board's item 31. The operator saw Archi working inside Cloud's iframe on 2026-11-20: **the
-  track is closed**; what is left below is small and on other binaries.
+  track is closed**; what is left below is small and on other binaries. A-358 ✅ built in 0.1.152.
 - A-142 (Archi) ✅ validated with 0.1.151: no wait of the proxy's own.
 - A-351 ✅ validated on 8.x with 0.1.151: the system's cookies reach its upstream, Fluxbee's never do, and an upstream cannot set Fluxbee's.
-- A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low). *Building in 0.1.152.*
 - A-356, A-357 ✅ built in 0.1.151: SY.admin's executor contract (`publish_cloud_endpoint`'s `cloud_node` optional; `vault_assign`'s lists are lists).
 - A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
@@ -525,8 +530,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 - A-142 ✅ validated on 8.x with 0.1.151: the proxy has no wait of its own (a 90 s answer passes, Archi's chat turns through the proxy).
 - A-361 🔵 Archi's leftovers of its removed staged-action path, and a deleted chat keeps its staged plan (low; SY.architect; found by 0.1.152's builder).
-- A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
-- A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
   across chat turns; the atoms become a document of their own. **A large topic (the operator,
@@ -570,10 +573,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
-- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` ✅ 0.1.142, by its tests; SY.architect's use of it open, for its next release).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-336 🔵 The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke orchestrator's as unreachable (low; the orchestrator's next change after 0.1.143; found by the review of `coa/rustsdk-143`).
-- A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
@@ -581,6 +582,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-347 🔵 `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped (low; the orchestrator; found by 0.1.139's gate; the operator's call of 2026-11-13: it waits, recorded).
 - A-359 🔵 SY.admin's executor gives its model a step's args unmasked when the step asks it to fill a field (low; SY.admin; found by 0.1.152's review; A-337's sibling).
 - A-360 🔵 `node_control_config_set`'s help names `postgres_url` as SY.storage's and SY.identity's secret field, which they refuse (low; SY.admin; found by 0.1.152's review).
+- A-362 🔵 `vault_delete`'s help names `tenant_id` a body field; SY.admin's HTTP route reads it only from the query, so a key of another tenant answers KEY_NOT_FOUND (low; SY.admin; found by 0.1.152's gate).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1658,6 +1660,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-362 [General/admin] 🔵 low (found 2026-11-20 by 0.1.152's gate; seen on 8.x, read in the code; there before it) — `vault_delete`'s help names `tenant_id` a body field, and SY.admin's HTTP route reads it only from the query
+
+- **Seen on 8.x:** the gate deleted its key `gate0252-review` of the tenant `pruebas` with
+  `DELETE /hives/motherbee/vault/secrets/gate0252-review` and the body `{"tenant_id": ...}`, as the
+  help's `request_contract` says: `KEY_NOT_FOUND`. With `?tenant_id=...` in the query: ok.
+- **Why:** the route (`handle_hive_paths`, `src/bin/sy_admin.rs` ~14330) takes `tenant_id` from the
+  query only; without one, SY.vault looks in the hive's root tenant. The help describes it as an
+  optional body field. A plan step passes it in its args, which works.
+- **Effect:** an operator, or Archi, who follows the help through the HTTP API cannot delete a
+  tenant's key, and reads that it does not exist.
+- **Fix, later (SY.admin):** the route also reads the body's `tenant_id`, or the help says query.
+
 ### A-361 [Archi] 🔵 low (found 2026-11-20 by 0.1.152's Archi builder on `coa/archi-152`; read in the code, not run; there before it) — Archi keeps leftovers of its removed staged-action path, and a deleted chat keeps its staged plan
 
 - **Why:** 0.1.152 removed the staged-action path that nothing fed (`pending_actions`). What is left:
@@ -1667,6 +1681,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - `delete_chat_session` and `clear_chat_sessions` never drop the plan the plan compiler staged
     for the session (`plan_compile_pending`), so it stays in memory until Archi restarts;
   - the page's JavaScript still names a `fluxbee_system_write` tool that Archi no longer has.
+  - a plan SY.admin refuses at validation reaches the chat with SY.admin's detail but without its
+    `error_code` (seen with `PLAN_HOLDS_MASKED_VALUE` by 0.1.152's gate), and the failure classifier
+    knows `PLAN_REVIEW_FAILED` but not `PLAN_HOLDS_MASKED_VALUE`.
 - **Effect:** none an operator sees, but dead code and a small leak.
 - **Fix, later (Archi alone):** remove the dead status handling and the tool name; drop a session's
   staged plan with the session.
@@ -1695,7 +1712,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Mask them for the prompt and put the real values back into the call the model makes, never taking
   a masked value from it.
 
-### A-358 [General/admin] 🔵 design (medium-low; found 2026-11-19 by io.web stage 2.2's io.web builder; read in the code, not run) — SY.admin publishes a `hive` upstream whose registry address io.web will refuse
+### A-358 [General/admin] ✅ BUILT (0.1.152, 2026-11-20, by its tests; on 8.x a worker at a private address still publishes, and no worker at a public address exists there to refuse) (medium-low; found 2026-11-19 by io.web stage 2.2's io.web builder; read in the code, not run) — SY.admin publishes a `hive` upstream whose registry address io.web will refuse
+
+- **Built (0.1.152):** at publish, SY.admin applies io.web's address rules to the worker's registry
+  address (one shared `check_address`; a name resolved within 5 s, passing when one of its addresses
+  does) and refuses `409 HIVE_ADDRESS_REFUSED`, writing and pushing nothing; a DNS failure is
+  retryable, an address the rules refuse is not. The same label and upstream published again answers
+  `created: false` with no check (the review's M1). io.web keeps its own check.
+
 
 - **Why:** at publish, SY.admin checks a `hive` upstream's role only (`check_upstream`,
   `src/bin/sy_admin/exposures.rs` ~651-690). From 0.1.151 io.web reads the hive's registry `address`
@@ -1880,7 +1904,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   frontdesk's 4 replies to IO.cloud by its UUID (no credential; the router still stores such
   replies). The VM snapshot `pre-router-0-1-146` holds the old rows until the next deploy drops it.
 
-### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
+### A-348 [Archi] ✅ VALIDATED ON 8.x (0.1.152, 2026-11-20: an SCMD `?replace=1` replaced a node's config and lifted `runtime_version` out of it) (low; found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
+
+- **Built (0.1.152):** the SCMD arm reads `replace` from the query (`1` or `true`) and lifts the
+  five binding fields from the body's top level, as SY.admin's route does.
+
 
 - **Why:** `translate_scmd` (`src/bin/sy_architect.rs` ~14588-14602) sends the SCMD's body as
   `config` with `replace: false`, whatever its query (`scmd_path_parts` keeps it as `raw_query`,
@@ -2355,7 +2383,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   right), past io.slack's and io.wapp's 5 s wait and ai.generic's none: such a reader on another
   hive fails it today. Recorded, not judged (the operator's call keeps it a topic of its own).
 
-### A-337 [General/admin] 🔵 low (found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
+### A-337 [General/admin] ✅ VALIDATED ON 8.x (0.1.152, 2026-11-20: a vault_put Archi staged with a value passed SY.admin's review masked and ran; a plan holding the mask refused before its review, with no model call) (low; found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
+
+- **Built (0.1.152):** the review's prompt carries each step with its secrets masked in shape (the
+  run log's names, a vault-shaped `value`, an `unpublish_artifact`'s `key`; `""` stays `""`), and a
+  rule that the mask reads as present; a plan whose args hold the mask anywhere is refused before its
+  review and its run, `400 PLAN_HOLDS_MASKED_VALUE`, naming the step and the field (the review's M2).
+  Left: A-359, the executor's fill.
+
 
 - **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~10460) runs
   `semantic_review_executor_plan` (~3127) whenever SY.admin's executor has an AI: one model call
@@ -2934,7 +2969,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `an_executor_answer_without_its_outputs_keeps_a_refusals_retryable_and_hives` (SY.admin) and
   `the_hives_sy_admin_cut_from_a_refusal_are_counted` (SY.architect).
 
-### A-327 [Archi] 🔵 low (found 2026-11-12 by A-322's review; read in the code; since 0.1.137) — Archi's explanation turn after a CONFIRM never reads the prompt cache
+### A-327 [Archi] ✅ VALIDATED ON 8.x (0.1.152, 2026-11-20: the explanation turn read 76,036 tokens from the cache and wrote none; on 0.1.151 the first explanation in a while wrote 58,438) (low; found 2026-11-12 by A-322's review; read in the code; since 0.1.137) — Archi's explanation turn after a CONFIRM never reads the prompt cache
+
+- **Built (0.1.152):** the explanation turn is shown the chat's tools with `tool_choice` none;
+  a tool the model calls anyway runs nothing.
+
 
 - **Why:** the turn sends no tools, and Anthropic caches a prompt as tools, then system, then
   messages, with the AI SDK's breakpoints on the last tool and on the system prompt
@@ -4096,6 +4135,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   hold no forwarding place. worker1 answered again after the thaw (0.87 s).
 
 ### A-307 [WF/wf-rules] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; with 14 changes queued behind a frozen Syncthing, 6 answered 409 `BUSY`, `retryable`, within SY.admin's 75 s after waits of 56.0 to 72.6 s, and 11 were refused in all, each after more than 55 s; no read refused, the refused changes changing nothing; on 0.1.138 a queued change timed out at 75 s while it ran) (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it, longer since 0.1.133) — SY.wf-rules handles one request at a time, and a request queued behind another starts its 60 s late
+
+- **Archi's part built (0.1.152, by its tests):** a step refused `BUSY` at the Execute stage is its
+  own class (`EXECUTION_BUSY`), told to the operator as nothing changed and may go again; the prompt
+  facts name `BUSY` beside `SERVICE_FAILED`.
 
 - **Why:** SY.wf-rules serves its requests in turn, and each request's 60 s start when its turn
   comes. Since 0.1.133 a purge waits up to 35 s for each removal while a hive cannot be read.
