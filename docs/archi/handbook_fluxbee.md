@@ -1315,6 +1315,12 @@ open exposure's key. `/acme/status` shows the certificate's names and DNS resolu
 
 - An exposure Cloud cannot enable because io.web is absent (`IO_WEB_ABSENT`): stage
   `run_node IO.web@motherbee` in the root tenant, in a plan the operator confirms.
+- An exposure Cloud cannot publish to a worker (`409 HIVE_ADDRESS_REFUSED`, since 0.1.152): the
+  hive registry records that worker at an address io.web never dials, one outside 10/8,
+  172.16/12, 192.168/16 and fc00::/7, loopback, link-local, one of the motherbee's own, none, or a
+  name that does not resolve; the detail names the worker, the address and the rule, and
+  `get_hive` shows the address recorded. An upstream is reached at a private address only: tell
+  the operator.
 - **The brake** is `kill_node IO.web@motherbee`, in a plan the operator confirms: every exposure's
   host then answers the edge's 502, and the exposures stay published. `start_node IO.web@motherbee`
   brings io.web back (its instance stays, so `run_node` would answer `NODE_ALREADY_EXISTS`), and

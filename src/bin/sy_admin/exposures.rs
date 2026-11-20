@@ -690,7 +690,8 @@ pub(crate) fn check_label(label: &str) -> Result<(), String> {
 /// An upstream SY.admin takes (§2.2): Archi; a worker of the registry by its hive id; or a private
 /// IP literal that is neither one of the motherbee's own addresses (`own_address`, the real one
 /// [`host_holds_address`]) nor a hive of the registry, which must be readable. Never one of
-/// Fluxbee's own ports.
+/// Fluxbee's own ports. A worker's recorded address is checked after, by [`check_hive_address`]:
+/// it may need a name resolved.
 pub(crate) fn check_upstream(
     upstream: &WebExposureUpstream,
     admin_hive: &str,
@@ -729,15 +730,7 @@ pub(crate) fn check_upstream(
         }
         WebExposureUpstream::Address { address, port } => {
             check_port(*port)?;
-            check_private_address(address)?;
-            // The hive registry never holds the motherbee (sdk/mesh/registry.rs), so its own
-            // addresses (its LAN's, a second NIC's, docker0's) are judged by the host itself.
-            if own_address(&canonical_ip(address)) {
-                return Err(format!(
-                    "upstream.address {address} is one of the motherbee's own addresses: only \
-                     Archi is reached there (upstream {{\"kind\": \"archi\"}})"
-                ));
-            }
+            check_address(address, own_address).map_err(|why| format!("upstream.address {why}"))?;
             match hive_at_address(registry, address) {
                 Ok(None) => Ok(()),
                 Ok(Some(hive)) => Err(format!(
@@ -781,14 +774,21 @@ fn canonical_ip(address: &IpAddr) -> IpAddr {
     }
 }
 
-/// 10/8, 172.16/12, 192.168/16 or fc00::/7, and never loopback, link-local, unspecified,
-/// multicast or broadcast.
-fn check_private_address(address: &IpAddr) -> Result<(), String> {
+/// Whether an upstream may be dialled at `address`, whatever kind led there (§2.2): 10/8,
+/// 172.16/12, 192.168/16 or fc00::/7, never loopback, link-local, unspecified, multicast or
+/// broadcast, and never one of the motherbee's own addresses (`own_address`), which only Archi's
+/// kind reaches. The error names the address and the rule. An `address` upstream is checked with
+/// it, and a worker's recorded address too ([`check_hive_address`]); io.web checks both again at
+/// each request (nodes/io/io-web/src/upstream.rs, `check_address`).
+fn check_address(
+    address: &IpAddr,
+    own_address: &(dyn Fn(&IpAddr) -> bool + '_),
+) -> Result<(), String> {
     let ip = canonical_ip(address);
     let refused = |what: &str| {
         Err(format!(
-            "upstream.address {address} is {what}: an address upstream is a private one (10/8, \
-             172.16/12, 192.168/16 or fc00::/7)"
+            "{address} is {what}: an upstream's address is a private one (10/8, 172.16/12, \
+             192.168/16 or fc00::/7)"
         ))
     };
     if ip.is_loopback() {
@@ -808,10 +808,8 @@ fn check_private_address(address: &IpAddr) -> Result<(), String> {
             if v4.is_link_local() {
                 return refused("link-local");
             }
-            if v4.is_private() {
-                Ok(())
-            } else {
-                refused("not private")
+            if !v4.is_private() {
+                return refused("not private");
             }
         }
         IpAddr::V6(v6) => {
@@ -819,18 +817,148 @@ fn check_private_address(address: &IpAddr) -> Result<(), String> {
             if segment & 0xffc0 == 0xfe80 {
                 return refused("link-local");
             }
-            if segment & 0xfe00 == 0xfc00 {
-                Ok(())
-            } else {
-                refused("not private")
+            if segment & 0xfe00 != 0xfc00 {
+                return refused("not private");
             }
         }
     }
+    // The hive registry never holds the motherbee (sdk/mesh/registry.rs), so its own addresses
+    // (its LAN's, a second NIC's, docker0's) are judged by the host itself.
+    if own_address(&ip) {
+        return Err(format!(
+            "{address} is one of the motherbee's own addresses: only Archi is reached there \
+             (upstream {{\"kind\": \"archi\"}})"
+        ));
+    }
+    Ok(())
+}
+
+/// A hive's `address` as the registry records it, read as io.web reads it
+/// (nodes/io/io-web/src/upstream.rs, `Recorded`): an IP, written bare, bracketed, or with a port
+/// (which is not the upstream's and is dropped), or a DNS name, resolved when it is dialled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedAddress {
+    Ip(IpAddr),
+    Name(String),
+}
+
+impl RecordedAddress {
+    fn parse(recorded: &str) -> Option<Self> {
+        if let Ok(ip) = recorded.parse::<IpAddr>() {
+            return Some(Self::Ip(ip));
+        }
+        if let Ok(socket) = recorded.parse::<std::net::SocketAddr>() {
+            return Some(Self::Ip(socket.ip()));
+        }
+        if let Some(ip) = recorded
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<IpAddr>().ok())
+        {
+            return Some(Self::Ip(ip));
+        }
+        is_dns_name(recorded).then(|| Self::Name(recorded.to_ascii_lowercase()))
+    }
+}
+
+/// A DNS name as the orchestrator takes a hive's address (`valid_address`) and io.web reads one:
+/// labels of letters, digits and inner hyphens, 1 to 63 each, 253 characters at most.
+fn is_dns_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// A `hive` upstream's address at publish (FINDINGS A-358): io.web dials a worker at the `address`
+/// the registry records for it, read at each request, a name resolved then, and refuses one
+/// [`check_address`] refuses (502, `address_refused`). The same address, read, resolved
+/// (`resolver`, within [`EXPOSURE_CALL_TIMEOUT`]) and checked now, so such a worker is refused at
+/// publish rather than published to answer 502. A name passes when one of its addresses passes,
+/// since io.web dials the first that does. The error says which hive, which address and which
+/// rule. io.web keeps its own check: the registry's address can change after publish.
+pub(crate) async fn check_hive_address(
+    hive: &str,
+    registry: &HiveRegistry,
+    own_address: &(dyn Fn(&IpAddr) -> bool + Sync),
+    resolver: &dyn acme::NameResolver,
+) -> Result<(), String> {
+    let entries = registry_hive_entries(registry).map_err(|err| {
+        format!(
+            "upstream.hive '{hive}''s address cannot be read: the hive registry {} cannot be read \
+             ({err})",
+            registry.root().display()
+        )
+    })?;
+    let Some(entry) = entries.into_iter().find(|entry| entry.name() == hive) else {
+        return Err(format!(
+            "upstream.hive '{hive}' is not a hive of the registry"
+        ));
+    };
+    let recorded = entry
+        .field("address")
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let (at, candidates) = match RecordedAddress::parse(&recorded) {
+        Some(RecordedAddress::Ip(ip)) => (recorded, vec![ip]),
+        Some(RecordedAddress::Name(name)) => {
+            let unresolved = |why: String| {
+                format!(
+                    "upstream.hive '{hive}' is recorded in the hive registry at '{name}', which \
+                     {why}: io.web resolves it at each request and would answer 502"
+                )
+            };
+            match tokio::time::timeout(EXPOSURE_CALL_TIMEOUT, resolver.resolve(&name)).await {
+                Ok(Ok(found)) if !found.is_empty() => {
+                    let shown: Vec<String> = found.iter().map(IpAddr::to_string).collect();
+                    (
+                        format!("'{name}', which resolves to {}", shown.join(", ")),
+                        found,
+                    )
+                }
+                Ok(Ok(_)) => return Err(unresolved("resolves to no address".to_string())),
+                Ok(Err(err)) => return Err(unresolved(format!("does not resolve ({err})"))),
+                Err(_) => {
+                    return Err(unresolved(format!(
+                        "did not resolve within {EXPOSURE_CALL_TIMEOUT:?}"
+                    )))
+                }
+            }
+        }
+        None => {
+            return Err(format!(
+                "upstream.hive '{hive}' has no address an upstream can be dialled at in the hive \
+                 registry ({recorded:?}: neither an IP nor a DNS name): io.web would answer every \
+                 request 502"
+            ))
+        }
+    };
+    let refusals: Vec<String> = candidates
+        .iter()
+        .filter_map(|ip| check_address(ip, own_address).err())
+        .collect();
+    if refusals.len() < candidates.len() {
+        return Ok(());
+    }
+    Err(format!(
+        "upstream.hive '{hive}' is recorded in the hive registry at {at}, where io.web never dials \
+         an upstream and would answer every request 502: {}",
+        refusals.join("; ")
+    ))
 }
 
 /// The hive of the registry whose recorded `address` is `address`. An address the registry records
-/// as a name is not compared: SY.admin resolves no name. A registry that cannot be read is the
-/// error: it fails closed, since any address might be a hive's.
+/// as a name is not compared: SY.admin resolves a hive's name only for that hive's own upstream
+/// ([`check_hive_address`]). A registry that cannot be read is the error: it fails closed, since
+/// any address might be a hive's.
 fn hive_at_address(registry: &HiveRegistry, address: &IpAddr) -> Result<Option<String>, String> {
     let wanted = canonical_ip(address);
     let entries = registry_hive_entries(registry).map_err(|err| {
@@ -845,15 +973,11 @@ fn hive_at_address(registry: &HiveRegistry, address: &IpAddr) -> Result<Option<S
             entry
                 .field("address")
                 .map(str::trim)
-                .and_then(|recorded| {
-                    recorded.parse::<IpAddr>().ok().or_else(|| {
-                        recorded
-                            .parse::<std::net::SocketAddr>()
-                            .ok()
-                            .map(|socket| socket.ip())
-                    })
+                .and_then(RecordedAddress::parse)
+                .is_some_and(|recorded| match recorded {
+                    RecordedAddress::Ip(recorded) => canonical_ip(&recorded) == wanted,
+                    RecordedAddress::Name(_) => false,
                 })
-                .is_some_and(|recorded| canonical_ip(&recorded) == wanted)
         })
         .map(|entry| entry.name().to_string()))
 }
@@ -1614,9 +1738,10 @@ fn taken_at(answer: &IoWebAnswer, generation: u64) -> bool {
     matches!(answer, IoWebAnswer::Taken { generation: held, .. } if *held >= generation)
 }
 
-/// `publish_exposure {label, upstream}` (§5.1): the field checks, the lock, (1) the host under the
-/// main name, (2) the label's rules, (3) the file, (4) the edge's routes and io.web's set pushed,
-/// (5) the ACME client woken, (6) the answer, `{exposure, created}`.
+/// `publish_exposure {label, upstream}` (§5.1): the field checks, a worker's recorded address
+/// (`409 HIVE_ADDRESS_REFUSED`), the lock, (1) the host under the main name, (2) the label's rules,
+/// (3) the file, (4) the edge's routes and io.web's set pushed, (5) the ACME client woken, (6) the
+/// answer, `{exposure, created}`.
 async fn publish(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -1637,6 +1762,20 @@ async fn publish(
         &host_holds_address,
     ) {
         return invalid(action, detail);
+    }
+    // A worker whose recorded address io.web would refuse at every request (FINDINGS A-358): the
+    // operator's, as the main name is.
+    if let WebExposureUpstream::Hive { hive, .. } = &request.upstream {
+        if let Err(detail) = check_hive_address(
+            hive,
+            &hive_registry(ctx),
+            &host_holds_address,
+            &acme::SystemResolver,
+        )
+        .await
+        {
+            return answer_error(action, 409, "HIVE_ADDRESS_REFUSED", detail);
+        }
     }
     let Some(_one_write) = ctx.exposures.try_lock() else {
         return busy(action);

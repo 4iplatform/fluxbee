@@ -1934,7 +1934,20 @@ Source: `src/bin/sy_admin/exposures.rs`.
   the motherbee) nor a hive's recorded address (a hive registry that cannot be read refuses every
   address), with a port (`{"kind": "address", "address", "port"}`); each kind takes only its own
   fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200,
-  21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
+  21027, 22000); each of these answers `400 INVALID_REQUEST`. At most 16 exposures
+  (`409 EXPOSURE_LIMIT`).
+- **A worker's recorded address** (since 0.1.152, FINDINGS A-358; `check_hive_address`), after
+  those checks: io.web dials a `hive` upstream at the `address` the registry's `info.yaml`
+  records for the worker, read at each request, and refuses (502, `address_refused`) one that
+  the `address` kind's rules above refuse, the motherbee's own addresses included. SY.admin reads
+  that address at publish from the same registry and the same field (`/var/lib/fluxbee/hives`,
+  beside its state directory, where io.web reads `HIVE_REGISTRY_DIR`), as io.web reads it: an IP
+  written bare, bracketed or with a port (dropped), or a DNS name, resolved then by the host's
+  resolver within 5 s; a name passes when one of its addresses does, as io.web dials the first
+  that passes. A worker recorded with no such address, at a name that does not resolve, or at an
+  address those rules refuse answers `409 HIVE_ADDRESS_REFUSED`, nothing locked, written or
+  pushed, and the detail names the hive, the address (and what a name resolved to) and the rule:
+  the operator's. io.web keeps its own check: the registry's address can change after publish.
 - **One change at a time** (the exposure lock): a publish, enable, disable or unpublish asked
   while another runs answers `409 BUSY` with `payload.retryable: true` at once, after its field
   checks, nothing read or changed. `issue_exposure_link` and `list_exposures` take no lock and

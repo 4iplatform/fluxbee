@@ -1013,6 +1013,136 @@ async fn publish_exposure_refuses_the_motherbee_s_own_addresses_and_an_unreadabl
     );
 }
 
+/// The DNS a worker's recorded name resolves against in the tests: each name's answer, any other
+/// unknown; `slow.example.com` never answers.
+struct ScriptedDns(HashMap<&'static str, Result<Vec<IpAddr>, String>>);
+
+#[async_trait::async_trait]
+impl acme::NameResolver for ScriptedDns {
+    async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, String> {
+        if name == "slow.example.com" {
+            std::future::pending::<()>().await;
+        }
+        self.0
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| Err(format!("{name}: no such name")))
+    }
+}
+
+/// FINDINGS A-358: io.web dials a worker at the address the registry records for it, a name
+/// resolved, and refuses one outside the private ranges, loopback, link-local or the motherbee's
+/// own (502, `address_refused`). SY.admin reads, resolves and checks it the same way at publish,
+/// and refuses it `409 HIVE_ADDRESS_REFUSED`, naming the hive, the address and the rule; a private
+/// one is published, and a name passes when one of its addresses does.
+#[tokio::test(start_paused = true)]
+async fn publish_exposure_refuses_a_worker_recorded_where_io_web_never_dials() {
+    let mut admin = exposures_admin("web22-hive-address", Some(EDGE));
+    let registry = hive_registry(&admin.ctx);
+    let done = "join:\n  phase: done\n";
+    for (hive, address) in [
+        ("public1", Some("8.8.8.8")),
+        ("loopback1", Some("127.0.0.1")),
+        ("mapped1", Some("::ffff:127.0.0.1")),
+        ("linklocal1", Some("169.254.10.10")),
+        ("linklocal2", Some("fe80::10")),
+        ("own1", Some("192.168.1.7")),
+        ("ported1", Some("10.0.0.31:9000")),
+        ("bracketed1", Some("[fd00::31]")),
+        ("named1", Some("W1.Example.Internal")),
+        ("mixed1", Some("w3.example.com")),
+        ("namedpublic1", Some("w2.example.com")),
+        ("empty1", Some("w4.example.com")),
+        ("gone1", Some("gone.example.com")),
+        ("slow1", Some("slow.example.com")),
+        ("bad1", Some("not an address")),
+        ("none1", None),
+    ] {
+        let address = address
+            .map(|address| format!("address: \"{address}\"\n"))
+            .unwrap_or_default();
+        write_registry_entry(
+            registry.root(),
+            hive,
+            &format!("hive_id: {hive}\nstatus: connected\nrole: worker\n{address}{done}"),
+        );
+    }
+    let dns = ScriptedDns(HashMap::from([
+        (
+            "w1.example.internal",
+            Ok(vec![IpAddr::from([10, 0, 0, 41])]),
+        ),
+        ("w2.example.com", Ok(vec![IpAddr::from([93, 184, 216, 34])])),
+        (
+            "w3.example.com",
+            Ok(vec![
+                IpAddr::from([127, 0, 0, 1]),
+                IpAddr::from([10, 0, 0, 43]),
+            ]),
+        ),
+        ("w4.example.com", Ok(Vec::new())),
+    ]));
+    let own: IpAddr = "192.168.1.7".parse().expect("an address");
+    let holds = move |address: &IpAddr| *address == own;
+    let judged = |hive: &'static str| check_hive_address(hive, &registry, &holds, &dns);
+
+    for hive in ["worker1", "ported1", "bracketed1", "named1", "mixed1"] {
+        assert_eq!(judged(hive).await, Ok(()), "{hive}");
+    }
+    for (hive, address, rule) in [
+        ("public1", "8.8.8.8", "not private"),
+        ("loopback1", "127.0.0.1", "loopback"),
+        ("mapped1", "::ffff:127.0.0.1", "loopback"),
+        ("linklocal1", "169.254.10.10", "link-local"),
+        ("linklocal2", "fe80::10", "link-local"),
+        ("own1", "192.168.1.7", "the motherbee's own addresses"),
+        ("namedpublic1", "93.184.216.34", "not private"),
+        ("empty1", "w4.example.com", "resolves to no address"),
+        ("gone1", "gone.example.com", "does not resolve"),
+        ("slow1", "slow.example.com", "did not resolve within"),
+        (
+            "bad1",
+            "not an address",
+            "no address an upstream can be dialled at",
+        ),
+        ("none1", "\"\"", "no address an upstream can be dialled at"),
+    ] {
+        let refused = judged(hive).await.expect_err("refused");
+        assert!(
+            refused.contains(&format!("upstream.hive '{hive}'"))
+                && refused.contains(address)
+                && refused.contains(rule),
+            "{hive}: {refused}"
+        );
+    }
+    let unreadable = HiveRegistry::new(test_temp_dir("web22-no-registry").join("hives"));
+    let refused = check_hive_address("worker1", &unreadable, &holds, &dns)
+        .await
+        .expect_err("an unreadable registry");
+    assert!(refused.contains("cannot be read"), "{refused}");
+
+    // The action: 409, nothing written or pushed; the worker at a private address is published.
+    let (answer, sent) = admin
+        .cloud(
+            "publish_exposure",
+            json!({
+                "label": "shop",
+                "upstream": { "kind": "hive", "hive": "public1", "port": 8443 },
+            }),
+        )
+        .await;
+    assert_eq!(answer.http_status, 409, "{}", answer.envelope);
+    assert_eq!(error_code(&answer), "HIVE_ADDRESS_REFUSED");
+    let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("public1") && detail.contains("8.8.8.8") && detail.contains("not private"),
+        "{detail}"
+    );
+    assert!(sent.is_empty());
+    assert!(!admin.mesh.registry.exists());
+    admin.publish("shop", shop_upstream()).await;
+}
+
 /// §5.1 publish (2): the same label with the same upstream is the same exposure, answered again
 /// with nothing written or pushed (`created: false`); another upstream under it is refused, and
 /// one exposure leads to Archi.
