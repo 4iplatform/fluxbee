@@ -877,30 +877,57 @@ fn is_dns_name(name: &str) -> bool {
         })
 }
 
+/// Why a worker's recorded address is refused at publish ([`check_hive_address`]): what to say,
+/// and whether asking again may pass. Only DNS is transient: a name that does not resolve, or not
+/// in time. An address the rules refuse, a missing one or one that is neither an IP nor a name
+/// stays refused until the operator changes the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HiveAddressRefusal {
+    pub(crate) detail: String,
+    pub(crate) retryable: bool,
+}
+
+impl HiveAddressRefusal {
+    fn lasting(detail: String) -> Self {
+        Self {
+            detail,
+            retryable: false,
+        }
+    }
+
+    fn transient(detail: String) -> Self {
+        Self {
+            detail,
+            retryable: true,
+        }
+    }
+}
+
 /// A `hive` upstream's address at publish (FINDINGS A-358): io.web dials a worker at the `address`
 /// the registry records for it, read at each request, a name resolved then, and refuses one
 /// [`check_address`] refuses (502, `address_refused`). The same address, read, resolved
 /// (`resolver`, within [`EXPOSURE_CALL_TIMEOUT`]) and checked now, so such a worker is refused at
 /// publish rather than published to answer 502. A name passes when one of its addresses passes,
-/// since io.web dials the first that does. The error says which hive, which address and which
-/// rule. io.web keeps its own check: the registry's address can change after publish.
+/// since io.web dials the first that does. The refusal says which hive, which address and which
+/// rule, and whether it is DNS's, which may pass. io.web keeps its own check: the registry's
+/// address can change after publish.
 pub(crate) async fn check_hive_address(
     hive: &str,
     registry: &HiveRegistry,
     own_address: &(dyn Fn(&IpAddr) -> bool + Sync),
     resolver: &dyn acme::NameResolver,
-) -> Result<(), String> {
+) -> Result<(), HiveAddressRefusal> {
     let entries = registry_hive_entries(registry).map_err(|err| {
-        format!(
+        HiveAddressRefusal::lasting(format!(
             "upstream.hive '{hive}''s address cannot be read: the hive registry {} cannot be read \
              ({err})",
             registry.root().display()
-        )
+        ))
     })?;
     let Some(entry) = entries.into_iter().find(|entry| entry.name() == hive) else {
-        return Err(format!(
+        return Err(HiveAddressRefusal::lasting(format!(
             "upstream.hive '{hive}' is not a hive of the registry"
-        ));
+        )));
     };
     let recorded = entry
         .field("address")
@@ -910,11 +937,13 @@ pub(crate) async fn check_hive_address(
     let (at, candidates) = match RecordedAddress::parse(&recorded) {
         Some(RecordedAddress::Ip(ip)) => (recorded, vec![ip]),
         Some(RecordedAddress::Name(name)) => {
+            // DNS: transient, so asking again may pass.
             let unresolved = |why: String| {
-                format!(
+                HiveAddressRefusal::transient(format!(
                     "upstream.hive '{hive}' is recorded in the hive registry at '{name}', which \
-                     {why}: io.web resolves it at each request and would answer 502"
-                )
+                     {why}: io.web resolves it at each request and would answer 502; ask again \
+                     once it resolves"
+                ))
             };
             match tokio::time::timeout(EXPOSURE_CALL_TIMEOUT, resolver.resolve(&name)).await {
                 Ok(Ok(found)) if !found.is_empty() => {
@@ -934,11 +963,11 @@ pub(crate) async fn check_hive_address(
             }
         }
         None => {
-            return Err(format!(
+            return Err(HiveAddressRefusal::lasting(format!(
                 "upstream.hive '{hive}' has no address an upstream can be dialled at in the hive \
                  registry ({recorded:?}: neither an IP nor a DNS name): io.web would answer every \
                  request 502"
-            ))
+            )))
         }
     };
     let refusals: Vec<String> = candidates
@@ -948,11 +977,11 @@ pub(crate) async fn check_hive_address(
     if refusals.len() < candidates.len() {
         return Ok(());
     }
-    Err(format!(
+    Err(HiveAddressRefusal::lasting(format!(
         "upstream.hive '{hive}' is recorded in the hive registry at {at}, where io.web never dials \
          an upstream and would answer every request 502: {}",
         refusals.join("; ")
-    ))
+    )))
 }
 
 /// The hive of the registry whose recorded `address` is `address`. An address the registry records
@@ -1608,6 +1637,16 @@ fn not_found(action: &str, exposure_id: &str) -> InternalAdminDispatchResult {
     )
 }
 
+/// `409 HIVE_ADDRESS_REFUSED` (FINDINGS A-358), with `payload.retryable: true` when it is DNS's
+/// and asking again may pass.
+fn hive_address_refused(action: &str, refusal: HiveAddressRefusal) -> InternalAdminDispatchResult {
+    let mut answer = answer_error(action, 409, "HIVE_ADDRESS_REFUSED", refusal.detail);
+    if refusal.retryable {
+        answer.envelope["payload"] = json!({ "retryable": true });
+    }
+    answer
+}
+
 /// `409 BUSY`, `payload.retryable: true`: another exposure write holds the lock, and nothing was
 /// read.
 fn busy(action: &str) -> InternalAdminDispatchResult {
@@ -1739,9 +1778,9 @@ fn taken_at(answer: &IoWebAnswer, generation: u64) -> bool {
 }
 
 /// `publish_exposure {label, upstream}` (§5.1): the field checks, a worker's recorded address
-/// (`409 HIVE_ADDRESS_REFUSED`), the lock, (1) the host under the main name, (2) the label's rules,
-/// (3) the file, (4) the edge's routes and io.web's set pushed, (5) the ACME client woken, (6) the
-/// answer, `{exposure, created}`.
+/// (`409 HIVE_ADDRESS_REFUSED`) unless the same exposure is published already, the lock, (1) the
+/// host under the main name, (2) the label's rules, (3) the file, (4) the edge's routes and
+/// io.web's set pushed, (5) the ACME client woken, (6) the answer, `{exposure, created}`.
 async fn publish(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -1764,17 +1803,24 @@ async fn publish(
         return invalid(action, detail);
     }
     // A worker whose recorded address io.web would refuse at every request (FINDINGS A-358): the
-    // operator's, as the main name is.
+    // operator's, as the main name is. Not for the same exposure again (a retry after a lost
+    // answer), which (2) answers `created: false` under the lock as before: a DNS failure or an
+    // address changed since must not refuse what is published already.
     if let WebExposureUpstream::Hive { hive, .. } = &request.upstream {
-        if let Err(detail) = check_hive_address(
-            hive,
-            &hive_registry(ctx),
-            &host_holds_address,
-            &acme::SystemResolver,
-        )
-        .await
-        {
-            return answer_error(action, 409, "HIVE_ADDRESS_REFUSED", detail);
+        let published = ctx.exposures.file().exposures.iter().any(|exposure| {
+            exposure.label == request.label && exposure.upstream == request.upstream
+        });
+        if !published {
+            if let Err(refusal) = check_hive_address(
+                hive,
+                &hive_registry(ctx),
+                &host_holds_address,
+                ctx.name_resolver.as_ref(),
+            )
+            .await
+            {
+                return hive_address_refused(action, refusal);
+            }
         }
     }
     let Some(_one_write) = ctx.exposures.try_lock() else {

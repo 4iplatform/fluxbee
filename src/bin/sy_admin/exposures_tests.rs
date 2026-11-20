@@ -1034,7 +1034,8 @@ impl acme::NameResolver for ScriptedDns {
 /// resolved, and refuses one outside the private ranges, loopback, link-local or the motherbee's
 /// own (502, `address_refused`). SY.admin reads, resolves and checks it the same way at publish,
 /// and refuses it `409 HIVE_ADDRESS_REFUSED`, naming the hive, the address and the rule; a private
-/// one is published, and a name passes when one of its addresses does.
+/// one is published, and a name passes when one of its addresses does. Only DNS is retryable: a
+/// name that does not resolve, or not in time.
 #[tokio::test(start_paused = true)]
 async fn publish_exposure_refuses_a_worker_recorded_where_io_web_never_dials() {
     let mut admin = exposures_admin("web22-hive-address", Some(EDGE));
@@ -1067,7 +1068,7 @@ async fn publish_exposure_refuses_a_worker_recorded_where_io_web_never_dials() {
             &format!("hive_id: {hive}\nstatus: connected\nrole: worker\n{address}{done}"),
         );
     }
-    let dns = ScriptedDns(HashMap::from([
+    let dns = Arc::new(ScriptedDns(HashMap::from([
         (
             "w1.example.internal",
             Ok(vec![IpAddr::from([10, 0, 0, 41])]),
@@ -1081,66 +1082,141 @@ async fn publish_exposure_refuses_a_worker_recorded_where_io_web_never_dials() {
             ]),
         ),
         ("w4.example.com", Ok(Vec::new())),
-    ]));
+    ])));
+    admin.ctx.name_resolver = dns.clone();
     let own: IpAddr = "192.168.1.7".parse().expect("an address");
     let holds = move |address: &IpAddr| *address == own;
-    let judged = |hive: &'static str| check_hive_address(hive, &registry, &holds, &dns);
+    let judged = |hive: &'static str| check_hive_address(hive, &registry, &holds, dns.as_ref());
 
     for hive in ["worker1", "ported1", "bracketed1", "named1", "mixed1"] {
         assert_eq!(judged(hive).await, Ok(()), "{hive}");
     }
-    for (hive, address, rule) in [
-        ("public1", "8.8.8.8", "not private"),
-        ("loopback1", "127.0.0.1", "loopback"),
-        ("mapped1", "::ffff:127.0.0.1", "loopback"),
-        ("linklocal1", "169.254.10.10", "link-local"),
-        ("linklocal2", "fe80::10", "link-local"),
-        ("own1", "192.168.1.7", "the motherbee's own addresses"),
-        ("namedpublic1", "93.184.216.34", "not private"),
-        ("empty1", "w4.example.com", "resolves to no address"),
-        ("gone1", "gone.example.com", "does not resolve"),
-        ("slow1", "slow.example.com", "did not resolve within"),
+    for (hive, address, rule, retryable) in [
+        ("public1", "8.8.8.8", "not private", false),
+        ("loopback1", "127.0.0.1", "loopback", false),
+        ("mapped1", "::ffff:127.0.0.1", "loopback", false),
+        ("linklocal1", "169.254.10.10", "link-local", false),
+        ("linklocal2", "fe80::10", "link-local", false),
+        (
+            "own1",
+            "192.168.1.7",
+            "the motherbee's own addresses",
+            false,
+        ),
+        ("namedpublic1", "93.184.216.34", "not private", false),
+        ("empty1", "w4.example.com", "resolves to no address", true),
+        ("gone1", "gone.example.com", "does not resolve", true),
+        ("slow1", "slow.example.com", "did not resolve within", true),
         (
             "bad1",
             "not an address",
             "no address an upstream can be dialled at",
+            false,
         ),
-        ("none1", "\"\"", "no address an upstream can be dialled at"),
+        (
+            "none1",
+            "\"\"",
+            "no address an upstream can be dialled at",
+            false,
+        ),
     ] {
         let refused = judged(hive).await.expect_err("refused");
+        let detail = &refused.detail;
         assert!(
-            refused.contains(&format!("upstream.hive '{hive}'"))
-                && refused.contains(address)
-                && refused.contains(rule),
-            "{hive}: {refused}"
+            detail.contains(&format!("upstream.hive '{hive}'"))
+                && detail.contains(address)
+                && detail.contains(rule),
+            "{hive}: {detail}"
         );
+        assert_eq!(refused.retryable, retryable, "{hive}: {detail}");
     }
     let unreadable = HiveRegistry::new(test_temp_dir("web22-no-registry").join("hives"));
-    let refused = check_hive_address("worker1", &unreadable, &holds, &dns)
+    let refused = check_hive_address("worker1", &unreadable, &holds, dns.as_ref())
         .await
         .expect_err("an unreadable registry");
-    assert!(refused.contains("cannot be read"), "{refused}");
+    assert!(refused.detail.contains("cannot be read"), "{refused:?}");
+    assert!(!refused.retryable);
 
-    // The action: 409, nothing written or pushed; the worker at a private address is published.
-    let (answer, sent) = admin
-        .cloud(
-            "publish_exposure",
-            json!({
-                "label": "shop",
-                "upstream": { "kind": "hive", "hive": "public1", "port": 8443 },
-            }),
-        )
-        .await;
-    assert_eq!(answer.http_status, 409, "{}", answer.envelope);
-    assert_eq!(error_code(&answer), "HIVE_ADDRESS_REFUSED");
-    let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
-    assert!(
-        detail.contains("public1") && detail.contains("8.8.8.8") && detail.contains("not private"),
-        "{detail}"
-    );
-    assert!(sent.is_empty());
-    assert!(!admin.mesh.registry.exists());
+    // The action: 409, nothing written or pushed, retryable only for DNS (a timeout here).
+    for (hive, retryable) in [("public1", false), ("slow1", true)] {
+        let (answer, sent) = admin
+            .cloud(
+                "publish_exposure",
+                json!({
+                    "label": "shop",
+                    "upstream": { "kind": "hive", "hive": hive, "port": 8443 },
+                }),
+            )
+            .await;
+        assert_eq!(answer.http_status, 409, "{}", answer.envelope);
+        assert_eq!(error_code(&answer), "HIVE_ADDRESS_REFUSED");
+        let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(hive), "{detail}");
+        assert_eq!(
+            answer.envelope["payload"]["retryable"].as_bool() == Some(true),
+            retryable,
+            "{hive}: {}",
+            answer.envelope
+        );
+        assert!(sent.is_empty());
+        assert!(!admin.mesh.registry.exists());
+    }
     admin.publish("shop", shop_upstream()).await;
+}
+
+/// FINDINGS A-358: the same exposure published again (Cloud's retry after a lost answer) answers
+/// `created: false` with no address check, whatever DNS answers now or wherever the worker is
+/// recorded since; another label to the same worker is checked, and refused.
+#[tokio::test(start_paused = true)]
+async fn publish_exposure_answers_the_same_exposure_again_without_the_address_check() {
+    let mut admin = exposures_admin("web22-hive-address-again", Some(EDGE));
+    let registry = hive_registry(&admin.ctx);
+    admin.ctx.name_resolver = Arc::new(ScriptedDns(HashMap::from([(
+        "w1.example.internal",
+        Ok(vec![IpAddr::from([10, 0, 0, 41])]),
+    )])));
+    let record = |address: &str| {
+        write_registry_entry(
+            registry.root(),
+            "moved1",
+            &format!(
+                "hive_id: moved1\nstatus: connected\nrole: worker\naddress: \"{address}\"\n\
+                 join:\n  phase: done\n"
+            ),
+        );
+    };
+    let upstream = json!({ "kind": "hive", "hive": "moved1", "port": 8443 });
+    record("w1.example.internal");
+    let id = admin.publish("moved", upstream.clone()).await;
+    // Its name no longer resolves, then it is recorded at a public address.
+    for (address, retryable) in [("gone.example.com", true), ("8.8.8.8", false)] {
+        record(address);
+        let (again, _) = admin
+            .cloud(
+                "publish_exposure",
+                json!({ "label": "moved", "upstream": upstream }),
+            )
+            .await;
+        assert_eq!(again.http_status, 200, "{address}: {}", again.envelope);
+        assert_eq!(again.envelope["payload"]["created"], false);
+        assert_eq!(again.envelope["payload"]["exposure"]["exposure_id"], id);
+        let (other, sent) = admin
+            .cloud(
+                "publish_exposure",
+                json!({ "label": "moved-2", "upstream": upstream }),
+            )
+            .await;
+        assert_eq!(other.http_status, 409, "{address}: {}", other.envelope);
+        assert_eq!(error_code(&other), "HIVE_ADDRESS_REFUSED");
+        assert_eq!(
+            other.envelope["payload"]["retryable"].as_bool() == Some(true),
+            retryable,
+            "{address}: {}",
+            other.envelope
+        );
+        assert!(sent.is_empty());
+    }
+    assert_eq!(admin.on_disk().exposures.len(), 1);
 }
 
 /// §5.1 publish (2): the same label with the same upstream is the same exposure, answered again

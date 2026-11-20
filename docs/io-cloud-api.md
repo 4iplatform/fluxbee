@@ -1068,7 +1068,7 @@ entry of `list_exposures`' `exposures`:
 | `upstream.kind` | fields | accepted when |
 |---|---|---|
 | `archi` | none | the hive's Archi |
-| `hive` | `hive`, `port` | `hive` is a worker of this installation, by its hive id (`worker1`): never the motherbee, an ingress or an egress. From 0.1.152, the address the hive records for that worker must also be one the `address` kind accepts (a name is resolved, and passes when one of its addresses does), else `HIVE_ADDRESS_REFUSED` |
+| `hive` | `hive`, `port` | `hive` is a worker of this installation, by its hive id (`worker1`): never the motherbee, an ingress or an egress. From 0.1.152, the address the hive records for that worker must also be within the `address` kind's ranges (private: never loopback, link-local or one of the hive's own addresses); a name is resolved, and passes when one of its addresses does. Else `HIVE_ADDRESS_REFUSED`. The same label and upstream already published answers `created: false` without this check |
 | `address` | `address`, `port` | an IP literal, never a name, in 10/8, 172.16/12, 192.168/16 or fc00::/7: never loopback, link-local, unspecified, multicast or broadcast, and never the address of a hive of this installation (name the hive instead) |
 
 Fluxbee's own ports are refused for every kind: 22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200,
@@ -1181,7 +1181,7 @@ needs, and what Cloud must keep:
 | `EXPOSURE_EXISTS` | publish | the label is published with another upstream, or another exposure has upstream `archi` | |
 | `EXPOSURE_LIMIT` | publish | 16 are published | unpublish one |
 | `NO_MAIN_HOST` | publish | the hive has no public host to put the label under | the operator |
-| `HIVE_ADDRESS_REFUSED` | publish | from 0.1.152: the upstream `hive` is a worker the hive records at an address it never leads an exposure to (public, loopback, link-local, the hive's own, none, or a name that does not resolve); `error_detail` names the worker, the address and the rule. Before 0.1.152 such an exposure was published and answered 502 | the operator |
+| `HIVE_ADDRESS_REFUSED` | publish | from 0.1.152: the upstream `hive` is a worker the hive records at an address it never leads an exposure to (public, loopback, link-local, the hive's own, none, or a name that does not resolve now); `error_detail` names the worker, the address and the rule. Before 0.1.152 such an exposure was published and answered 502 | the operator. When the worker is recorded by a name that did not resolve, or not in time (DNS, as `error_detail` says), sending it again later may pass; another send of a lasting refusal answers the same code, and changes nothing |
 | `EXPOSURE_CLOSED` | link | the exposure is not enabled | enable it first |
 | `IO_WEB_ABSENT` | enable | io.web, the hive's web node, was never launched in the hive (`io_web.state` `absent`) | the operator |
 | `BUSY` | publish, enable, disable, unpublish | another of these four is running. Only they answer it: `issue_exposure_link` and `list_exposures` never do | send it again |

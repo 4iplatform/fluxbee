@@ -382,6 +382,9 @@ struct AdminContext {
     /// io.web's exposures: their registry, the lock of their writes and io.web's last answer
     /// (docs/io-web-v2-stage-2-1.md §2.3, §5.1).
     exposures: Arc<exposures::Exposures>,
+    /// Resolves a DNS name as the host does: a worker's recorded name at `publish_exposure`
+    /// (FINDINGS A-358), and the published hosts' for the ACME client, which shares it.
+    name_resolver: Arc<dyn acme::NameResolver>,
     /// Reads the ILK identity's shared memory holds for a node, given this hive's config dir:
     /// io.web's, which owns an enablement's key (`enable_exposure`).
     node_ilk: NodeIlk,
@@ -765,6 +768,7 @@ async fn main() -> Result<(), AdminError> {
         Arc::clone(&exposures),
         Arc::clone(&acme_edge),
     ));
+    let name_resolver: Arc<dyn acme::NameResolver> = Arc::new(acme::SystemResolver);
     let acme_ca = Arc::new(acme::InstantAcmeCa::new(
         &acme_config.trust_anchor_roots(),
         acme::platform_roots,
@@ -789,7 +793,7 @@ async fn main() -> Result<(), AdminError> {
                 let exposures = Arc::clone(&exposures);
                 Arc::new(move || exposures.hosts())
             },
-            resolver: Arc::new(acme::SystemResolver),
+            resolver: Arc::clone(&name_resolver),
         },
         state_dir.join("sy-admin/acme.json"),
         self_ilk_id.clone(),
@@ -826,6 +830,7 @@ async fn main() -> Result<(), AdminError> {
         acme: acme_service,
         web: web_routes,
         exposures,
+        name_resolver,
         node_ilk: Arc::new(node_ilk_from_shm),
         connected_nodes: Arc::new(connected_nodes_from_shm),
         publisher_tenant: Arc::new(publisher_tenant_from_shm),
@@ -20103,7 +20108,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "IO.cloud relays only the action's own fields, and never a tenant_id: an exposure is the installation's, not a tenant's.",
             "One exposure change at a time (publish, enable, disable, unpublish): another one asked meanwhile answers 409 BUSY with payload.retryable true, nothing read or changed. issue_exposure_link and list_exposures take no lock and never answer BUSY.",
             "The answer's exposure is the view list_exposures gives: exposure_id, label, host, url, upstream, state (closed or enabled), enabled_until, published_at, certificate {state: covered, pending, waiting_dns, failed, held or off; detail; retry_at}, route {state: acknowledged, pending or no_edge} and io_web {state: acknowledged, pending or absent}.",
-            "publish_exposure {label, upstream} answers {exposure, created}: 409 NO_MAIN_HOST (admin.public_base_url gives no host), HIVE_ADDRESS_REFUSED (the upstream hive is a worker the hive registry records at an address io.web never dials: outside 10/8, 172.16/12, 192.168/16 and fc00::/7, loopback, link-local, the motherbee's own, none, or a name that does not resolve; the detail names the hive, the address and the rule), EXPOSURE_EXISTS (the label with another upstream, or a second archi), EXPOSURE_LIMIT (16 published); 500 RECORD_FAILED when the registry cannot be written, nothing published. It wakes the ACME client: a host the certificate misses is ordered within a minute once its DNS name answers the main name's addresses.",
+            "publish_exposure {label, upstream} answers {exposure, created}: 409 NO_MAIN_HOST (admin.public_base_url gives no host), HIVE_ADDRESS_REFUSED (the upstream hive is a worker the hive registry records at an address io.web never dials: outside 10/8, 172.16/12, 192.168/16 and fc00::/7, loopback, link-local, the motherbee's own, none, or a name that does not resolve; the detail names the hive, the address and the rule; payload.retryable true only when the name did not resolve or not within 5 s, DNS, which may pass when asked again; the same label and upstream published already answers created false with no such check), EXPOSURE_EXISTS (the label with another upstream, or a second archi), EXPOSURE_LIMIT (16 published); 500 RECORD_FAILED when the registry cannot be written, nothing published. It wakes the ACME client: a host the certificate misses is ordered within a minute once its DNS name answers the main name's addresses.",
             "enable_exposure {exposure_id, duration_s} answers {exposure, renewed}: 409 IO_WEB_ABSENT (run_node IO.web@motherbee in the root tenant first), 502 VAULT_UNAVAILABLE (nothing changed), 500 RECORD_FAILED. Each enable mints a new key; a renewal keeps the previous enablement's sessions to its own end. At most two enablements live: a retried enable (after a lost answer) makes one more, and the one before the enablement it renews ends at once.",
             "disable_exposure {exposure_id} answers {exposure, was_enabled, persisted}; unpublish_exposure {exposure_id} answers {exposure_id, host, removed, route, io_web, persisted}. Each acts at once and then writes the registry; persisted false means the write is tried again every minute.",
             "issue_exposure_link {exposure_id} answers {exposure_id, url, expires_at (RFC 3339), link_id}: 409 EXPOSURE_CLOSED when not enabled, 503 IO_WEB_UNAVAILABLE (payload.retryable true) when io.web did not answer or holds no key yet. When io.web's set is older (ENABLEMENT_UNKNOWN), SY.admin pushes it and asks once more. The url is a one-time code, opened top-level within about 120 s, once; it is never logged, and the logs name the link by link_id.",
@@ -32619,6 +32624,16 @@ mod tests {
         );
     }
 
+    /// No DNS in the tests: a test that resolves a name gives the admin its own resolver.
+    struct NoDns;
+
+    #[async_trait::async_trait]
+    impl acme::NameResolver for NoDns {
+        async fn resolve(&self, name: &str) -> Result<Vec<std::net::IpAddr>, String> {
+            Err(format!("{name}: no DNS in the tests"))
+        }
+    }
+
     /// An admin wired to the in-process test dispatcher, with an empty hives registry (so a write
     /// expects the motherbee only) and no exposure.
     pub(crate) fn opa_test_admin(
@@ -32662,6 +32677,7 @@ mod tests {
                 Arc::new(|| Err("no edge in the tests".to_string())),
             )),
             exposures,
+            name_resolver: Arc::new(NoDns),
             node_ilk: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
             publisher_tenant: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
