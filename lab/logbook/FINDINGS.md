@@ -517,13 +517,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   track is closed**; what is left below is small and on other binaries.
 - A-142 (Archi) ✅ validated with 0.1.151: no wait of the proxy's own.
 - A-351 ✅ validated on 8.x with 0.1.151: the system's cookies reach its upstream, Fluxbee's never do, and an upstream cannot set Fluxbee's.
-- A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low).
+- A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low). *Building in 0.1.152.*
 - A-356, A-357 ✅ built in 0.1.151: SY.admin's executor contract (`publish_cloud_endpoint`'s `cloud_node` optional; `vault_assign`'s lists are lists).
 - A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
 ### Archi
 
 - A-142 ✅ validated on 8.x with 0.1.151: the proxy has no wait of its own (a 90 s answer passes, Archi's chat turns through the proxy).
+- A-361 🔵 Archi's leftovers of its removed staged-action path, and a deleted chat keeps its staged plan (low; SY.architect; found by 0.1.152's builder).
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -578,6 +579,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
 - A-345 🔵 `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one (low, observability; the orchestrator; found by 0.1.139's gate).
 - A-347 🔵 `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped (low; the orchestrator; found by 0.1.139's gate; the operator's call of 2026-11-13: it waits, recorded).
+- A-359 🔵 SY.admin's executor gives its model a step's args unmasked when the step asks it to fill a field (low; SY.admin; found by 0.1.152's review; A-337's sibling).
+- A-360 🔵 `node_control_config_set`'s help names `postgres_url` as SY.storage's and SY.identity's secret field, which they refuse (low; SY.admin; found by 0.1.152's review).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1654,6 +1657,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-361 [Archi] 🔵 low (found 2026-11-20 by 0.1.152's Archi builder on `coa/archi-152`; read in the code, not run; there before it) — Archi keeps leftovers of its removed staged-action path, and a deleted chat keeps its staged plan
+
+- **Why:** 0.1.152 removed the staged-action path that nothing fed (`pending_actions`). What is left:
+  - the `pending_confirm` status handling: `operation_model_summary`, `operation_error_message`, the
+    "staged mutations" line in the session summary, and the page's `isPending` JavaScript. Nothing
+    writes that status;
+  - `delete_chat_session` and `clear_chat_sessions` never drop the plan the plan compiler staged
+    for the session (`plan_compile_pending`), so it stays in memory until Archi restarts;
+  - the page's JavaScript still names a `fluxbee_system_write` tool that Archi no longer has.
+- **Effect:** none an operator sees, but dead code and a small leak.
+- **Fix, later (Archi alone):** remove the dead status handling and the tool name; drop a session's
+  staged plan with the session.
+
+### A-360 [General/admin] 🔵 low (found 2026-11-20 by 0.1.152's SY.admin review; read in the code, not run; there before it) — `node_control_config_set`'s help names `config.database.postgres_url` as SY.storage's and SY.identity's secret field, which they refuse
+
+- **Why:** the help (`src/bin/sy_admin.rs` ~19640) says *"For SY.storage v1, the canonical secret
+  field is config.database.postgres_url"*, and the same for SY.identity. Both refuse `postgres_url`
+  and `postgres_url_ref` in a CONFIG_SET (`sy_storage.rs` ~2555, `sy_identity.rs` ~9253, and
+  SY.cognition ~5238): they find their database through SY.vault.
+- **Effect:** an Archi that follows the help writes a connection string with its password into a
+  plan step. The node refuses it, but the password has already reached SY.admin's review model and
+  its run log, since no rule masks the name `postgres_url`.
+- **Fix, later (SY.admin):** the help says what the nodes take, the envelope only, and that the
+  database comes from SY.vault.
+
+### A-359 [General/admin] 🔵 low (found 2026-11-20 by 0.1.152's SY.admin review; read in the code, not run; there before it) — SY.admin's executor gives its model a step's args unmasked when the step asks it to fill a field
+
+- **Why:** a step with a non-empty `executor_fill` runs through the executor's model, whose prompt
+  holds the step as written (`admin_executor_prompt`, `src/bin/sy_admin.rs` ~3312, used at
+  ~3992). A step with nothing to fill goes as written, with no model. A-337 (0.1.152) masks secrets
+  in the plan review's prompt only.
+- **Effect:** a secret in such a step's args, such as a vault value, an SSH password or an
+  `unpublish_artifact`'s link key, reaches the AI provider at run time.
+- **Fix, later (SY.admin), to design:** the model needs the fields it fills, not the secrets.
+  Mask them for the prompt and put the real values back into the call the model makes, never taking
+  a masked value from it.
 
 ### A-358 [General/admin] 🔵 design (medium-low; found 2026-11-19 by io.web stage 2.2's io.web builder; read in the code, not run) — SY.admin publishes a `hive` upstream whose registry address io.web will refuse
 
