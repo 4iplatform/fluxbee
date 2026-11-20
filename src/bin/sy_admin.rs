@@ -19759,7 +19759,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "purge_ilk" => vec![
             "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
-            "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
+            "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). The operator's: SY.admin's HTTP API, Archi's SCMD, or a plan Archi stages and the operator confirms; never Fluxbee Cloud, which only marks and restores.",
             "A system ILK is refused (SYSTEM_ILK_PROTECTED) unless it is retired: its hive removed (retire_hive_ilks) or its node no longer run by the release (FINDINGS A-191). Purge a retired one only on the operator's word and when it made no history; otherwise it stays retired.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of the ILK's node (its identification.node_name): while any page is up, SY.admin asks SY.identity whose ILK it is (ILK_GET) before it sends the purge, and an ILK that cannot be read gives {count: null, error}. An ILK of no node, a person's, names none.",
@@ -19773,7 +19773,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "purge_tenant" => vec![
             "Final: removes the tenant, the ILKs marked in it and the channels other ILKs hold in its scope. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
-            "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
+            "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. The operator's: SY.admin's HTTP API, Archi's SCMD, or a plan Archi stages and the operator confirms; never Fluxbee Cloud, which only marks and restores.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the tenant's pages (tenant_id: its publisher's tenant when it published).",
         ],
