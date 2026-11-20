@@ -1397,7 +1397,9 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   Since 0.1.152 (FINDINGS A-337) the review's prompt (`executor_review_prompt`) carries the
   step's args with every secret masked by the executor log's rules (`redact_executor_secrets`: a
   field whose name reads as a secret, `ssh_password` and `ssh_key` among them, and the `value` of
-  a vault-shaped `{key, value}`, a `vault_put`'s or a `vault_rotate`'s), each shown as
+  a vault-shaped `{key, value}`, a `vault_put`'s or a `vault_rotate`'s), and an
+  `unpublish_artifact`'s `key`, its page's link key and so the permission to read the page (by
+  that action's field: a vault step's `key`, a secret's name, stays readable), each shown as
   `***REDACTED***` with an object's field names kept (`{"api_key": "***REDACTED***"}`), so a
   secret the operator wrote into a step never reaches the AI provider there. The review checks
   that a field is there and its shape, never a secret's value, and its prompt says a masked value

@@ -3266,10 +3266,19 @@ fn executor_usage_account(
 /// (`redact_executor_secrets`) in the review's shape (`executor_review_mask`). The review checks
 /// that a field is there and its shape, never a secret's value, so a secret the operator wrote
 /// into a step (a `vault_put`'s or a `vault_rotate`'s `value`, an `add_hive`'s `ssh_password` or
-/// `ssh_key`) never reaches the AI provider here.
+/// `ssh_key`) never reaches the AI provider here. An `unpublish_artifact`'s `key`, the key of a
+/// page's link and so the permission to read the page, is masked too: by that action's field, since
+/// a vault step's `key` is a secret's name, which the review reads (the run log keeps only its
+/// hash, `unpublish_artifact_log_params`).
 fn executor_review_prompt(step: &AdminExecutorPlanStep, help_text: &str) -> String {
+    let mut args = redact_executor_secrets(&step.args, &executor_review_mask);
+    if step.action.trim() == "unpublish_artifact" {
+        if let Some(key) = args.get_mut("key") {
+            *key = executor_review_mask(key);
+        }
+    }
     let masked = AdminExecutorPlanStep {
-        args: redact_executor_secrets(&step.args, &executor_review_mask),
+        args,
         ..step.clone()
     };
     format!(
@@ -34198,9 +34207,10 @@ mod tests {
 
     /// FINDINGS A-337: the plan review's prompt carries each step's args with every secret the
     /// operator wrote into them masked (a `vault_put`'s and a `vault_rotate`'s `value`, an
-    /// `add_hive`'s `ssh_password` and `ssh_key`), so none reaches the AI provider. Each masked
-    /// field is still there, an object with its fields' names, the prompt says what the mask
-    /// means, and the rest of the step goes as written.
+    /// `add_hive`'s `ssh_password` and `ssh_key`, an `unpublish_artifact`'s link `key`), so none
+    /// reaches the AI provider. Each masked field is still there, an object with its fields'
+    /// names, the prompt says what the mask means, and the rest of the step goes as written: a
+    /// vault step's `key`, a secret's name, stays readable.
     #[test]
     fn the_plan_review_s_prompt_holds_no_secret_the_operator_wrote_into_a_step() {
         let secrets = [
@@ -34210,6 +34220,8 @@ mod tests {
             "hunter2-ssh-password",
             // The private key's body: the key itself goes with its newlines, escaped in JSON.
             "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU",
+            // A page's link key, the permission to read the page.
+            "9c1f3e7a5b2d4c6e8f0a1b3c5d7e9f1a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d0e",
         ];
         let ssh_key = format!(
             "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
@@ -34253,6 +34265,7 @@ mod tests {
                     "harden_ssh": true,
                 }),
             ),
+            step("s4", "unpublish_artifact", json!({ "key": secrets[5] })),
         ];
         let masked = json!(NODE_SECRET_REDACTION_TOKEN);
         let mut reviewed = Vec::new();
@@ -34276,6 +34289,12 @@ mod tests {
             let shown: serde_json::Value = serde_json::from_str(shown).expect("the step as JSON");
             assert_eq!(shown["id"], json!(step.id));
             assert_eq!(shown["action"], json!(step.action));
+            if let Some(name) = step.args["key"]
+                .as_str()
+                .filter(|_| step.action.starts_with("vault_"))
+            {
+                assert!(prompt.contains(name), "{}: the secret's name", step.action);
+            }
             reviewed.push(shown["args"].clone());
         }
         assert_eq!(
@@ -34303,6 +34322,7 @@ mod tests {
                 "harden_ssh": true,
             })
         );
+        assert_eq!(reviewed[3], json!({ "key": masked }));
         // The executor's log still masks a secret whole.
         assert_eq!(redact_executor_log_value(&steps[0].args)["value"], masked);
     }
