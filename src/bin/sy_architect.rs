@@ -199,7 +199,7 @@ Do not ask multiple clarifying questions. If the task is reasonably clear, choos
 
 - Be direct and operational. Prefer short concrete answers.
 - Do not claim actions ran unless they actually did.
-- A node's `lifecycle_state` `UNKNOWN` is a unit its hive's systemd gave no full answer for, which may run, or a managed node with neither config nor state, which reads `UNKNOWN` every time: never report it as stopped. A step refused with `SERVICE_FAILED` and `retryable: true` did nothing: say so and offer to ask again.
+- A node's `lifecycle_state` `UNKNOWN` is a unit its hive's systemd gave no full answer for, which may run, or a managed node with neither config nor state, which reads `UNKNOWN` every time: never report it as stopped. A step refused with `SERVICE_FAILED` or `BUSY` and `retryable: true` did nothing: say so and offer to ask again (`BUSY`: the service was taking another request, a hive's SY.wf-rules or another `publish_cloud_endpoint` run).
 - When unsure of field names or schemas while answering, inspect `/admin/actions/{action}` — never guess payloads."#.to_string();
 
     if let Some(handbook_text) = handbook.filter(|t| !t.trim().is_empty()) {
@@ -2467,14 +2467,14 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - Use `restart_node` only when the managed instance already exists and should be restarted.
 - Use `kill_node` to stop a node process. It does not necessarily delete the persisted instance.
 - Use `remove_node_instance` only to delete the persisted managed instance.
-- A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd gave no full answer for its unit. Read it again before you choose; never take it for stopped. A managed node with neither config nor state reads `UNKNOWN` every time too, so a read again changes nothing. `SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or `remove_node_instance` is a systemd check with no answer: nothing was done, and the same step can be asked again.
+- A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd gave no full answer for its unit. Read it again before you choose; never take it for stopped. A managed node with neither config nor state reads `UNKNOWN` every time too, so a read again changes nothing. `SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or `remove_node_instance` is a systemd check with no answer: nothing was done, and the same step can be asked again. `BUSY` with `retryable: true` beside it (a hive's SY.wf-rules that took another request first, or another `publish_cloud_endpoint` running) is a refusal too: nothing changed, and the same step can be staged again as it was.
 - Use `publish_runtime_package` to publish a runtime package. It does not spawn nodes.
 
 ### Workflow runtime selection
 
 - `wf.engine` is the WF base runtime. It is not the runtime to use when creating a `WF.*` managed workflow node.
 - A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
-- To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: with `auto_spawn=true` and `tenant_id` it spawns the node when it does not exist, and without them no node is created; on an existing node it restarts it, so never add a `restart_node` after it. A deploy whose node does not run the definition is refused (`WF_NODE_NOT_DEPLOYED`, its `wf_node` says why): the definition is current, and the deploy is not done.
+- To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: with `auto_spawn=true` and `tenant_id` it spawns the node when it does not exist, and without them no node is created; on an existing node it restarts it, so never add a `restart_node` after it. A deploy whose node does not run the definition is refused (`WF_NODE_NOT_DEPLOYED`, its `wf_node` says why): the definition is current, and the deploy is not done. A change refused `BUSY` (`retryable: true`; `wf_rules_compile_apply`, `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`, `wf_rules_delete`) came while the hive's SY.wf-rules took another request: nothing changed, and the same step can be staged again as it was; it is no failed deploy.
 - The definition was checked before it reached you (`wf_rules_check`, a read that stages nothing): `wf_rules_check` is never an executor step.
 - `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE), or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a node that is not RUNNING keeps its instances); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them. A config read of the WF node with no answer refuses it with `force` too (ORCHESTRATOR_ERROR, saying nothing was changed), and nothing changes; an ORCHESTRATOR_ERROR from the node's kill may have stopped or removed the node: read the workflow's status (`wf_rules_get_status`) before you stage the delete again.
 - `wf_cancel_instance` cancels one instance of a WF node (hive, node_name `WF.<workflow_name>`, instance_id, reason): its cancel transition runs.
@@ -27016,6 +27016,21 @@ async fn handle_pipeline_confirm1(
     }
 }
 
+/// What the chat says of a pipeline run whose plan stopped at execution. A step refused `BUSY`
+/// (FINDINGS A-307: `retryable`, the service was taking another request) changed nothing, and the
+/// plan may be staged again as it was; it read "Pipeline execution failed", as a failed deploy.
+fn pipeline_execution_failure_message(failure_class: &FailureClass, failure_text: &str) -> String {
+    if *failure_class == FailureClass::ExecutionBusy {
+        format!(
+            "Pipeline execution stopped: {failure_text}\nThat step changed nothing: it was refused \
+             BUSY, retryable, while the service took another request; any step before it ran. \
+             Ask for retry to stage the plan again for CONFIRM, or discard the run."
+        )
+    } else {
+        format!("Pipeline execution failed: {failure_text}")
+    }
+}
+
 /// A deploy that failed for its design (`RetryDesign` at Execute: a workflow definition or a policy
 /// that does not compile) goes back to the designer: the blocked run closes, and a new one designs
 /// the task again with the error (`restart_from_design`). The operator gets what failed, then the
@@ -27180,7 +27195,7 @@ async fn handle_pipeline_confirm2(
                     status: "blocked".to_string(),
                     mode: "pipeline".to_string(),
                     output: json!({
-                        "message": format!("Pipeline execution failed: {failure_text}"),
+                        "message": pipeline_execution_failure_message(&failure_class, &failure_text),
                         "pipeline_run_id": pipeline_run.pipeline_run_id,
                         "stage": "blocked",
                         "failure_class": failure_class,
@@ -30642,6 +30657,76 @@ mod tests {
         assert_eq!(executor_failure_code(&bare).as_deref(), Some("TIMEOUT"));
     }
 
+    /// FINDINGS A-307, Archi's part: a deploy step SY.wf-rules refused `BUSY` (SY.admin's 409,
+    /// `retryable: true`: its turn came with less than 20 s of SY.admin's wait left) changed
+    /// nothing. The pipeline classifies it as such (`ExecutionBusy`), says so, and offers to stage
+    /// the plan again, where it fell to `ExecutionActionFailed` and read "Pipeline execution
+    /// failed", as a failed deploy. Archi's prompt and the plan compiler's facts name `BUSY` beside
+    /// `SERVICE_FAILED`, and on the wf-rules changes.
+    #[test]
+    fn a_deploy_refused_busy_changed_nothing_and_the_pipeline_says_so() {
+        let detail = "request waited 56.0s for its turn; less than the 20s of it a change needs \
+                      left at its turn";
+        let output = json!({
+            "status": "error",
+            "action": "executor_execute_plan",
+            "error_code": "EXECUTION_FAILED",
+            "error_detail": "Execution stopped at step 's1'",
+            "payload": { "status": "failed", "summary": {
+                "status": "failed", "failed_step_id": "s1",
+                "failed_step_action": "wf_rules_compile_apply",
+                "failure": { "code": "BUSY", "detail": detail,
+                    "source": "admin_action_failure", "step_id": "s1",
+                    "step_action": "wf_rules_compile_apply" }
+            } }
+        });
+        assert!(!executor_output_is_successful(&output));
+        let text = executor_failure_text(&output);
+        assert_eq!(
+            text,
+            format!("wf_rules_compile_apply failed: BUSY: {detail}")
+        );
+        let class = classify_failure_deterministic(
+            &text,
+            &FailureContext {
+                stage: PipelineStage::Execute,
+                error_code: executor_failure_code(&output),
+            },
+        )
+        .unwrap_or(FailureClass::ExecutionActionFailed);
+        assert_eq!(class, FailureClass::ExecutionBusy);
+        let told = pipeline_execution_failure_message(&class, &text);
+        assert!(
+            told.starts_with(&format!("Pipeline execution stopped: {text}\n")),
+            "{told}"
+        );
+        assert!(told.contains("That step changed nothing"), "{told}");
+        assert!(
+            told.contains("Ask for retry to stage the plan again"),
+            "{told}"
+        );
+        assert_eq!(
+            pipeline_execution_failure_message(&FailureClass::ExecutionActionFailed, "boom"),
+            "Pipeline execution failed: boom"
+        );
+
+        let chat = build_archi_prompt(None);
+        assert!(chat.contains(
+            "A step refused with `SERVICE_FAILED` or `BUSY` and `retryable: true` did nothing"
+        ));
+        let facts = build_plan_compiler_prompt(&[], &[], None);
+        for text in [
+            "`BUSY` with `retryable: true` beside it (a hive's SY.wf-rules that took another \
+             request first, or another `publish_cloud_endpoint` running) is a refusal too: nothing \
+             changed, and the same step can be staged again as it was.",
+            "A change refused `BUSY` (`retryable: true`; `wf_rules_compile_apply`, \
+             `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`, `wf_rules_delete`) came \
+             while the hive's SY.wf-rules took another request: nothing changed",
+        ] {
+            assert!(facts.contains(text), "{text}");
+        }
+    }
+
     /// `restart_from_design` designs the same task with the same context, and with the blocked
     /// run's last error.
     #[test]
@@ -31849,8 +31934,8 @@ mod tests {
             "A node's `lifecycle_state` `UNKNOWN` is a unit its hive's systemd gave no full answer \
              for, which may run, or a managed node with neither config nor state, which reads \
              `UNKNOWN` every time: never report it as stopped.",
-            "A step refused with `SERVICE_FAILED` and `retryable: true` did nothing: say so and \
-             offer to ask again.",
+            "A step refused with `SERVICE_FAILED` or `BUSY` and `retryable: true` did nothing: say \
+             so and offer to ask again",
         ] {
             assert!(chat.contains(text), "{text}");
         }

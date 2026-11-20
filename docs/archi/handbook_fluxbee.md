@@ -1065,7 +1065,9 @@ person: when its provider gave no answer, the error carries the operator's text 
   with less than 20 s left of SY.admin's 75 s wait for it, another request having run before it.
   `payload.retryable` is `true`: nothing changed, so the same request may go again as it was (in
   a plan, the step staged again for the operator's confirmation). Say so; never report it as a
-  failed deploy or delete. A check and the reads are never refused so.
+  failed deploy or delete. A check and the reads are never refused so. A pipeline run whose step
+  was refused so is blocked as "Pipeline execution stopped" (`failure_class` `EXECUTION_BUSY`,
+  since 0.1.152): offer `retry`, which stages its plan again for the operator's `CONFIRM`.
 - **A change answered `504 TIMEOUT` is no refusal, and may still complete:** a change whose turn
   came with 20 s or more of SY.admin's wait left runs with its 60 s, and can end past the 75 s.
   Never stage it again at once: first read `wf_rules_get_status`, which SY.wf-rules answers after

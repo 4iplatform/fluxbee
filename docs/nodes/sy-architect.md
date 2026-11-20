@@ -319,7 +319,10 @@ a node whose `lifecycle_state` is `UNKNOWN` may run, its hive's systemd gave no 
 its unit, so it is read again and never taken for stopped, while a managed node with neither
 config nor state reads `UNKNOWN` every time, and that `SERVICE_FAILED` with `retryable: true` from
 `run_node`, `start_node`, `kill_node` or `remove_node_instance` did nothing and can be asked again
-([SY.orchestrator](sy-orchestrator.md)).
+([SY.orchestrator](sy-orchestrator.md)). Since 0.1.152 both name `BUSY` with `retryable: true`
+beside it (FINDINGS A-307): a hive's SY.wf-rules that took another request first refused the
+change at once (the plan compiler's facts name the five wf-rules changes), or another
+`publish_cloud_endpoint` was running; nothing changed, and the step can be staged again as it was.
 
 A confirmed run is verified (`verify_execution_result`): done, no step failed, each workflow it
 deployed has its node running (`wf_deploys_left_not_running`), and each change of the
@@ -571,7 +574,11 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
 - Failures are classified first by rules, then by an LLM if no rule matched
   (`failure_classifier.rs`), and either retried or escalated. At execution, only a design's
   failure goes back on its own (to the designer); any other is the operator's, with the options
-  `retry`, `restart_from_design` and `discard`, since nothing retries a step there.
+  `retry`, `restart_from_design` and `discard`, since nothing retries a step there. A step refused
+  `BUSY` (`ExecutionBusy`, since 0.1.152, FINDINGS A-307: SY.admin's 409 with `retryable: true`)
+  changed nothing: the run is blocked with "Pipeline execution stopped", the chat says the step
+  changed nothing and offers `retry`, which stages the plan again for `CONFIRM` (it runs from its
+  first step); before, it fell to `ExecutionActionFailed` and read "Pipeline execution failed".
 
 Runs are stored in the `pipeline_runs` table; a restart marks unfinished ones `interrupted`, and
 the session's recovery route resumes or discards them.

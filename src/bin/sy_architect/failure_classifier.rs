@@ -47,6 +47,13 @@ pub fn classify_failure_deterministic(
     if ctx.stage == PipelineStage::Execute && code == "WF_NODE_NOT_DEPLOYED" {
         return Some(FailureClass::ExecutionActionFailed);
     }
+    // A step refused BUSY (FINDINGS A-307): the hive's SY.wf-rules took another request first and
+    // refused the change at once, or another publish_cloud_endpoint was running. SY.admin answers
+    // it 409 with `payload.retryable: true`: the step changed nothing, so the plan may be staged
+    // again as it was. It is no failed deploy, whatever its detail says.
+    if ctx.stage == PipelineStage::Execute && code == "BUSY" {
+        return Some(FailureClass::ExecutionBusy);
+    }
 
     // ── Execution failures ───────────────────────────────────────────────────
     if text.contains("runtime not materialized")
@@ -160,6 +167,16 @@ impl FailureRoutingDecision {
     pub fn operator_message(&self, failure_class: &FailureClass) -> String {
         let class_label = format!("{failure_class:?}");
         match self {
+            FailureRoutingDecision::EscalateToOperator
+                if *failure_class == FailureClass::ExecutionBusy =>
+            {
+                format!(
+                    "Nothing changed at the step refused BUSY: the service was taking another \
+                    request, and the refusal is retryable. Failure class: {class_label}. \
+                    Choose retry to stage the plan again for CONFIRM (it runs from its first \
+                    step), or discard."
+                )
+            }
             FailureRoutingDecision::RetryDesign => format!(
                 "The design phase will be retried automatically. \
                 Failure class: {class_label}. \
@@ -246,6 +263,9 @@ pub fn route_failure(
         }
 
         FailureClass::ExecutionTimeout => FailureRoutingDecision::RetryExecutor,
+
+        // Nothing retries a step at execution: staging the plan again is the operator's call.
+        FailureClass::ExecutionBusy => FailureRoutingDecision::EscalateToOperator,
 
         FailureClass::ExecutionActionFailed => FailureRoutingDecision::EscalateToOperator,
 
@@ -382,6 +402,54 @@ mod tests {
         assert_eq!(
             route_failure(&FailureClass::ExecutionActionFailed, 1, 0, 0),
             FailureRoutingDecision::EscalateToOperator
+        );
+    }
+
+    /// FINDINGS A-307: a step SY.wf-rules refused BUSY (SY.admin's 409, `retryable: true`)
+    /// changed nothing. It is classified as such, never as a failed deploy, and the operator is
+    /// told so and offered to stage the plan again; at another stage the code is not a step's.
+    #[test]
+    fn a_step_refused_busy_changed_nothing_and_may_go_again() {
+        let detail =
+            "wf_rules_compile_apply failed: BUSY: request waited 56.0s for its turn; less \
+                      than the 20s of it a change needs left at its turn";
+        let class =
+            classify_failure_deterministic(detail, &ctx_code(PipelineStage::Execute, "BUSY"));
+        assert_eq!(class, Some(FailureClass::ExecutionBusy));
+        // Its detail's words never make it a timeout or another class.
+        assert_eq!(
+            classify_failure_deterministic(
+                "publish_cloud_endpoint failed: BUSY: timed out waiting for the door",
+                &ctx_code(PipelineStage::Execute, "BUSY"),
+            ),
+            Some(FailureClass::ExecutionBusy)
+        );
+        let route = route_failure(&FailureClass::ExecutionBusy, 1, 0, 0);
+        assert_eq!(route, FailureRoutingDecision::EscalateToOperator);
+        assert!(route.operator_options().contains(&"retry"));
+        let told = route.operator_message(&FailureClass::ExecutionBusy);
+        assert!(
+            told.starts_with("Nothing changed at the step refused BUSY"),
+            "{told}"
+        );
+        assert!(
+            told.contains("Choose retry to stage the plan again"),
+            "{told}"
+        );
+        // Any other class keeps its own message.
+        assert!(route
+            .operator_message(&FailureClass::ExecutionActionFailed)
+            .starts_with("Operator action required"));
+        assert_eq!(
+            classify_failure_deterministic(
+                "some completely unknown error XYZ",
+                &ctx_code(PipelineStage::PlanValidation, "BUSY"),
+            ),
+            None
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::ExecutionBusy).unwrap(),
+            serde_json::json!("EXECUTION_BUSY")
         );
     }
 

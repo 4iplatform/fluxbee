@@ -354,6 +354,10 @@ pub enum FailureClass {
     ExecutionEnvironmentMissing,
     ExecutionActionFailed,
     ExecutionTimeout,
+    /// A step refused `BUSY`, `retryable` (FINDINGS A-307): the service was taking another request
+    /// (a hive's SY.wf-rules, or another `publish_cloud_endpoint` run), and the step changed
+    /// nothing, so the plan may go again as it was.
+    ExecutionBusy,
     /// No deterministic rule matched — escalate to operator or residual AI classifier.
     UnknownResidual,
 }
