@@ -2455,12 +2455,14 @@ fn redact_executor_secrets(
     }
 }
 
-/// A secret as the plan review's model reads it (FINDINGS A-337): every value in it but null is
-/// `NODE_SECRET_REDACTION_TOKEN`, and an object keeps its fields' names and an array its length,
-/// so a `vault_put`'s `value` still reads as the object its contract asks for. The review checks
-/// that a field is there and its shape, never a secret's value.
+/// A secret as the plan review's model reads it (FINDINGS A-337): every value in it but null and
+/// an empty string is `NODE_SECRET_REDACTION_TOKEN`, and an object keeps its fields' names and an
+/// array its length, so a `vault_put`'s `value` still reads as the object its contract asks for.
+/// The review checks that a field is there and its shape, never a secret's value; an empty string
+/// holds no secret and stays one, so the review still sees a field left empty.
 fn executor_review_mask(value: &serde_json::Value) -> serde_json::Value {
     match value {
+        serde_json::Value::String(text) if text.is_empty() => value.clone(),
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.iter()
                 .map(|(key, entry)| (key.clone(), executor_review_mask(entry)))
@@ -2531,6 +2533,64 @@ fn persist_admin_executor_run_log(
     });
     fs::write(&path, serde_json::to_vec_pretty(&body)?)?;
     Ok(path.display().to_string())
+}
+
+/// Where a plan, as sent, puts the redaction mask (`NODE_SECRET_REDACTION_TOKEN`) in a step's
+/// args, the first place (FINDINGS A-337): the step's id and action and the field, never what the
+/// field holds. A plan rebuilt from a masked history (Archi's chat, an executor run log) carries
+/// the mask where a secret was, and its step would store or send the mask itself; the plan
+/// review's model is told the mask stands for a secret it is not shown, so it cannot catch it.
+/// `executor_validate_plan` and `executor_execute_plan` refuse such a plan first
+/// (`PLAN_HOLDS_MASKED_VALUE`): a masked value is not a value.
+fn executor_plan_masked_value(plan: &serde_json::Value) -> Option<String> {
+    fn masked_at(value: &serde_json::Value, path: String) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => {
+                text.contains(NODE_SECRET_REDACTION_TOKEN).then_some(path)
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(index, item)| masked_at(item, format!("{path}[{index}]"))),
+            serde_json::Value::Object(map) => map
+                .iter()
+                .find_map(|(key, item)| masked_at(item, format!("{path}.{key}"))),
+            _ => None,
+        }
+    }
+    let steps = plan.get("execution")?.get("steps")?.as_array()?;
+    steps.iter().enumerate().find_map(|(index, step)| {
+        let field = masked_at(step.get("args")?, format!("execution.steps[{index}].args"))?;
+        let text = |key: &str| {
+            step.get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string()
+        };
+        Some(format!(
+            "step '{}' ({}) holds the redaction mask {NODE_SECRET_REDACTION_TOKEN} in \
+             {field}, where a value goes: a masked value is not a value, and the step would store \
+             or send the mask itself. A plan rebuilt from a masked history (a chat, a run log) \
+             carries it where a secret was: write the real value, or store the secret over \
+             SY.admin's HTTP API (POST /hives/<hive>/vault/secrets).",
+            text("id"),
+            text("action"),
+        ))
+    })
+}
+
+/// `400 PLAN_HOLDS_MASKED_VALUE` (`executor_plan_masked_value`): nothing reviewed or run.
+fn plan_holds_masked_value(action: &str, detail: String) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 400,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "PLAN_HOLDS_MASKED_VALUE",
+            "error_detail": detail,
+        }),
+    }
 }
 
 fn parse_executor_plan(params: serde_json::Value) -> Result<AdminExecutorPlan, String> {
@@ -11111,6 +11171,9 @@ async fn dispatch_internal_admin_command(
             return Ok(handle_list_published_artifacts(ctx, &params));
         }
         "executor_validate_plan" => {
+            if let Some(detail) = executor_plan_masked_value(&params) {
+                return Ok(plan_holds_masked_value(action, detail));
+            }
             let plan = match parse_executor_plan(params) {
                 Ok(plan) => plan,
                 Err(detail) => return Ok(internal_invalid_request(action, &detail)),
@@ -11224,6 +11287,9 @@ async fn dispatch_internal_admin_command(
                     action,
                     "payload.target is not used for executor_execute_plan",
                 ));
+            }
+            if let Some(detail) = params.get("plan").and_then(executor_plan_masked_value) {
+                return Ok(plan_holds_masked_value(action, detail));
             }
             let request = match serde_json::from_value::<AdminExecutorRunRequest>(params) {
                 Ok(request) => request,
@@ -34266,7 +34332,11 @@ mod tests {
                 json!({
                     "hive": "motherbee",
                     "key": "slack-tokens",
-                    "value": { "bot_token": secrets[1], "app_token": secrets[2] },
+                    "value": {
+                        "bot_token": secrets[1],
+                        "app_token": secrets[2],
+                        "signing_secret": "",
+                    },
                 }),
             ),
             step(
@@ -34322,9 +34392,10 @@ mod tests {
                 "metadata": { "resource_type": "openai", "description": "the main key" },
             })
         );
+        // An empty string holds no secret and stays one: the review still sees a field left empty.
         assert_eq!(
             reviewed[1]["value"],
-            json!({ "bot_token": masked, "app_token": masked })
+            json!({ "bot_token": masked, "app_token": masked, "signing_secret": "" })
         );
         assert_eq!(reviewed[1]["key"], json!("slack-tokens"));
         assert_eq!(
@@ -34341,6 +34412,99 @@ mod tests {
         assert_eq!(reviewed[3], json!({ "key": masked }));
         // The executor's log still masks a secret whole.
         assert_eq!(redact_executor_log_value(&steps[0].args)["value"], masked);
+    }
+
+    /// FINDINGS A-337: a plan whose step args hold the redaction mask anywhere (a plan rebuilt from
+    /// a masked history) is refused before the review and before a run, `400
+    /// PLAN_HOLDS_MASKED_VALUE`, the detail naming the step and the field and never what the field
+    /// holds: the review's model is told the mask stands for a secret, so it would pass, and the
+    /// step would store the mask itself.
+    #[tokio::test]
+    async fn a_plan_that_holds_the_redaction_mask_is_refused_before_its_review_and_its_run() {
+        let (ctx, _harness) = opa_test_admin("executor-masked-value");
+        let plan = |steps: serde_json::Value| {
+            json!({
+                "plan_version": ADMIN_EXECUTOR_PLAN_VERSION,
+                "kind": ADMIN_EXECUTOR_PLAN_KIND,
+                "metadata": { "name": "rotate", "target_hive": "motherbee" },
+                "execution": {
+                    "strict": true,
+                    "stop_on_error": true,
+                    "allow_help_lookup": false,
+                    "steps": steps,
+                },
+            })
+        };
+        let rebuilt = plan(json!([
+            { "id": "s1", "action": "list_hives", "args": {} },
+            {
+                "id": "s2",
+                "action": "vault_rotate",
+                "args": {
+                    "hive": "motherbee",
+                    "key": "slack-tokens",
+                    "value": { "app_token": "xapp-kept-in-clear", "bot_token": NODE_SECRET_REDACTION_TOKEN },
+                },
+            },
+        ]));
+        let detail = executor_plan_masked_value(&rebuilt).expect("refused");
+        assert!(
+            detail.contains("step 's2' (vault_rotate)")
+                && detail.contains("execution.steps[1].args.value.bot_token"),
+            "{detail}"
+        );
+        assert!(!detail.contains("xapp-kept-in-clear"), "{detail}");
+        // Inside a longer value too, as a masked history writes it into a text.
+        let embedded = plan(json!([{
+            "id": "s1",
+            "action": "vault_put",
+            "args": {
+                "hive": "motherbee",
+                "key": "db",
+                "value": { "postgres_url": format!("postgresql://app:{NODE_SECRET_REDACTION_TOKEN}@10.0.0.5:5432") },
+                "metadata": { "resource_type": "postgres" },
+            },
+        }]));
+        let detail = executor_plan_masked_value(&embedded).expect("refused");
+        assert!(
+            detail.contains("execution.steps[0].args.value.postgres_url")
+                && !detail.contains("postgresql://"),
+            "{detail}"
+        );
+        // An empty value is no masked value.
+        let clean = plan(json!([{
+            "id": "s1",
+            "action": "vault_rotate",
+            "args": { "hive": "motherbee", "key": "slack-tokens", "value": { "bot_token": "" } },
+        }]));
+        assert_eq!(executor_plan_masked_value(&clean), None);
+
+        for (action, params) in [
+            ("executor_validate_plan", rebuilt.clone()),
+            (
+                "executor_execute_plan",
+                json!({ "execution_id": "exec-masked", "plan": rebuilt }),
+            ),
+        ] {
+            let answer = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                None,
+                params,
+                AdminOrigin::Http,
+            )
+            .await
+            .expect("answered");
+            assert_eq!(answer.http_status, 400, "{action}: {}", answer.envelope);
+            assert_eq!(
+                answer.envelope["error_code"], "PLAN_HOLDS_MASKED_VALUE",
+                "{action}: {}",
+                answer.envelope
+            );
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("value.bot_token"), "{action}: {detail}");
+        }
     }
 
     fn command_log_test_state_dir(tag: &str) -> PathBuf {

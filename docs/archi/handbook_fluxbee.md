@@ -1811,6 +1811,11 @@ Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fl
   `vault_put`'s or a `vault_rotate`'s value, an SSH password or key; FINDINGS A-337). A secret the
   operator asks you to store still reached you, and the AI provider behind you, if they typed it
   in the chat. Say so before staging it.
+- **A masked value is not a value.** Since 0.1.152, SY.admin refuses a plan whose args hold
+  `***REDACTED***` anywhere, `400 PLAN_HOLDS_MASKED_VALUE`, naming the step and the field: the
+  step would store the mask itself. Never rebuild a plan's secret from your history, where it is
+  masked: ask the operator for the value again, or send them to SY.admin's HTTP API for a secret
+  (`POST /hives/<hive>/vault/secrets`).
 
 ---
 

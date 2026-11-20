@@ -1395,15 +1395,25 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   schema, no `<placeholder>` strings. `executor_validate_plan` also runs an LLM review of each
   step against its help (`semantic_review_executor_plan`); issues give `PLAN_REVIEW_FAILED`.
   Since 0.1.152 (FINDINGS A-337) the review's prompt (`executor_review_prompt`) carries the
-  step's args with every secret masked by the executor log's rules (`redact_executor_secrets`: a
-  field whose name reads as a secret, `ssh_password` and `ssh_key` among them, and the `value` of
-  a vault-shaped `{key, value}`, a `vault_put`'s or a `vault_rotate`'s), and an
-  `unpublish_artifact`'s `key`, its page's link key and so the permission to read the page (by
-  that action's field: a vault step's `key`, a secret's name, stays readable), each shown as
-  `***REDACTED***` with an object's field names kept (`{"api_key": "***REDACTED***"}`), so a
-  secret the operator wrote into a step never reaches the AI provider there. The review checks
+  step's args with these fields masked: the ones the executor's run log masks by name
+  (`redaction_field_is_secret`: `password`, `token`, `secret`, `api_key`, `ssh_password`,
+  `ssh_key`, `private_key`, `authorization` and the names ending in `_token`, `_secret`,
+  `_password`, `_api_key` or `_private_key`), the `value` of a vault-shaped `{key, value}` (a
+  `vault_put`'s or a `vault_rotate`'s), and an `unpublish_artifact`'s `key`, its page's link key
+  and so the permission to read the page (by that action's field: a vault step's `key`, a
+  secret's name, stays readable). Each is shown as `***REDACTED***`, an object with its field
+  names kept (`{"api_key": "***REDACTED***"}`) and an empty string as `""`. A secret under any
+  other field name is still shown to the review, and so to the AI provider. The review checks
   that a field is there and its shape, never a secret's value, and its prompt says a masked value
   is present.
+- **A masked value is not a value** (since 0.1.152, FINDINGS A-337; `executor_plan_masked_value`):
+  `executor_validate_plan` and `executor_execute_plan` refuse a plan whose step args hold
+  `***REDACTED***` anywhere, a whole value or part of one, `400 PLAN_HOLDS_MASKED_VALUE`, before
+  any other check, the review or a run. A plan rebuilt from a masked history (Archi's chat, a run
+  log) carries the mask where a secret was, the review's model is told the mask stands for a
+  secret it is not shown, and the step would store or send the mask itself. The detail names the
+  step (id and action) and the field (`execution.steps[1].args.value.bot_token`), never what the
+  field holds.
 - **Execution** (`execute_admin_executor_plan`): each step's `$steps.<step_id>.<path>`
   references are resolved first, from the earlier steps' results.
   - **A step with nothing to fill**, with no `executor_fill` (or one that allows no field), is
