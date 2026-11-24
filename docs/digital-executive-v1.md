@@ -134,9 +134,35 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Each node instance gets its own ILK at spawn, so a conscious that had to run as several processes
     would be several actors today.
 
+- **The operator, on the order (2026-11-24):** one line per person is right, by ILK. The thread id is
+  per channel and interlocutor, so the line needs another id if it is not the thread id. Time orders
+  everything inside a line. The line should be ordered naturally by the system, with a tool of its
+  own: not a WF doing that work (*"no me gusta el WF haciendo ese trabajo"*); to think about. On the
+  volume: *"sería por IO, según entiendo"* (asked back what it means, see the chat).
+- **Ids that exist, read for it (2026-11-24):**
+  - **The old CTX** ([history/11-context](history/11-context.md), v1.16 of 2026-02-04): "keep
+    conversations with history between interlocutors across different channels", but built as
+    `ctx = hash(ilk + ich)`, one per interlocutor **and** channel. It left the protocol in 0.1.79
+    (commit `41decbd`, the cleanup of 2026-10-17): nothing read it. The thread id took its place, and
+    the IO owns it (the operator, 2026-10-30).
+  - **Cognition's `context_id` and `scope_id`** (`src/bin/sy_cognition.rs`,
+    [scope-binding-energy-spec](scope-binding-energy-spec.md)): a context is a topic ("billing
+    dispute"), a scope a set of contexts that hold together. Cognition's scene, not a conversation's
+    key.
+  - **What crosses channels today is the person's ILK:** one person, one ILK with several channels.
+    A Cloud account is one per email; a contact is charged to the company it wrote to, and the same
+    person from a phone and from an email can be two ILKs until an explicit proof joins them (D13,
+    open since 2026-10-15, [ilk-tenant-model-v1](ilk-tenant-model-v1.md)).
+  - So the line's natural key is the pair (the person's ILK, the executive's ILK), and time orders
+    it; the person who is two ILKs is D13's question.
+- **Where a tool that orders the lines could live** (noted, nothing chosen): the router, which sees
+  every message (the operator, 2026-10-16: *"si hay algo global que resolver en los hives que sea el
+  router"*); the AI runtime of the conscious, which today starts turns in arrival order on 4 workers
+  with no line per person; or a node of its own.
+
 ## 6. Later questions (not yet)
 
-- The order of things around the conscious (open, 2026-11-24, see the chat).
+- The tool that orders the lines, and the person who is two ILKs (D13).
 - The core: what "something more" holds besides IO and AI (an agenda: the tasks on timers of §1.2?).
 - The company's people and their roles in Fluxbee. An earlier decision to weigh
   ([ilk-tenant-model-v1](ilk-tenant-model-v1.md), the operator 2026-10-14 and 10-15): companies,
