@@ -1,6 +1,8 @@
 # The Digital Executive v1, and the operator's large topics of 2026-11-20
 
-**Status:** the talk opened on 2026-11-20; its skeleton agreed the same day (§4). This is the single place for the
+**Status:** talk notes, kept as the talk goes; **no design yet.** The operator, 2026-11-24: the
+design will not come out at once, the ideas come as everything connects; the details are recorded as
+they are talked, then all reviewed together, and only then a solution is documented. This is the single place for the
 Digital Executive. §1 also keeps the other three large topics the operator raised the same day,
 until each gets a talk and a document of its own.
 
@@ -75,7 +77,7 @@ io.web's track closed the same day. The operator: the IO family's revamp is not 
 
 ---
 
-## 4. The skeleton: one person, born and then hired (agreed 2026-11-20)
+## 4. Notes, 2026-11-20: one person, born and then hired
 
 The question: what a Digital Executive is in Fluxbee's identity, and how it relates to the nodes
 that do its work. The example asked: "Laura" answers Ana on WhatsApp as sales, and a week later
@@ -113,10 +115,28 @@ Options (b), a label over several agents, and (c), one node that does everything
 
 ---
 
-## 5. Later questions (not yet)
+## 5. Notes, 2026-11-24: one conscious agent, and many channels
 
-- **Next, asked on 2026-11-20:** who speaks to the humans, the soul alone or each responsibility's
-  agents through the executive's channels (see the chat).
+- **Asked:** who speaks to the humans, the soul alone, with the responsibilities working behind it,
+  or each responsibility's agents through the executive's channels as the executive.
+- **The operator:** better that the conscious one is always the same agent. The executive's manager,
+  its conscious, needs an agent dedicated to the interaction. The concern: whether the number of IO
+  channels causes a problem with this. The structure may be more complex for that reason, because
+  communications can fire WFs, and what comes first and what after is important.
+- **Facts read for it (2026-11-24):**
+  - `ai.generic` runs at most 4 model turns at once (`worker_pool_size`, default 4) and queues up to
+    128 more in the order they came; the next is refused `ai_runtime_busy`
+    (`crates/fluxbee_ai_sdk/src/runtime.rs`).
+  - Nothing keeps one conversation's turns in order: two messages of the same person can run at once
+    on two workers, and their answers can cross.
+  - Each IO node relays what comes in to one node, its `io.dst_node` (usually a WF), or lets the
+    router resolve it.
+  - Each node instance gets its own ILK at spawn, so a conscious that had to run as several processes
+    would be several actors today.
+
+## 6. Later questions (not yet)
+
+- The order of things around the conscious (open, 2026-11-24, see the chat).
 - The core: what "something more" holds besides IO and AI (an agenda: the tasks on timers of §1.2?).
 - The company's people and their roles in Fluxbee. An earlier decision to weigh
   ([ilk-tenant-model-v1](ilk-tenant-model-v1.md), the operator 2026-10-14 and 10-15): companies,
