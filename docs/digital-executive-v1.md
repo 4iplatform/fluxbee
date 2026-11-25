@@ -425,6 +425,11 @@ Options (b), a label over several agents, and (c), one node that does everything
     "virtual" bit fits there with no change to the layout, and a reader that does not know it
     ignores it. A person's rules (an email, channels, a complete registration) would then hold for an
     ED as they are.
+  - A new type value would read as `unknown` to a router or an SDK that does not know it (the fail-safe
+    against a byte up-converted to `system`, `src/router/mod.rs`); a flag bit does not have that cost.
+  - Each ILK in the SHM carries a `handler_node` (its identification's `node_name`), and the router
+    gives it to OPA with the ILK's type and definition. A node that answers for an ILK has a place
+    there already (for the instances, at the end).
 
 ## 17. Later questions (not yet)
 
