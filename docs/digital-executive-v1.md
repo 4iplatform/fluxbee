@@ -611,7 +611,32 @@ Options (b), a label over several agents, and (c), one node that does everything
     `crates/fluxbee_sdk/src/identity.rs`; `ai_node_runner` reads its own definition's hashes), and
     one of the accepted exceptions to "everything through SY.admin" (the operator, 2026-10-15).
 
-## 25. Later questions (not yet)
+## 25. Notes, 2026-11-25 (later): the extra data in a blob, its name in the SHM
+
+- **The operator's call:** the extra data (what does not fit in the shared memory) goes in a blob the
+  agents read, and the shared memory keeps its place, its name. The same pattern as an agent's
+  definition: assets in the blob, their references in the SHM.
+- **Facts read for it (2026-11-25):**
+  - Identity's shared memory is versioned (`IDENTITY_MAGIC` "JSID", `IDENTITY_VERSION` 6) with a
+    fixed 1160-byte `IlkEntry`; a reader refuses another version, and the Go SDK mirrors the
+    offsets (`go/fluxbee-go-sdk/identity_shm.go`). Version 6 came with the agent definition's
+    hashes (`8f8e8a7c`): a new field means a new version, with every reader updated together.
+  - Each `IlkEntry` ends in **8 reserved bytes**, written as zeros by identity and read by nobody
+    (the Go SDK reads the id, type, flags, display name and handler node).
+- **A shape for it (for the review):**
+  - **The blob:** one JSON per person and version, `people/<ilk_id>/<version>.json` (company,
+    position, reports to, responsibilities, and whatever extra comes later), written once; a change
+    is a new version.
+  - **The name in the SHM:** the 8 reserved bytes hold the profile's version as a number (0, none);
+    the ILK id is already in the entry, so id and version name the file. No new field, no new SHM
+    version, and a reader that does not know it ignores it.
+  - **Written by identity,** the owner, on the update command of §24; **read locally** by an
+    agent's tool: the SHM entry, then `read_blob`, with no request to anyone.
+  - **Syncthing's lag** (A-338: on another hive a message can arrive before its blob): the SHM can
+    name a version whose file has not arrived; the old versions stay, so a reader takes the newest
+    one present.
+
+## 26. Later questions (not yet)
 
 - The ED's agents' tools: which ones, and what of the shared memory they read.
 
