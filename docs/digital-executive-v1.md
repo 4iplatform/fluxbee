@@ -452,7 +452,22 @@ Options (b), a label over several agents, and (c), one node that does everything
   - What does not cross channels is the rest of the package: memories, feelings and the last turns
     are per communication `(thread_id, agent ILK)`.
 
-## 18. Later questions (not yet)
+## 18. Notes, 2026-11-25 (later): the pair, and two EDs
+
+- **Start with the pair** (the operator), but not only ED and person: **ED and ED** too. The
+  example: two EDs of one company, one in sales and one in project development, talk to learn
+  whether a billing is approved. They need a chat, and maybe an email after: they talk through
+  channels, as people do.
+- **Facts read for it (2026-11-25):**
+  - An inbound message from an IO carries the person's ILK as `src_ilk` and no `dst_ilk`
+    (`build_inbound_user_message_to_router`, `nodes/io/common/src/router_message.rs`).
+  - An agent's reply carries the person as `dst_ilk` and the agent node's own ILK as `src_ilk`,
+    stamped by the runtime (`build_reply_meta`, `crates/fluxbee_ai_sdk/src/message.rs`). So today
+    the other end of a conversation is the agent node, not a person it speaks for.
+  - Cognition analyzes the turns of people with no agent at either end; between agents it keeps only
+    the immediate memory ([cognition-hands-v1](cognition-hands-v1.md) §12.3, 2).
+
+## 19. Later questions (not yet)
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
