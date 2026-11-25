@@ -223,9 +223,35 @@ Options (b), a label over several agents, and (c), one node that does everything
     in `@*` tries the sender's hive first, then any hive). Nothing picks among several instances, by
     load or by person.
 
-## 8. Later questions (not yet)
+## 8. Notes, 2026-11-25 (later): solutions and the ED
 
-- How a message reaches one of the conscious's instances, and the order within a person's line.
+- **The instances wait for the end** (the operator): how a message reaches one of the conscious's
+  instances is left for last. Picking by person in the router could be, but the operator dislikes the
+  router deciding anything about load.
+- **What a solution is to an ED:** Archi's solutions give an ED its tools. An ED may have general
+  solutions and particular ones.
+- **The relation is the ED node's** (the operator's lean, not yet clear to the operator which is
+  better): there is no place for solutions tied to a project; the relation is between solutions and
+  EDs. A particular solution's skills, when needed, are associated with one ED; a standard one would
+  be native to the ED.
+- **Facts read for it (2026-11-25):**
+  - Archi's solution today is a versioned manifest (`SolutionManifestV2`,
+    `src/bin/sy_architect/pipeline_types.rs`), kept per `solution_id`, one file per version
+    (`manifests/<solution_id>/<version>.json`). Its desired state holds topology, runtimes, nodes,
+    routing, WF deployments, the OPA policy and ownership; an `identity` section is refused.
+  - The tenant is not a field of the solution: each node's config names its own. The spec's "one
+    manifest per tenant-solution" ([solution-manifest-spec_1](solution-manifest-spec_1.md) §3) is
+    the design, not the key the code uses.
+  - A solution runs on one hive (the operator, 2026-11-06).
+  - Where solutions live as sources with their versions (the solutions chapter, the operator
+    2026-11-11) is still open.
+  - The operator, 2026-11-20 (§2): an admin creates an ED and assigns it a role, maybe with template
+    solutions, then adds solutions of their own.
+
+## 9. Later questions (not yet)
+
+- How a message reaches one of the conscious's instances, and the order within a person's line (left
+  for the end).
 - The person who is two ILKs (D13).
 - What the manager node keeps, what identity keeps, and where the ED's list of ILKs lives (read by
   every node: shared memory?).
