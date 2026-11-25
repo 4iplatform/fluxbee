@@ -489,7 +489,23 @@ Options (b), a label over several agents, and (c), one node that does everything
     frontdesk gate is off by default (`nodes/io/common/src/frontdesk_gate.rs`). So today a stranger
     who writes to an agent's IO reaches the agent and stays temporary.
 
-## 20. Later questions (not yet)
+## 20. Notes, 2026-11-25 (later): the frontdesk stays the one registrar
+
+- **The ED does the human part** (the operator: *"sí, es el humano"*), but the idea was that the
+  frontdesk is the only interlocutor for registering, and it has two ways: by command, and by a chat
+  with the human.
+- **Facts read for it (2026-11-25), SY.frontdesk.gov** (`nodes/gov/ai-frontdesk-gov/README.md`):
+  - A core system node on the motherbee, autonomous, with two inputs. The command,
+    `frontdesk_handoff`: already structured data (`register_human` from IO.cloud, for one), with no
+    LLM, taken **only from an IO node** (the sender the router stamps starts with `IO.`; any other
+    gets `INVALID_REQUEST`). The chat: its LLM gathers the data and calls its own `ilk_register`.
+  - **Vouched and claimed:** only a handoff's own `subject.email` is vouched, and a vouched email a
+    person of the tenant already has merges the temporary ILK into that person (`MERGED`). An email
+    typed in a conversation is `claimed_email`: stored, never merged on.
+  - So what an agent learns in a chat ("soy Ana, mi mail es ana@acme.com") is a claim and joins
+    nothing; a join needs what a channel vouches.
+
+## 21. Later questions (not yet)
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
