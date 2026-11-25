@@ -558,7 +558,40 @@ Options (b), a label over several agents, and (c), one node that does everything
   - **A relation between two people** (one's supervisor, who reports to whom) is in no design and no
     code: v2's `supervisor` was a tag, v3's claims are about one ILK.
 
-## 23. Later questions (not yet)
+## 23. Notes, 2026-11-25 (later): people and roles, simple first
+
+- **The operator:** simple, and without v3 for now, but with everything: the hierarchy,
+  responsibilities, and capabilities made explicit by the solutions assigned. Long; start simple, to
+  learn and tune it before solving it. Do not mix it with what exists for agents in Archi.
+- **Facts read for it (2026-11-25):**
+  - The words taken: an agent's *role* and *skills* are its cognitive definition (v2.1, Archi's
+    assets), and identity rejects the fields `roles` and `capabilities` as v2's legacy.
+  - Nothing changes a person's data after the registration: `ILK_UPDATE` only adds channels, and
+    only SY.orchestrator may send it. Cloud's `register_human` stores `display_name`, `email`,
+    `phone`, `company_name` and a free `attributes` object, once.
+  - An agent cannot read identity: the base tools are the thread state, the artifact generators,
+    `get_current_time`, `read_blob` and the HTML pages (`docs/reference/agent-tools.json`). What
+    reaches it about people is the message, the turns and the news.
+- **A first shape, proposed in the talk (for the review, not decided):**
+  - **For people only** (a person's ILK, real or virtual), never an agent node's. Its own words, so
+    it does not mix with Archi's agents: a **position** (free text, "sales manager"), **reports to**
+    (another person's ILK: the hierarchy) and **responsibilities** (short free texts).
+  - **A human's** position, boss and responsibilities are typed by the company's admin.
+  - **An ED's** position and boss are typed when it is hired; its **capabilities are not typed:**
+    they are its deployments in SY.deploy, each with its why.
+  - **Its home: identity,** on the person, the one place for humans and EDs; outside the shared
+    memory, since no node needs it at each message. Written through SY.admin (Cloud through
+    IO.cloud, Archi, the HTTP API), by a new action.
+  - **Read by** Archi and Cloud through SY.admin, and by the ED's conscious through a new tool:
+    "my boss", "who in my tenant handles X" (it answers the tenant's people with their positions
+    and responsibilities, and the model judges).
+  - **Free text, no catalog:** learn first, tune later.
+  - **Against the decision of 2026-10-14/15** (Cloud keeps companies and members): this is
+    knowledge for the EDs, neither a membership nor a permission; Cloud stays where the admin edits
+    it, and Fluxbee keeps it because the ED acts on it here (the operator, 2026-10-30: before moving
+    data, ask what acts on it).
+
+## 24. Later questions (not yet)
 
 - The frontdesk's reinforced process: a contact who becomes a "user", its mechanism and approval.
 
