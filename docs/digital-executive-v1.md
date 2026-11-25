@@ -248,7 +248,30 @@ Options (b), a label over several agents, and (c), one node that does everything
   - The operator, 2026-11-20 (§2): an admin creates an ED and assigns it a role, maybe with template
     solutions, then adds solutions of their own.
 
-## 9. Later questions (not yet)
+## 9. Notes, 2026-11-25 (later): source and deployment
+
+- **Two things called "solution":** the source (the manifest with its versions, what Archi writes)
+  and the deployment (the nodes that run it, with their ILKs, on a hive and charged to a tenant).
+  For an ED the operator means the deployment.
+- **Three layers, right** (the operator): native (what every ED has at birth, the core IO + AI +
+  something more, raised by the ED node: not a solution that is associated); standard (a template
+  from Archi's catalog, given to an ED when it is hired, and to others); particular (made to measure
+  by Archi for one ED).
+- **One deployment per ED,** agreed: a standard solution two EDs use is deployed twice. So an agent
+  works for one ED only, and the ED's list of ILKs follows from its core and its deployments.
+- **CI stays with Archi** (the sources, their versions, the catalog); each version is there to be
+  deployed into each executive.
+- **The CD's events need records,** a whole topic, the ED node's as the operator sees it.
+- **Facts read for it (2026-11-25):**
+  - Archi deploys today: its reconciler (`src/bin/sy_architect/reconciler.rs`, pure deterministic
+    functions, no AI and no network) diffs a manifest against the actual state, and SY.admin's
+    executor runs the plan after the operator's CONFIRM.
+  - What is recorded today: SY.admin's command log (each command and its outcome, an executor
+    plan's steps), Archi's tracked operations, and the orchestrator's deployment history, which is a
+    hive's software (core, runtime and vendor updates), not solutions. Nothing records "this
+    version of this solution, deployed for this ED, on these nodes".
+
+## 10. Later questions (not yet)
 
 - How a message reaches one of the conscious's instances, and the order within a person's line (left
   for the end).
