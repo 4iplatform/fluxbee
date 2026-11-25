@@ -290,7 +290,25 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Node names are unique per hive, so a standard solution deployed for two EDs needs its names made
     per ED.
 
-## 11. Later questions (not yet)
+## 11. Notes, 2026-11-25 (later): a CD node, and the ED as a deployment
+
+- **Pending, for later:** the user OPA policy that is one for the whole installation (§10).
+- **Node names:** distinct per ED, yes.
+- **One responsible for the CD** (the operator). Each deployment carries its tenant (that exists)
+  and a *why*, what it is for, which groups deployments: an ED, or infra, maybe others. The other
+  groupings sit at the same level as an ED.
+- **So the node is not the ED's but the CD's, and the ED becomes a deployment** (the operator: *"eso
+  me cierra más"*). The node of §6 and §7, which gives birth to EDs, is the CD node; an ED is one
+  kind of what deployments are grouped by.
+- **Facts read for it (2026-11-25), what is deployed today outside Archi's solutions:**
+  - The platform's own software: the package installs the core (SY.*, RT.*) and boots `io.cloud` and
+    `io.blob` (`packaging/base-nodes.json`); runtimes grow by publish plus `SYSTEM_UPDATE`
+    (category runtime), and the orchestrator keeps that history per hive.
+  - `io.web` runs only where the operator starts it, by one `run_node` in the root tenant.
+  - Fluxbee Cloud launches a tenant's IO nodes through IO.cloud's `provision_node`.
+  - The operator launches any node with `run_node` (SY.admin's HTTP API or Archi's SCMD).
+
+## 12. Later questions (not yet)
 
 - How a message reaches one of the conscious's instances, and the order within a person's line (left
   for the end).
