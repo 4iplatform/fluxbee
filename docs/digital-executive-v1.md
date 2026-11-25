@@ -502,7 +502,7 @@ Options (b), a label over several agents, and (c), one node that does everything
   - **Vouched and claimed:** only a handoff's own `subject.email` is vouched, and a vouched email a
     person of the tenant already has merges the temporary ILK into that person (`MERGED`). An email
     typed in a conversation is `claimed_email`: stored, never merged on.
-  - So what an agent learns in a chat ("soy Ana, mi mail es ana@acme.com") is a claim and joins
+  - So what an agent learns in a chat ("soy Ana, mi mail es `ana@acme.com`") is a claim and joins
     nothing; a join needs what a channel vouches.
 
 ## 21. Notes, 2026-11-25 (later): the general circuit, kept simple
