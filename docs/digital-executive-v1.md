@@ -352,7 +352,37 @@ Options (b), a label over several agents, and (c), one node that does everything
     (`semantic_review_executor_plan`, `src/bin/sy_admin.rs`): the step's fields and their shape
     against the action's help, never a secret's value (A-337).
 
-## 14. Later questions (not yet)
+## 14. Notes, 2026-11-25 (later): the ED is born from Cloud
+
+- **Checks and manifest, as proposed:** a deployment has a small manifest of its own, which is also
+  its record (its owner, the source and its version, the blanks' values, the nodes it made, its
+  history); the concrete desired state is source plus values, computed. Fixed checks first; an AI
+  only where judgment is needed (open).
+- **The ED is born from Fluxbee Cloud.** There its identity data is added, and there the EDs are
+  listed: born, killed, edited and so on, through Cloud's normal path.
+- **Its birth is a fixed CI, a plain ED: the first layer.** Assigning it solutions comes after.
+- **The operator's doubt:** whether to bring everything under capabilities, skills and roles, which
+  were half built in Archi.
+- **Facts read for it (2026-11-25):**
+  - Built: an agent's cognitive definition
+    ([identity-v2.1-agent-definition-addendum](identity-v2.1-agent-definition-addendum.md)). Archi
+    creates role, skill, handbook and personality assets, immutable and named by their hash
+    (`blob://agent-assets/<hash>.json`), and lists, reads and deletes them; SY.admin's
+    `set_ilk_definition` puts the hashes on an agent's ILK; `ai.generic` composes its prompt from
+    them and recomposes it when identity's SHM changes.
+  - A role is what one agent does (one per agent), and Archi's handbook keeps roles reusable: a role
+    names no channel and no tool. "Role" in a company (sales, collections) is another thing with the
+    same word.
+  - "Capability" is no concept in the code.
+  - A solution's manifest refuses an `identity` section, so a solution cannot carry its agents'
+    definitions today: they are set apart, with `set_ilk_definition`.
+  - Cloud's normal path is Cloud → the edge → IO.cloud → SY.admin, over the list of exposed actions
+    ([io-cloud-api](io-cloud-api.md)).
+
+## 15. Later questions (not yet)
+
+- The list of EDs: which side keeps it, Cloud (as it keeps companies and their members) or Fluxbee
+  (the ED's ILK and the CD node's groupings), and what the other reads.
 
 - The line between infra and an ED's deployments: a hive, a tenant's provider key in SY.vault, an
   edge exposure (a solution's manifest declares hives in its topology today).
