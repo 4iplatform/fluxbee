@@ -202,10 +202,33 @@ Options (b), a label over several agents, and (c), one node that does everything
     by thread even with everything into the conscious; the person's line is what joins them, and two
     messages of the same line can run at once in either shape.
 
-## 7. Later questions (not yet)
+## 7. Notes, 2026-11-25 (later): the operator's calls
 
-- The tool that orders the lines, and the person who is two ILKs (D13).
-- Who keeps the ED: a node of its own, or what exists; and where its list of ILKs lives.
+- **A new ILK type for the ED:** yes.
+- **A node of its own gives birth to EDs and manages them.** It groups all of an ED's secondary
+  identity, everything except what identity keeps.
+- **Cognition:** if it has to be touched for this, it is reviewed then. An ED may need one more id
+  in cognition, to group cognition's threads with the same interlocutor and evaluate them together.
+- **Instances:** the conscious runs as several instances of the same agent, each its own ILK in the
+  ED's list (agreed).
+- **Facts read for it (2026-11-25):**
+  - What identity keeps of an ILK (`IlkRecord`, `src/bin/sy_identity.rs`): its id, type,
+    registration status, tenant, identification, definition (the hashes of its role, skills,
+    handbooks and personality), its channels (each with its scope and owner node), and its mark.
+    That is the line between identity and the manager node's secondary identity.
+  - Cognition keys a communication by `(thread_id, agent_ilk)`. It already weighs both
+    interlocutors of a turn, the sender's ILK and the receiver's, for its scope binding
+    (`current_turn_ilk_weights`), but nothing groups communications by person.
+  - The router delivers a resolved message to one node by name (`resolve_by_name`; a name ending
+    in `@*` tries the sender's hive first, then any hive). Nothing picks among several instances, by
+    load or by person.
+
+## 8. Later questions (not yet)
+
+- How a message reaches one of the conscious's instances, and the order within a person's line.
+- The person who is two ILKs (D13).
+- What the manager node keeps, what identity keeps, and where the ED's list of ILKs lives (read by
+  every node: shared memory?).
 - The core: what "something more" holds besides IO and AI (an agenda: the tasks on timers of §1.2?).
 - The company's people and their roles in Fluxbee. An earlier decision to weigh
   ([ilk-tenant-model-v1](ilk-tenant-model-v1.md), the operator 2026-10-14 and 10-15): companies,
