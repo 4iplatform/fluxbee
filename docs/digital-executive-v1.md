@@ -271,7 +271,26 @@ Options (b), a label over several agents, and (c), one node that does everything
     hive's software (core, runtime and vendor updates), not solutions. Nothing records "this
     version of this solution, deployed for this ED, on these nodes".
 
-## 10. Later questions (not yet)
+## 10. Notes, 2026-11-25 (later): growing by parts, and CD without an ED
+
+- **Not one deployment per ED: incremental** (the operator). Several solutions can be deployed into
+  one ED, so it grows by parts without touching what is already deployed; the ED node manages the
+  versions running. (What §9 meant by "one deployment per ED" was only that two EDs never share one
+  deployment; it stands as one deployment per ED and solution.)
+- **The whole CD by the ED node, and its cost** (the operator): then there can be no CD without an
+  existing ED. The operator sees no problem, but it makes the platform rigid; its other side effects
+  are not clear yet.
+- **Facts read for it (2026-11-25), Archi's reconciler today:**
+  - Deploying one solution leaves another's alone: a WF or the user OPA policy is removed only by
+    the solution that declared it (`declared_by == solution_id`), and the reconciler never kills a
+    node that is not in the manifest (a node dropped from a solution keeps running).
+  - The user OPA policy is one for the whole installation: a solution that declares one replaces the
+    one another solution declared, *"the last one applied wins"* (`reconcile_opa`). Two parts of the
+    same ED, each with its own policy, would overwrite each other.
+  - Node names are unique per hive, so a standard solution deployed for two EDs needs its names made
+    per ED.
+
+## 11. Later questions (not yet)
 
 - How a message reaches one of the conscious's instances, and the order within a person's line (left
   for the end).
