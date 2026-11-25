@@ -335,7 +335,24 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Removing what a grouping deployed kills nodes; an ILK with history is disabled, never deleted
     (the operator, 2026-11-11).
 
-## 13. Later questions (not yet)
+## 13. Notes, 2026-11-25 (later): a deployment fills the blanks its solution declares
+
+- **The idea, agreed:** a solution made ahead declares what each deployment must give it (the ED it
+  serves, from which its names come; its connector's credential; whom it escalates to; a business
+  value), and a deployment fills those blanks and nothing more. A different flow is a particular
+  solution: a new source in Archi (CI), deployed the same way. The CD never changes what a solution
+  is; it completes it.
+- **It leaves the operator thinking:** whether a deployment needs a manifest of its own, and maybe a
+  verification by AI.
+- **Facts read for it (2026-11-25), the AI checks that exist:**
+  - Archi's design auditor: an AI that audits a solution's manifest before it is applied and
+    submits a verdict (`run_design_auditor_with_context`, `src/bin/sy_architect.rs`). It looks at
+    the source.
+  - SY.admin's executor reviews each step of a plan with AI before running it
+    (`semantic_review_executor_plan`, `src/bin/sy_admin.rs`): the step's fields and their shape
+    against the action's help, never a secret's value (A-337).
+
+## 14. Later questions (not yet)
 
 - The line between infra and an ED's deployments: a hive, a tenant's provider key in SY.vault, an
   edge exposure (a solution's manifest declares hives in its topology today).
