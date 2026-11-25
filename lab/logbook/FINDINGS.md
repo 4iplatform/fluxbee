@@ -583,7 +583,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-359 🔵 SY.admin's executor gives its model a step's args unmasked when the step asks it to fill a field (low; SY.admin; found by 0.1.152's review; A-337's sibling).
 - A-360 🔵 `node_control_config_set`'s help names `postgres_url` as SY.storage's and SY.identity's secret field, which they refuse (low; SY.admin; found by 0.1.152's review).
 - A-362 🔵 `vault_delete`'s help names `tenant_id` a body field; SY.admin's HTTP route reads it only from the query, so a key of another tenant answers KEY_NOT_FOUND (low; SY.admin; found by 0.1.152's gate).
-- A-363 🔵 io.web is a system node named as an IO node: it should be SY.web (low, naming and model; the operator, 2026-11-25, in the Digital Executive talk).
+- A-363 🔵 io.web and io.cloud are system nodes named as IO nodes: they should be SY.web and SY.cloud (low, naming and model; the operator, 2026-11-25, in the Digital Executive talk).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1661,7 +1661,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-363 [General/io.web] 🔵 low (the operator, 2026-11-25, in the Digital Executive talk; read in the code) — io.web is a system node named as an IO node: it should be SY.web
+### A-363 [General/io.web] 🔵 low (the operator, 2026-11-25, in the Digital Executive talk; read in the code) — io.web and io.cloud are system nodes named as IO nodes: they should be SY.web and SY.cloud
 
 - **What:** io.web is the platform's own: the orchestrator lists it among the core IO runtimes
   (`CORE_IO_RUNTIMES`, `src/bin/sy_orchestrator.rs`, with io.cloud and io.blob), it runs only in the
@@ -1670,6 +1670,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To check before renaming:** what the `IO.` prefix carries besides the name (the edge's
   externalize rule, the router's edge-to-IO path, the policy's prefixes), the edge's proxy target,
   and io.cloud and io.blob, which sit in the same list.
+- **io.cloud too** (the operator, later the same day): it is system, since Fluxbee Cloud does not
+  work without it: `SY.cloud`. Asked whether that holds in an open-source install with no Cloud: it
+  boots with every install today (`boot: true`) and sits UNCONFIGURED and DEGRADED
+  (`missing_edge_node`) until `publish_cloud_endpoint` gives it an edge, so such an install carries
+  it idle. To weigh at the rename: boot it only when Cloud is connected, as io.web runs only where
+  the operator starts it.
 - **Status:** recorded, not scheduled.
 
 ### A-362 [General/admin] 🔵 low (found 2026-11-20 by 0.1.152's gate; seen on 8.x, read in the code; there before it) — `vault_delete`'s help names `tenant_id` a body field, and SY.admin's HTTP route reads it only from the query

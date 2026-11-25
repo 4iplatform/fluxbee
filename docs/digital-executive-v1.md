@@ -431,7 +431,28 @@ Options (b), a label over several agents, and (c), one node that does everything
     gives it to OPA with the ILK's type and definition. A node that answers for an ILK has a place
     there already (for the instances, at the end).
 
-## 17. Later questions (not yet)
+## 17. Notes, 2026-11-25 (later): closed points, and an id across channels
+
+- **Closed:** the CD node is **`SY.deploy`**; Cloud's order goes through SY.admin, as WFs do; the ED
+  is a virtual person, a person's ILK with a flag.
+- **IO.cloud is system** (the operator): Cloud does not work without it, so `SY.cloud`, the same
+  naming slip as io.web (FINDINGS A-363, with the open-source install's question).
+- **The large topic: the mixing of channels,** and the concepts that cross channels, or news. The
+  operator: messages will need another id that joins that, to analyze it as a subdomain of the
+  others.
+- **Facts read for it (2026-11-25):**
+  - A message's meta carries `src_ilk`, `dst_ilk`, `ich`, `thread_id`, the memory package and a
+    `context` (where the trace rides), among others (`Meta`, `crates/fluxbee_sdk/src/protocol.rs`).
+    Its `scope` is the delivery's (`global` for a broadcast), not cognition's.
+  - **The news already crosses channels, by person.** Cognition's news are the episodes of a
+    conversation's people: public gossip, not memories or feelings, kept for the whole
+    installation, fading with time (halved every 7 days), each belonging to its protagonist. An
+    agent gets up to 5 of its conversation's people, by weight, in its memory package, and never
+    passes them on ([cognition-hands-v1](cognition-hands-v1.md) §12.3 and §12.4; package version 5).
+  - What does not cross channels is the rest of the package: memories, feelings and the last turns
+    are per communication `(thread_id, agent ILK)`.
+
+## 18. Later questions (not yet)
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
