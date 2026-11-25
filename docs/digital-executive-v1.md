@@ -505,7 +505,31 @@ Options (b), a label over several agents, and (c), one node that does everything
   - So what an agent learns in a chat ("soy Ana, mi mail es ana@acme.com") is a claim and joins
     nothing; a join needs what a channel vouches.
 
-## 21. Later questions (not yet)
+## 21. Notes, 2026-11-25 (later): the general circuit, kept simple
+
+- **The frontdesk will get complicated** (the operator): until now it is lax, for testing. The
+  channels are there; the process needs reinforcing. Ana would become a "user" of the system, which
+  at first will need a mechanism and maybe an approval. For now, simple: close the general circuit,
+  which the operator believes is built.
+- **It is built (read 2026-11-25):**
+  1. A stranger writes: the IO provisions a temporary ILK for them in its own tenant
+     (`provision_on_miss`).
+  2. The IO's frontdesk gate (io.slack and io.wapp, `nodes/io/common/src/frontdesk_gate.rs`): for a
+     sender not `complete`, it sends the frontdesk a structured handoff with the channel and the
+     address, then delivers the message anyway (a gate that does not hold). Off by default, on with
+     `io.frontdesk.enabled`; its handoff goes as a `user` message since the fix of 2026-10-02.
+  3. A message the router resolves: a temporary sender is forced to the frontdesk.
+  4. The frontdesk registers by command or by chat, merges on a vouched email, never on a claimed one.
+  5. IO.cloud's `register_human` hands a vouched email: Cloud accounts register that way.
+- **What the circuit does not give an ED yet:** the IO's assignment to a person (§19, new config);
+  a join across channels, since the gate's handoff carries no email (fine for now); and **an email
+  IO, which does not exist**: the IO nodes are io.api, io.blob, io.cloud, io.linkedhelper, io.slack,
+  io.wapp and io.web (`nodes/io`).
+
+## 22. Later questions (not yet)
+
+- The frontdesk's reinforced process: a contact who becomes a "user", its mechanism and approval.
+- The ED's email: an email IO.
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
