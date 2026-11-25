@@ -467,7 +467,29 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Cognition analyzes the turns of people with no agent at either end; between agents it keeps only
     the immediate memory ([cognition-hands-v1](cognition-hands-v1.md) §12.3, 2).
 
-## 19. Later questions (not yet)
+## 19. Notes, 2026-11-25 (later): the IO is assigned by configuration
+
+- **Agreed:** in the messages the ED is the person (its IO marks it on the way in, the reply goes out
+  as the ED) and the conscious is the hand that wrote.
+- **By configuration** (the operator): expand the configuration that exists. Assigning an IO to an
+  agent or to an ED is the config's; it is not restricted to an ED: the config assigns the IO to a
+  person's ILK in general, virtual or real.
+- **Facts read for it (2026-11-25):**
+  - The IO family shares one inbound configuration (`InboundConfig`,
+    `nodes/io/common/src/inbound.rs`): its TTL and dedup, `dst_node` (from `io.dst_node`, the node
+    every inbound message goes to), `provision_on_miss`, the blob runtime and the tenant the node
+    runs as. The assigned ILK would sit next to `io.dst_node`.
+  - The same person on two channels of one tenant can already be one ILK: an `ILK_REGISTER` with an
+    email a person of that tenant has merges the temporary ILK into that person (`merge_registration`,
+    `src/bin/sy_identity.rs`; also `ILK_ADD_CHANNEL` with `merge_from_ilk_id`). Only a temporary
+    person of the same tenant merges. D13's open part is across tenants.
+  - Only the frontdesk and the orchestrator may register. A stranger reaches the frontdesk through
+    the router's force rule (a temporary sender goes to the frontdesk), which applies only to a
+    message the router resolves; an IO with `io.dst_node` sends straight to that node, and its own
+    frontdesk gate is off by default (`nodes/io/common/src/frontdesk_gate.rs`). So today a stranger
+    who writes to an agent's IO reaches the agent and stays temporary.
+
+## 20. Later questions (not yet)
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
