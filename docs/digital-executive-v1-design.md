@@ -507,10 +507,11 @@ data, ask what acts on it).
 **The operator's starting point** (2026-11-20): *"tiene identidad reconocida en internet [tal vez
 resolverlo así… (did:web / did:webvh + agent-card.json) + (did:key + Credenciales Verificables)]"*.
 
-**The operator's reference:** a link the operator passes, to add here.
+**Nothing in Fluxbee holds a DID, an agent card or a credential today.**
 
-**Nothing in Fluxbee holds a DID, an agent card or a credential today.** What each piece would be
-for an ED:
+### 12.1 The pieces
+
+What each piece would be for an ED:
 
 - **A DID** (W3C [Decentralized Identifiers v1.0](https://www.w3.org/TR/did-core/)), an identifier
   that resolves to a document with the ED's public keys and endpoints:
@@ -521,24 +522,109 @@ for an ED:
   - **`did:webvh`** ([DIF, v1.0](https://identity.foundation/didwebvh/), formerly `did:tdw`) is
     `did:web` with a verifiable history: a log of the document's versions, with an identifier whose
     security does not rest on DNS.
-  - **`did:key`** (the W3C CCG method) is a public key written as a DID, with nothing to host. It
-    fits signing keys, such as the key that signs the ED's credentials.
-- **An agent card** ([A2A](https://a2a-protocol.org/latest/specification/)) is a JSON document at
-  `https://<domain>/.well-known/agent-card.json` (the path since A2A v0.3; before, `agent.json`). It
-  names the agent, its skills, its endpoints and its security schemes, so other agents can find it
-  and talk to it.
+  - **`did:key`** (the W3C CCG method) is a public key written as a DID, with nothing to host and
+    nothing to pay: an Ed25519 key pair, whose public key is the identifier (`did:key:z6Mk…`).
+    Unreadable to people, and not discoverable on the web by itself.
+- **An agent card** ([A2A 1.0.0](https://a2a-protocol.org/latest/specification/)) is a JSON
+  document at `https://<domain>/.well-known/agent-card.json` (the path since A2A v0.3; before,
+  `agent.json`). It names the agent, its skills, its endpoints and its security schemes, so other
+  agents can find it and talk to it.
 - **Verifiable credentials** ([W3C VC Data Model 2.0](https://www.w3.org/TR/vc-data-model/), a
   Recommendation since May 2025) are signed claims among issuers, holders and verifiers. An example
   is "Laura works for Acme, in sales", issued by Acme and verifiable by anyone.
 
+### 12.2 The operator's ideas (2026-11-25)
+
+The operator brought two methods and a combination, as ideas to adapt.
+
+- **Method 1, a domain and open standards:** `did:web` or `did:webvh` plus `agent-card.json`. It
+  is the freest and most universal method, the one open protocols such as A2A adopt.
+  - **Cost:** a domain, or nothing under a subdomain of the company's own; a free TLS certificate
+    (Let's Encrypt).
+  - **Portability:** total. If the company leaves Fluxbee, it points its DNS or the file elsewhere,
+    and the ED's URL and DID stay the same.
+- **Method 2, keys alone:** `did:key` plus verifiable credentials. The company signs a credential
+  saying the key belongs to its ED.
+  - **Cost:** nothing.
+  - **Portability:** high, since the keys go with the company.
+  - **Limit:** nobody can discover the ED by it alone.
+- **Combined, the recommended architecture.** The domain gives discovery on the web, and the
+  Ed25519 signature gives authenticity that does not depend on Fluxbee.
+
+**Method 1's weak points, and what covers each:**
+
+| Weak point | What covers it |
+| --- | --- |
+| The domain expires or its DNS is hijacked: the identity goes away, or to someone else | Renewal and DNS security are the domain owner's. |
+| Silent changes: the file can be edited with no public trace | `did:webvh`'s history, or signed versions. |
+| A hacked web server changes the card's contacts to impersonate the ED | The card's signature, which only helps when the verifier takes the key from a place the attacker cannot change: `did:webvh`'s log, or a `did:key` the company vouched for in a credential. |
+| Every lookup tells the server who looked, and when (*phone home*) | Inherent to `did:web`. |
+
+**The card is a passport, with the least exposure.**
+
+- **It holds:** the ED's name, a description of its position, its company (`provider`), its
+  skills, its connection URL (`supportedInterfaces`), how to authenticate (`securitySchemes`) and
+  its signatures.
+- **It never holds:** prompts, personality instructions, clients' history, keys or tokens.
+- **No channel in the public card.** A WhatsApp number or an email published on the web is
+  harvested within hours for spam and prompt injection. A2A has two levels for this:
+  1. the public card: who the ED is, the company behind it, and how to start a secure technical
+     contact;
+  2. the extended card: when the public card sets `capabilities.extendedAgentCard`, a caller who
+     authenticates with a scheme the public card declares gets an extended card
+     (`GetExtendedAgentCard`), which may reveal the direct channels and special permissions.
+- **Who reads the card:** machines, not people:
+  - other companies' agents, to learn the ED's skills and how to talk to it;
+  - security gateways and B2B systems, which check the signature before they accept a mail, an
+    invoice or an API call from the ED;
+  - registries and indexes.
+
+**Checked against A2A 1.0.0 (2026-11-25):**
+
+- **Fields:**
+  - The card's required fields are `name`, `description`, `supportedInterfaces`, `version`,
+    `capabilities`, `defaultInputModes`, `defaultOutputModes` and `skills`.
+  - `protocolVersion` goes in each interface, next to its `url` and its `protocolBinding`
+    (`JSONRPC`, `GRPC`, `HTTP+JSON`).
+  - `provider` takes `organization` and `url`.
+  - A skill requires `id`, `name`, `description` and `tags`.
+  - A signature is a JWS (RFC 7515) with `protected` and `signature`.
+
+  The example the operator brought fits all of this.
+- **No plural `/.well-known/agents.json`.** A2A defines only one card per host, at the well-known
+  path, and leaves registries without a standard API. So each ED needs a host of its own, such as
+  `laura.acme.com/.well-known/agent-card.json`, or a registry or direct configuration.
+  `did:web` does allow paths (`did:web:acme.com:agents:laura`).
+- **`securitySchemes` is a wrapper of one scheme kind in 1.0.0.** The OpenAPI-style
+  `{"type": "http", "scheme": "bearer"}` of the operator's example may not be its shape. Check it
+  against the specification at build time, along with the signature's canonicalization (its §8.4).
+
+### 12.3 What it would mean in Fluxbee (ideas for the talk, nothing decided)
+
+- **The card's skills are the ED's responsibilities:** its deployments in SY.deploy, one skill
+  each. They are not an agent's *skills* (identity v2.1), which is the same word with another
+  meaning (§1.1). The card can be generated from the ED's grouping and its profile (position,
+  company).
+- **The card's interface is a channel.** `supportedInterfaces` points at an A2A endpoint into
+  Fluxbee: an A2A IO node, through which other companies' agents talk to the ED. It is one more of
+  its channels (§7), assigned to it like the others.
+- **The extended card's "legitimate client"** is the reinforced contact process of §9: who has
+  proved who they are.
+- **Keys:** the ED's Ed25519 key in SY.vault, in its tenant. For Method 2's portability, the
+  company must be able to take it out.
+- **Hosting:** the company's domain keeps portability. Fluxbee could serve the files through its
+  edge and web node, with SY.admin's own ACME certificates, when the company points a name at the
+  installation; or the company could host static files that Fluxbee generates. `did:webvh` adds
+  its log file to host.
+
 **Open** (a talk of its own, after the review):
 
-- who hosts the DID document and the agent card (Cloud, or the installation's edge through its web
-  node);
-- who holds the keys (SY.vault is the natural custodian);
+- who hosts the DID document and the agent card;
+- who holds the keys, and how the company takes them out;
 - who issues the credentials (the company through Cloud, Fluxbee Cloud itself) and who verifies
   them;
-- how the agent card's skills relate to the ED's responsibilities.
+- the A2A IO;
+- what the extended card reveals, and to whom.
 
 ---
 
