@@ -1,6 +1,9 @@
 # The Digital Executive v1, and the operator's large topics of 2026-11-20
 
-**Status:** talk notes, kept as the talk goes; **no design yet.** The operator, 2026-11-24: the
+**The design:** [digital-executive-v1-design](digital-executive-v1-design.md) puts these notes
+together (2026-11-25, for the panel review). These notes stay as the record of each decision.
+
+**Status:** talk notes, kept as the talk goes. The operator, 2026-11-24: the
 design will not come out at once, the ideas come as everything connects; the details are recorded as
 they are talked, then all reviewed together, and only then a solution is documented. This is the single place for the
 Digital Executive. §1 also keeps the other three large topics the operator raised the same day,
