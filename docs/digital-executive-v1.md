@@ -591,7 +591,29 @@ Options (b), a label over several agents, and (c), one node that does everything
     it, and Fluxbee keeps it because the ED acts on it here (the operator, 2026-10-30: before moving
     data, ask what acts on it).
 
-## 24. Later questions (not yet)
+## 24. Notes, 2026-11-25 (later): born with its company, and identity kept small
+
+- **An ED is born with its company** (the operator): Cloud's request that creates it carries the
+  company. To ask of Cloud's contract when it is written.
+- **The agents' tools are an unfinished topic:** an agent will need tools, mainly. Reading a blob is
+  essential (it exists: `read_blob`); maybe access to the shared memory's data.
+- **Identity owns the people's data, agreed; the question is how it arrives** (another command?).
+  Nothing large in identity for this.
+- **Facts read for it (2026-11-25):**
+  - A person's `identification` is a free JSON object, already filled by Cloud's `register_human`
+    (`phone`, `company_name`, `attributes`), kept in identity's database and its replication; of it,
+    the shared memory holds only the display name and `node_name` (`handler_node`).
+  - The one piece missing is changing it after the registration: `ILK_UPDATE` only adds channels,
+    and only SY.orchestrator may send it.
+  - An agent's tool already goes through SY.admin: `publish_html_page` publishes through SY.admin
+    (`nodes/ai/ai-generic/README.md`).
+  - Reading identity's shared memory is a node's everyday read (the SDK's `resolve_*` functions,
+    `crates/fluxbee_sdk/src/identity.rs`; `ai_node_runner` reads its own definition's hashes), and
+    one of the accepted exceptions to "everything through SY.admin" (the operator, 2026-10-15).
+
+## 25. Later questions (not yet)
+
+- The ED's agents' tools: which ones, and what of the shared memory they read.
 
 - The frontdesk's reinforced process: a contact who becomes a "user", its mechanism and approval.
 
