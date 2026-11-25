@@ -160,9 +160,52 @@ Options (b), a label over several agents, and (c), one node that does everything
   router"*); the AI runtime of the conscious, which today starts turns in arrival order on 4 workers
   with no line per person; or a node of its own.
 
-## 6. Later questions (not yet)
+## 6. Notes, 2026-11-25: a type of its own, the list of its agents, and who keeps it
+
+- **Its name:** from here on the operator calls it the **ED** (its Spanish initials, *Ejecutivo
+  Digital*); so does this doc.
+- **The ids:** the old CTX is deprecated, and cognition's scope will not serve either (the operator).
+  The relation between a person and the ED across channels needs new infrastructure of relations.
+- **Its identity: an ILK, of a type of its own.** It interacts like every other actor, so it is an
+  ILK; it is not a normal agent, so it needs an extra type that tells it apart.
+- **It is a set of agents,** so it holds the list of the ILKs that make it up. That is the new data
+  structure the operator meant on 2026-11-24.
+- **The question to review: who keeps it.** Either a node of its own that manages EDs, where they
+  are created and their solutions, skills, responsibilities and capabilities are associated; or all
+  of it stays in what exists (identity, Archi with its solutions, roles, skills and so on). The
+  operator leans to a node of its own, *"aunque me duele"*.
+- **The conscious's AI node:** either part of a template solution that starts the ED, launched by
+  Archi; or that part is the manager node's, *"casi que mejor"*: the node raises the skeleton empty,
+  and Archi assigns it the infra's tools.
+- **The channels, the problem of 2026-11-24 said plainly:** an ED can handle several channels; the
+  healthier shape is either one agent per IO channel, or everything into the conscious.
+- **Facts and earlier decisions that bear on it (read 2026-11-25):**
+  - The ILK types are a closed set of three, checked by name across `src/bin/sy_identity.rs` and
+    written to identity's SHM as a code each (`SHM_ILK_TYPE_HUMAN`, `_AGENT`, `_SYSTEM`). A fourth
+    type touches identity's rules, its SHM and the nodes that read it.
+  - Identity holds no relation from one ILK to others today. The one ILK-to-ILK link is an alias (a
+    merged temporary pointing at its `canonical_ilk_id`); a tenant's sponsor links tenants. The agent
+    definition's hashes point at assets, not at ILKs.
+  - A list of the nodes that make a whole exists on paper: the solution manifest's `nodes.instances`
+    ([solution-manifest-spec_1](solution-manifest-spec_1.md), partly built). It lists one
+    solution's nodes, not an actor's.
+  - Every user action goes through SY.admin; a node never acts on another node outside the listed
+    exceptions (the operator, 2026-10-15). A manager node would create and change through SY.admin,
+    as Archi does; and whatever it does must be reachable by Archi, the operator's interface, and by
+    Cloud through IO.cloud.
+  - State that every node reads stays in shared memory (the operator, 2026-11-10), as identity's
+    does.
+  - Cognition keys a memory by the ILK of the agent that answered (`CommunicationKey { thread_id,
+    agent_ilk }`, `src/bin/sy_cognition.rs`). A conscious that ran as several instances would split
+    a person's memory by instance today.
+  - In both channel shapes, a person's WhatsApp and email are two threads, so the memory is split
+    by thread even with everything into the conscious; the person's line is what joins them, and two
+    messages of the same line can run at once in either shape.
+
+## 7. Later questions (not yet)
 
 - The tool that orders the lines, and the person who is two ILKs (D13).
+- Who keeps the ED: a node of its own, or what exists; and where its list of ILKs lives.
 - The core: what "something more" holds besides IO and AI (an agenda: the tasks on timers of §1.2?).
 - The company's people and their roles in Fluxbee. An earlier decision to weigh
   ([ilk-tenant-model-v1](ilk-tenant-model-v1.md), the operator 2026-10-14 and 10-15): companies,
