@@ -1,12 +1,20 @@
 # The Digital Executive (ED) v1: the design
 
-**Status:** draft for the panel review, 2026-11-25. Nothing of it is built, and the order of the
-work is not decided: after the review the operator and I choose what to touch first.
+**Status:** draft, reviewed by a panel of five on 2026-11-25. The panel's lenses were the code's
+facts, fidelity to the talk, identity and security, CD and operation, and messaging and cognition.
+Its findings are applied below, and §16 lists them with what each one needs. Nothing is built, and
+the order of the work is not decided: the operator and I choose what to touch first after this.
 
 **Where it comes from:** the talk of 2026-11-20 to 2026-11-25, recorded as it went in
 [digital-executive-v1](digital-executive-v1.md) (cited below as *notes §n*). The notes keep each
-decision in the operator's words and each fact read in the code for it. This document puts them
-together into one design. Where they differ, the later decision holds, and so does this document.
+decision in the operator's words and each fact read in the code for it. Where they differ, the later
+decision holds, and so does this document.
+
+**How to read it:**
+
+- **Decided:** the operator decided it in the talk.
+- **Proposed:** the talk or the panel brought it, and it waits for the operator.
+- **Open:** nobody has an answer yet.
 
 **Its name:** the operator's short name is **ED**, from the Spanish *Ejecutivo Digital*. In sales it
 is the Digital Executive.
@@ -18,22 +26,25 @@ is the Digital Executive.
 Fluxbee does not solve "agents". It groups varied tools to solve complex tasks, imitating people at
 work (the operator, 2026-11-20). An ED is that idea made into an actor:
 
-- **A virtual person.** It has what a person has: a first and last name, a face, an email, a
-  phone, a Slack account, a LinkedIn profile. For every purpose except legal ones, it is a person
-  (notes §16).
+- **A virtual person.** It has a first and last name, a face, an email, a phone, a Slack account and
+  a LinkedIn profile. For every purpose except legal ones, it is a person (notes §16).
 - **One person, one set of channels.** *"Una persona no tiene un wapp por cada rol"*: one WhatsApp,
   one email, one Instagram, whatever it does (notes §4).
-- **Born, then hired.** It is born with the same core as every other ED, from a fixed source: a
-  plain ED. When a company hires it, it gets **responsibilities**. To the operator, a
-  responsibility, a capability and a role in a company are one thing: *"si es responsable es porque
-  tiene la capacidad"*. Each responsibility is a solution deployed into the ED (notes §4, §9, §14).
-- **It grows by parts.** More responsibilities bring more internal agents and flows. An ED is
-  multi-agent, and each part is added without touching the others (notes §4, §10).
+- **Born, then hired.**
+  - **Born** with the same core as every other ED, from a fixed source: a plain ED, born with its
+    company.
+  - **Hired** by a company, which gives it **responsibilities**. To the operator a responsibility, a
+    capability and a role in a company are one thing: *"si es responsable es porque tiene la
+    capacidad"*. Each one is a solution deployed into the ED (notes §4, §9, §14, §24).
+  - How roles and capabilities are ordered is still *"desordenado, para revisar mejor"*. The two
+    levels of §10 are liked a priori (notes §15).
+- **It grows by parts.** More responsibilities bring more internal agents and flows. Each part is
+  added without touching the others (notes §4, §10).
 - **One conscious agent.** One AI agent holds its "soul" and speaks to people. The responsibilities'
   agents work behind it (notes §5).
-- **It works with the company's people.** It knows its boss, and who handles what, so it knows
-  where to pass a problem (notes §4, §22, §23).
-- **Fluxbee Cloud creates it,** for a company. Fluxbee keeps its identity, its deployments and its
+- **It works with the company's people.** It knows its boss and who handles what, so it knows where
+  to pass a problem (notes §4, §23).
+- **Fluxbee Cloud creates it,** for a company. Fluxbee keeps its identity, its deployments and their
   records (notes §14, §15, §24).
 
 The legacy website already sold the idea: *"Digital Workforce, with Digital Executives for concrete
@@ -45,199 +56,355 @@ jobs"* (`docs/website/legacy/preview-3.html`).
 | --- | --- |
 | ED | The virtual person: one ILK of a person, marked virtual (§3). |
 | The conscious | The ED's AI agent that speaks for it. |
-| Responsibility | What the ED is hired to do. One deployed solution, seen from the ED. |
+| Responsibility | What the ED is hired to do: one deployed solution, seen from the ED. |
 | Source | A solution as Archi writes it: a manifest with versions. This is CI. |
 | Deployment | One source's version running, its blanks filled, for one owner. This is CD. |
 | Blanks | What a source declares that each deployment must give it. |
-| Grouping | The *why* of a deployment: the ED it serves, or a test. |
+| Grouping | A deployment's *why*: the ED it serves, infra, or a test. |
 | The pair | Two people who talk, whatever the channel (§8). |
 | Profile | A person's position, boss and responsibilities (§10). |
 
 An agent's *role* and *skills* keep their present meaning: the cognitive definition of an `agent`
 ILK (identity v2.1, Archi's assets). The ED's words were chosen so the two never mix (notes §23).
+The A2A agent card also has *skills* (§12), which are the ED's responsibilities.
 
 ---
 
-## 2. The rules it keeps
+## 2. The rules it keeps, and the ones it changes
 
-Earlier decisions of the operator that this design obeys. Each one is quoted in the notes where it
-was weighed.
+### 2.1 Earlier decisions it keeps
 
-- **Every user action goes through SY.admin.** A node never acts on another node outside the listed
-  exceptions (2026-10-15). An ED's creation, its deployments, and a change to a person's profile all
-  go through SY.admin.
-- **The datum's owner decides** (2026-10-30). The IO owns its thread ids and knows which person it
-  carries. Identity owns a person's data. SY.deploy owns the deployments. Archi owns the sources.
-- **Shared state stays in shared memory** (2026-11-10). What every node reads lives in identity's
-  SHM, and readers read it locally. Reading the identity SHM is one of the accepted exceptions to
-  "through SY.admin".
-- **A tenant is a cost center, not a company** (2026-10-14/15). Cloud keeps companies, members,
-  billing and the law. Fluxbee keeps identity, permissions and what is spent.
-- **Archi is the operator's interface** (2026-11-10). Whatever an operator does with an ED must be
-  reachable by Archi.
-- **ILKs with history are disabled, never deleted.** Only Fluxbee Cloud deletes, and only with a
-  whole tenant (2026-11-11).
-- **No magic automation; operational first.** Transitions are explicit and reported. Simple first,
-  learn, then tune (2026-11-25, notes §23).
+- **Every user action goes through SY.admin.** A node never acts on another outside the listed
+  exceptions (2026-10-15). One exception already exists for Cloud: `register_human` is handled
+  inside IO.cloud, which provisions the person and hands the frontdesk the case directly, without
+  SY.admin (`nodes/io/io-cloud/src/main.rs`).
+- **The datum's owner decides** (2026-10-30):
+  - the IO owns its thread ids and knows the person it carries;
+  - identity owns a person's data;
+  - SY.deploy owns the deployments;
+  - Archi owns the sources.
+- **Shared state stays in shared memory** (2026-11-10). Reading the identity SHM is an accepted
+  exception to "through SY.admin".
+- **A tenant is a cost center, not a company** (2026-10-14/15).
+- **"Si hay algo global que resolver en los hives que sea el router"** (2026-10-16).
+- **A solution runs on one hive** (2026-11-06, [cognition-hands-v1](cognition-hands-v1.md) §12.3).
+- **Archi is the operator's interface** (2026-11-10).
+- **ILKs with history are disabled, never deleted.** Fluxbee Cloud deletes them atomically only with
+  a whole tenant. The operator purges one at a time through SY.admin's HTTP API, Archi's SCMD, or an
+  Archi plan with CONFIRM (2026-11-11 and 2026-11-20).
+- **Between agents, only the immediate memory** (cognition-hands §12.3, 2).
+- **Simple first: learn, then tune** (notes §23).
+
+### 2.2 Earlier decisions it changes (to confirm, each on purpose)
+
+1. **Cloud keeps companies and their members** (2026-10-14/15;
+   [io-cloud-api](io-cloud-api.md) §8; [ilk-tenant-model-v1](ilk-tenant-model-v1.md) §0).
+   - **The change:** an ED is born with its company, and a person's profile names a boss and a
+     position (§10).
+   - **The argument** (notes §23): this is knowledge for the EDs, neither a membership nor a
+     permission. The admin edits it from Cloud, and Fluxbee keeps it because the ED acts on it here.
+2. **Cloud launches IO nodes only so a credential has somewhere to live; solutions are the
+   operator's, through Archi** ([ilk-tenant-model-v1](ilk-tenant-model-v1.md) §7).
+   - **The change:** Cloud orders an ED's birth and its end, and they reach solutions and AI nodes
+     through SY.deploy (notes §14, §16).
+   - **Open:** what becomes of Cloud's `provision_node`.
+3. **One manifest per tenant-solution** ([solution-manifest-spec_1](solution-manifest-spec_1.md)
+   §3).
+   - **The change:** a tenant has many deployments: one per ED and solution.
+4. **A reply never carries the human's ILK as its own** (2026-10-17,
+   [router-stream-v1](router-stream-v1.md) §6.2, pinned by a contract test in
+   `crates/fluxbee_ai_sdk/tests/contracts.rs`).
+   - **The change:** the conscious's replies carry the ED (§7.2), and only the conscious's.
 
 ---
 
 ## 3. The ED's identity: a person with a flag
 
-**The decision** (notes §16, §17): the ED is a person's ILK (`ilk_type` `human`) with a
-**`virtual` flag**. The decision does not add an ILK type.
+**Decided** (notes §16, §17): the ED is a person's ILK (`ilk_type` `human`) with a **`virtual`
+flag**. There is no new ILK type.
 
-- **Why a flag and not a type.** Identity's SHM gives each ILK entry a 16-bit `flags` field
-  (`IlkEntry`, `src/shm/mod.rs`), and one of its free bits carries `virtual`. The layout does not
-  change, and a reader that does not know the bit ignores it. A new type value, by contrast, would
-  read as `unknown` to every router and SDK not yet updated (the fail-safe that keeps an odd byte
-  from ever reading as `system`, `src/router/mod.rs`).
-- **Every rule of a person holds as it is.** It may hold an email, which identity refuses to
-  non-humans today. It holds channels in its tenant's scope, a complete registration, and a tenant
-  it is charged to.
-- **Its channels are its ILK's,** like a person's (notes §16). No two EDs hold the same address.
-  Several EDs may *use* a common one, such as a company's phone, through an IO of its own made for
-  that (§7.4).
-- **Born with its company** (notes §24). Cloud's request that creates an ED names its company and
+- **Why a flag and not a type:**
+  - Identity's SHM gives each ILK entry a 16-bit `flags` field (`IlkEntry`, `src/shm/mod.rs`), in
+    which identity writes only `FLAG_ACTIVE` today. Every reader masks that bit, so a new bit
+    changes no layout, and a reader that does not know it ignores it.
+  - A new type value would read as `unknown` to every router and SDK not yet updated. That is the
+    fail-safe that keeps an odd byte from ever reading as `system` (`src/router/mod.rs`).
+  - **Proposed:** `virtual` gets a constant of its own for ILK entries. The shared `FLAG_DELETED`,
+    `FLAG_STALE` and `FLAG_FROZEN` belong to other tables.
+- **OPA does not see it.** The router's OPA input for an ILK carries its type, tenant, registration,
+  `handler_node` and definition, but no flags. A policy can tell an ED from a person only after a
+  router change.
+- **Born with its company** (notes §24). Cloud's request that creates an ED names the company and
   the tenant it is charged to.
+- **Its channels are its ILK's,** like a person's (notes §16). No two EDs hold the same address.
+  Several EDs may *use* a common one, through an IO of its own (§7.4).
+  - Its channels' credentials in SY.vault are assigned to its IO nodes, since a secret is assigned
+    to a node, never to a person.
 - **Its conscious and its responsibilities' agents are `agent` ILKs,** each with its own node, as
-  today (`derive_ilk_type_for_node`, `src/bin/sy_orchestrator.rs`). The ED's ILK has no node of its
-  own: its IOs carry it, and its conscious speaks for it (§7, §8).
+  today (`derive_ilk_type_for_node`, `src/bin/sy_orchestrator.rs`).
+- **The ED's ILK has no node of its own.** Its IOs carry it, and its conscious speaks for it.
+  io.linkedhelper is a working precedent: it provisions the LinkedIn profile it carries as an ILK
+  with no node, and stamps it on inbound messages.
+- **Its ILK never takes a node's name as its `handler_node`** (Proposed). `handler_node` is a node's
+  key: SY.vault binds secrets with it, and `find_ilk_by_handler_node` (cognition, SY.storage, the
+  orchestrator, SY.admin, ai.generic) returns its first match. If the ED shares its conscious's
+  name, any of them may get the wrong ILK.
 
-**Open:** whether an ED holds a Fluxbee Cloud account. A Cloud account is a person's `cloud`
-channel, created by `register_human`, and it lets that person sign in to Cloud. An ED has no reason
-to sign in. Its birth may need its own path rather than `register_human` (§4).
+### 3.1 Where an ED is not a person (Proposed by the review)
+
+Treating every person's rule as holding for an ED opens two holes the panel found:
+
+- **A merge into an ED.** A stranger gets a temporary ILK on WhatsApp and says "I'm Laura,
+  `laura@acme.com`". If a code is sent to that address, Laura's email IO hands it to her conscious,
+  an LLM, and the stranger can ask it for "the code you just got". The proof passes, and the
+  stranger's WhatsApp merges into Laura's ILK (`merge_registration`, `src/bin/sy_identity.rs`). From
+  then on, the stranger speaks as Laura. A Cloud signup for that address fails the same way: its
+  verification link reaches the same inbox.
+- **Cloud's person actions.** `delete_ilk` and `restore_ilk` take any person, so a delete would mark
+  an ED while its nodes keep running. `set_ilk_tenant` can move an ED to another tenant.
+
+**So:**
+
+- identity refuses any merge into a virtual ILK, by `merge_registration`, by `ILK_ADD_CHANNEL` with
+  `merge_from_ilk_id`, or by `register_human`;
+- no proof code is ever sent to, or accepted for, an address a virtual ILK holds;
+- **an ED holds no Fluxbee Cloud account** (no `cloud` channel);
+- Cloud's person actions refuse a virtual ILK. An ED's life goes only through SY.deploy, and its
+  channels reach it only through SY.deploy and SY.admin.
 
 ---
 
-## 4. Birth, life and death
+## 4. Birth, life and its end
 
 ### 4.1 The path of an order
 
 **Decided** (notes §16, §17): Cloud → the edge → IO.cloud → **SY.admin** → **SY.deploy** →
 SY.admin, once for each step.
 
-1. An admin creates an ED in Fluxbee Cloud: its name, its photo, its company, its channels'
-   addresses, and its boss.
+1. An admin creates an ED in Fluxbee Cloud: its name, its photo, its company, and its channels'
+   addresses. Its position and its boss are given when it is hired (notes §23).
 2. Cloud sends one action through IO.cloud to SY.admin. SY.admin checks that Cloud may send it,
    records it, and hands it to SY.deploy.
 3. SY.deploy reads the plain-ED source from Archi, fills its blanks with what Cloud sent, and builds
-   the plan.
-4. SY.deploy asks SY.admin for each step, in the order the deploy needs. The steps are the ED's ILK
-   with its flag and its profile, the vault keys of its channels, a `run_node` for each IO and for
-   its conscious, and its conscious's definition.
-5. SY.deploy records the deployment, and the answer goes back to Cloud.
+   the steps.
+4. SY.deploy asks SY.admin for each step, in the order the deploy needs:
+   - the ED's ILK, with its flag and its company;
+   - its channels' credentials;
+   - its conscious first, with its definition;
+   - its IOs last, assigned to the ED.
 
-The path is the one WFs already take. SY.admin hands a deploy to SY.wf-rules, and SY.wf-rules
-launches, rebinds, restarts and deletes its WF nodes through SY.admin, which lets it touch only its
-own hive's `WF.*` nodes (`go/sy-wf-rules/node/node_lifecycle.go`,
-[wf-standard-path-v1](wf-standard-path-v1.md)). Archi's plans run the same way: SY.admin's executor
-runs them step by step. One door is kept for Cloud, Archi and the HTTP API alike.
+   The conscious goes first so that no message reaches a node that does not exist yet.
+5. SY.deploy records the deployment.
 
-**To settle:** a birth launches several nodes, which may take longer than one mesh wait. SY.deploy
-probably answers "accepted" with the deployment's id, and Cloud then reads its state.
+The path is the one WFs take: SY.admin hands a deploy to SY.wf-rules, and SY.wf-rules launches,
+rebinds, restarts and deletes its nodes through SY.admin ([wf-standard-path-v1](wf-standard-path-v1.md)).
+One door is kept for Cloud, Archi and the HTTP API alike. The panel found what the comparison hides:
+
+- **SY.deploy needs its own row in SY.admin's mesh list (`mesh_access`).** A new mesh caller is
+  closed until it has one ([control-path-hardening-v1](control-path-hardening-v1.md)).
+  - SY.wf-rules' row admits only `WF.*` nodes of its own hive.
+  - SY.deploy needs AI and IO nodes in users' tenants, on any hive, plus vault keys,
+    `set_ilk_definition` and config writes. Over the mesh, all of these are Archi's alone today.
+  - **Proposed:** its row is bounded to the node names and tenants its recorded deployments hold.
+    Unbounded, SY.deploy would be a second Archi with no operator's CONFIRM.
+- **Nothing in SY.admin creates a person.** `register_human` runs inside IO.cloud. **Proposed:** an
+  action that creates a virtual person, for SY.deploy.
+- **An ED's birth does not fit in one wait.**
+  - The edge gives Cloud 30 s, and IO.cloud waits 20 to 25 s.
+  - The motherbee's orchestrator runs node actions one at a time.
+  - SY.wf-rules budgets 15 s for each `run_node`.
+
+  **Required:** SY.deploy answers *accepted* with the deployment's id, and Cloud reads the state
+  after.
+- **A retry must not birth a second ED.** SY.admin has no dedup of requests. **Required:** an
+  idempotency key from Cloud, its own id for the ED.
 
 ### 4.2 The list, and who sees it
 
-Cloud does not keep the list of EDs (notes §15). SY.deploy keeps the list of the deployments in the
-infra. An ED is one entry, and its responsibilities are listed under it as deployments. SY.admin
-reads the list from SY.deploy and serves it to Cloud, Archi and the HTTP API.
+**Decided** (notes §15): Cloud does not keep the list of EDs.
 
-### 4.3 Editing, killing, disabling
+- SY.deploy keeps the list of the deployments in the infra. An ED is one entry, and its
+  responsibilities are listed under it.
+- SY.admin reads the list from SY.deploy and serves it to Cloud, Archi and the HTTP API.
+- **Open:** whether the ED's list of ILKs must also be in the shared memory, for nodes that read it
+  at each message (notes §26).
+
+### 4.3 Editing, ending, disabling
 
 - **Editing** an ED's data is a change of its profile (§10) or of its channels.
-- **Killing** an ED removes its deployments: SY.deploy removes every node of its grouping (§5.4).
-- Its ILK, and the ILKs of its agents, are **disabled, never deleted** when they have history. Only
-  Cloud deletes, and only with a whole tenant (notes §11 and the deletion rule).
+- **Ending** an ED removes its deployments. Its ILK and its agents' ILKs, which have history, are
+  **disabled, never deleted** (notes §12).
+
+**The panel found that no removal today keeps an ILK:**
+
+- **Freeing a node's name purges its ILK.** `remove_node_instance`, and `kill_node` with purge, go
+  through the orchestrator's `teardown_node`, which marks and then purges the node's ILK and its
+  vault secrets.
+- **Not purging holds the name.** A plain `kill_node` keeps the node's config, so the name stays
+  taken.
+- **A recreate gives the node a new ILK** unless the old one is passed. If an upgrade recreates the
+  conscious, it loses its definition and its memory with every person, which cognition keys by the
+  agent's ILK (§8.3).
+
+**Proposed:**
+
+- a **retire** mode in the orchestrator: stop the node, remove its files, mark its ILK, and never
+  purge;
+- a recreate that passes the old `ilk_id`.
+
+**What an ending leaves:** exposures are Cloud's alone, so SY.deploy cannot unpublish them. Pages
+stay until their fixed expiry, and the answer names them. Cognition's rows outlive the ILKs
+(A-159).
+
+**Nodes record who launched them,** in `_system.launched_by` (`cloud`, `archi`, `operator`, or the
+caller's name). Cloud's node actions reach only the nodes Cloud launched. The nodes SY.deploy
+launches carry its name, so Cloud's own node actions do not reach them: an ED's nodes change only
+through SY.deploy.
 
 ---
 
 ## 5. SY.deploy: the node of the CD
 
 **Decided** (notes §11, §12, §16, §17): one node is responsible for every CD of user solutions,
-**`SY.deploy`**. It began as "the ED's node". It became the CD's node, and the ED became one kind of
-deployment: *"eso me cierra más"*.
+**`SY.deploy`**. It began as "the ED's node". It became the CD's node, and the ED became a kind of
+grouping: *"eso me cierra más"*.
 
 ### 5.1 What it does
 
-- Takes orders from SY.admin: deploy, upgrade, remove, list, and read one deployment.
-- Reads Archi's sources (CI) and computes each deployment's desired state as the source plus the
-  blanks' values.
-- Builds the plan and asks SY.admin for each step. Archi's reconciler is made of pure functions, so
-  it can be shared or moved (`src/bin/sy_architect/reconciler.rs`).
-- Keeps each deployment's manifest and its history (§5.3), and the list of the infra's deployments.
-- Is a system node (`SY.`): it is infra. Everything it deploys is a user's (notes §12).
+- **Takes orders from SY.admin:** deploy, upgrade, remove, list, and read one deployment.
+  - The names `list_deployments` and `get_deployments` are taken: they read the orchestrator's
+    software history.
+- **Reads Archi's sources (CI)** and computes each deployment's desired state as the source plus
+  its blanks' values.
+- **Builds the steps** and asks SY.admin for each.
+- **Keeps** each deployment's manifest, its history, and the list.
+- **Is a system node** (`SY.`), part of the infra. What it deploys is a user's (notes §12).
+
+**What the panel found about building the steps:**
+
+- **Archi's reconciler is pure, but only its delta is.** Archi turns the delta into a plan with its
+  LLM plan compiler (`run_plan_compiler_transaction`, `src/bin/sy_architect.rs`). The admin steps
+  of each change class are named without their arguments (`compiler_class_admin_steps`). The
+  reconciler has no section for an ILK, a vault key, a definition or a profile, and it refuses
+  `identity`.
+- **So SY.deploy needs a deterministic step builder,** with exact arguments, and reconcile sections
+  for what an ED holds. **Proposed.**
+- **Two ways to run the steps, which behave differently.** To choose. **Open:**
+  - **through SY.admin's executor:**
+    - only Archi may call it over the mesh;
+    - it refuses to run without SY.admin's AI, even with nothing to fill;
+    - it reviews every step with a model call, so an upgrade of 100 EDs costs hundreds of calls and
+      stops when the AI key fails;
+  - **step by step,** as SY.wf-rules does: no AI review.
 
 ### 5.2 What it does not do
 
-- **The platform's software.** The package installs the core (SY.*, RT.*) and boots the system IO
-  nodes. Runtimes grow by publishing and `SYSTEM_UPDATE`, and the orchestrator keeps that history
-  per hive (`packaging/base-nodes.json`). That path stays as it is.
+- **The platform's software.** The package installs the core and boots io.cloud and io.blob;
+  io.web runs where the operator starts it. Runtimes grow by publishing and `SYSTEM_UPDATE`, and the
+  orchestrator keeps that history per hive. That path stays as it is.
 - **Loose launches.** A `run_node` for debugging or maintenance is Archi's, and Archi removes it
-  after (notes §12). *"No deployments a lo loco"*: everything that runs for a user runs as a
-  solution.
+  after (the operator imagines so, notes §12). *"No deployments a lo loco"*: what runs for a user
+  runs as a solution.
 - **CI.** Sources, versions and the catalog stay with Archi (notes §9).
 
 ### 5.3 A deployment's manifest, which is its record
 
-Nothing running today records who deployed it. SY.wf-rules keeps no owner for a WF, and a node
-carries no owner at all. Archi infers which solution a WF or the user policy belongs to by matching
-its saved manifests against what runs (`wf_declared_by`, `opa_policy_declared_by`). A deployment's
-manifest (notes §13, §14) holds:
+Nodes record who launched them, not which solution or why. Archi infers which solution a WF or the
+user policy belongs to by matching its saved manifests against what runs (`wf_declared_by`,
+`opa_policy_declared_by`).
 
-- **its owner, the grouping of its why:** "ED Laura, collections". It lets anyone list at a glance
-  what runs and why (notes §12);
+**Decided** (notes §12, §13, §14): a deployment's manifest is also its record, and holds:
+
+- **its owner, the grouping of its why:** "ED Laura, collections", so anyone can list at a glance
+  what runs and why;
 - **its tenant;**
-- **its source and version:** "collections v3";
+- **its source and version,** pinned with the content's hash (Proposed);
 - **its blanks' values;**
-- **the nodes it made;**
+- **the nodes it made,** with their ILKs;
 - **its history:** applied, upgraded and removed, when, and by whom.
 
 The concrete desired state is computed from the source and the values; nobody writes it by hand.
-Archi owns the source, and SY.deploy owns the deployment's manifest.
+
+**Proposed by the review, for operation:**
+
+- **A journal written before each step,** with deterministic node names and ILK ids. A restart of
+  SY.deploy, or of the motherbee during a core deploy, then never leaves a node it does not know of.
+- **A retry re-reads the state and converges,** rather than replaying the steps.
+- **A lock per grouping,** so that a Cloud edit during an upgrade is not written back over by the
+  upgrade's older view.
+- **A check of the records against what runs,** after a restored motherbee snapshot.
+- **Where SY.deploy runs** (the motherbee, as SY.admin does), how its state persists, and its
+  backup. Open.
 
 ### 5.4 Groupings
 
-Groupings sit at the same level as one another (notes §11, §12):
+**Decided** (notes §11, §12): the why groups deployments, all at the same level.
 
 - **ED:** tied to the ED's ILK. Its first deployment is the plain ED, and each responsibility is one
   more deployment.
+- **Infra:** what a user needs to run an ED with its own solutions (§6.4).
 - **Test:** what a gate deploys, removed as a whole when the test is done.
-- More kinds when they appear. Removing a grouping removes everything it deployed.
+- More kinds when they appear. Removing a grouping removes all it deployed.
 
 Each ED needs its own connector to its company's CRM: nothing is shared between EDs (notes §12). A
 resource common to several EDs, such as the company's phone, is an IO made for that (§7.4).
 
 ### 5.5 Checks
 
-Most checks are fixed checks, run before a plan (notes §13, §14):
+**Proposed** (notes §13, §14): fixed checks first, before any step:
 
 - every blank is filled;
 - the keys a blank names exist in SY.vault, in the ED's tenant;
-- the ILKs a blank names exist (the boss, for one);
-- the node names are free on the hive.
+- the ILKs a blank names exist, **in the deployment's tenant** (the boss, for one);
+- the node names are free.
+  - A WF's name is installation-wide, since a WF package is refused while any hive runs
+    `WF.<name>`.
+  - The name grammar is lowercase with no hyphens, so a person's first name collides across
+    companies. **Proposed:** names come from a short unique id.
+- the hive has room (§5.7).
 
-Two AI reviews already exist and stay where they are:
+Archi's design auditor reviews a source before it is applied. SY.admin's executor reviews each step
+of a plan it runs (A-337); with steps sent one by one, no step is reviewed (§5.1). A new AI check
+inside SY.deploy, only where judgment is needed, is **open**.
 
-- **Archi's design auditor** reviews a source before it is applied
-  (`run_design_auditor_with_context`).
-- **SY.admin's executor** reviews each step of a plan against the action's help, and never sees a
-  secret's value (`semantic_review_executor_plan`, A-337).
+### 5.6 Growing by parts, and what is shared
 
-A new AI check inside SY.deploy is open. It would cover only what needs judgment, such as whether
-30 days of arrears suits this solution.
+**Decided** (notes §10): several solutions are deployed into one ED, and each is upgraded alone.
 
-### 5.6 Growing by parts, and its known conflict
-
-Several solutions are deployed into one ED, and each is upgraded alone (notes §10). Archi's
-reconciler already leaves another solution alone in most ways:
+Archi's reconciler already leaves another solution's parts alone in two ways:
 
 - it removes a WF or the user policy only when the solution that declared them removes them;
-- it never kills a node that is not in the manifest.
+- it never kills a node missing from the manifest, so a node dropped from a solution keeps running.
 
-One thing blocks growing by parts: **the user OPA policy is one for the whole installation.** A
-solution that declares one replaces the policy another solution declared: *"the last one applied
-wins"* (`reconcile_opa`). This is a pending topic of its own (notes §11).
+**What is shared and gets in the way:**
+
+| Shared thing | What happens with two deployments |
+| --- | --- |
+| The user OPA policy, one for the installation | The last one applied wins (`reconcile_opa`). A topic of its own (notes §11). |
+| Routes, keyed by hive and prefix | The last one applied wins, and removing one ED's route breaks the other's. |
+| VPN rules, keyed by pattern | The last one applied wins. |
+| A runtime's `current` version | Upgrading it for one ED moves every ED's nodes at their next restart. |
+| Node names | Archi's reconciler takes any running node with a declared name as its own and pushes its config. An Archi solution, or an operator's config write, can rewrite an ED's node, and the next upgrade reverts it. |
+
+**Proposed:**
+
+- blanks cover routes and VPN patterns, or SY.deploy refuses sources that declare them;
+- runtime versions are pinned per deployment;
+- Archi refuses nodes that SY.deploy records, and refuses to apply sources with blanks;
+- reading a deployment shows its drift.
+
+### 5.7 Capacity
+
+The panel's numbers:
+
+- **The limits:** a router holds at most 1024 nodes, and the installation at most 1024 remote nodes
+  (`MAX_NODES`, `MAX_REMOTE_NODES`, `src/shm/mod.rs`). Past them, link-state writes fail.
+- **What that allows:** at about five nodes for the plain ED and two for each responsibility, about
+  150 EDs.
+- **One hive per ED:** a solution runs on one hive, so an ED's deployments sit on its conscious's
+  hive.
+
+**Proposed:** each grouping has a fixed hive, and SY.deploy checks capacity before it deploys.
 
 ---
 
@@ -245,51 +412,61 @@ wins"* (`reconcile_opa`). This is a pending topic of its own (notes §11).
 
 ### 6.1 Source and deployment
 
-A solution is two things (notes §9):
+**Decided** (notes §9). A solution is two things:
 
-- **the source,** what Archi writes: today a versioned manifest (`SolutionManifestV2`), kept per
-  `solution_id` with one file per version;
-- **the deployment,** the nodes that run it, with their ILKs, on one hive and charged to one tenant.
+- **the source:** what Archi writes. Today it is a versioned manifest (`SolutionManifestV2`), kept
+  per `solution_id` with one file per version;
+- **the deployment:** the nodes that run it, with their ILKs, on one hive, charged to one tenant.
 
 For an ED, "solution" means the deployment. One ED has many deployments, and two EDs never share
 one.
 
+**Versions** (Proposed by the review). Every save in Archi makes a new version (`v<epoch ms>`), and
+none is marked released, so "the latest" can be a draft from the middle of a talk. The proposal:
+
+- SY.deploy deploys **released versions only,** pinned by version and content hash;
+- a blank a new version adds carries **a default,** or every upgrade waits for each ED's value;
+- **an upgrade of many EDs goes in waves,** paced so it does not fill the orchestrator's queue,
+  and stops on failure;
+- **a rollback** deploys the previous pinned version.
+
 ### 6.2 Three layers
 
-The operator confirmed these layers (notes §9, §14):
+**Decided** (notes §9, §14):
 
-1. **Native:** the plain ED, a fixed source that every ED is born from. It holds the ED's ILK, an
-   IO for each of its channels, and its conscious. It deploys like any other source, so a new
-   version of the plain ED reaches every ED by an ordinary CD.
+1. **Native:** the plain ED, a fixed source every ED is born from. It brings the ED's ILK, an IO for
+   each channel and its conscious, deployed like any source. A new version of it reaches every ED
+   by an ordinary CD, in waves.
 2. **Standard:** a template from Archi's catalog, made ahead for EDs, given to an ED when it is
    hired, and to others.
-3. **Particular:** made to measure by Archi for one ED. It is a new source, deployed the same way.
+3. **Particular:** made to measure by Archi for one ED, as a new source deployed the same way.
 
 ### 6.3 Blanks
 
-A source made ahead declares what each deployment must give it, and a deployment fills those blanks
-and nothing more (notes §13). For "collections v3", the blanks are:
+**Decided** (notes §13): a source made ahead declares what each deployment must give it, and a
+deployment fills those blanks and nothing more. For "collections v3":
 
-- the ED it serves (its node names come from it, distinct per ED: `AI.collections.pedro`);
+- the ED it serves, from which its node names come (§5.5);
 - its CRM connector's credential, a key in SY.vault in the ED's tenant;
 - whom it escalates to;
 - a business value, such as the days of arrears before a call.
 
-A different flow is a particular solution: a new source, written by Archi. The CD never changes what
-a solution is. It only completes it.
+A different flow is a particular solution: a new source. The CD never changes what a solution is.
 
 **What the source format needs:**
 
-- **Blanks.** The manifest has no parameters today: node names and configs are written out. The
-  only template today is a runtime's, which a node's config is written from at launch.
-- **Its agents' definitions.** A responsibility's agents need their role, skills and handbooks
-  (identity v2.1). A manifest refuses an `identity` section today, so these are set apart with
-  `set_ilk_definition`.
+- **Blanks.** A manifest has no parameters today: names and configs are written out. The only
+  template today is a runtime's, from which a node's config is written at launch.
+- **An identity part.** The plain ED brings an ILK, and a responsibility's agents need their role,
+  skills and handbooks (identity v2.1). A manifest refuses an `identity` section, so today these are
+  set apart, with `set_ilk_definition`.
 
 ### 6.4 What is infra
 
-Infra is everything a user needs to run an ED with its own solutions (notes §12). It is the system's,
-not a user's deployment. Where the line falls is open for three things:
+**Decided** (notes §11, §12): infra is everything a user needs to run an ED with its own solutions,
+and it is one of the groupings (§5.4).
+
+**Open:** the line between infra and an ED's deployments, for three things:
 
 - a hive (a manifest declares hives in its topology today);
 - a tenant's provider key in SY.vault;
@@ -302,44 +479,87 @@ not a user's deployment. Where the line falls is open for three things:
 ### 7.1 Assigned by configuration
 
 **Decided** (notes §19): a person's channels are carried by IO nodes, each **assigned by
-configuration** to the person it carries. The assignment is not restricted to EDs: the config can
+configuration** to the person it carries. The assignment is not restricted to EDs: the config may
 name any person's ILK, real or virtual.
 
-- The IO family shares one inbound configuration (`InboundConfig`,
-  `nodes/io/common/src/inbound.rs`): TTL, dedup, `dst_node` (from `io.dst_node`),
-  `provision_on_miss`, the blob runtime, and the node's own tenant. The assigned ILK sits next to
-  `io.dst_node`.
-- The ED's first layer sets both fields: the assigned ILK is the ED, and `dst_node` is its
-  conscious.
+- **Where it goes.** io.slack, io.wapp, io.api and io.sim share one inbound configuration
+  (`InboundConfig`, `nodes/io/common/src/inbound.rs`): TTL, dedup, `dst_node` (from `io.dst_node`),
+  `provision_on_miss`, the blob runtime and `self_tenant_id`. The assigned ILK sits next to
+  `io.dst_node`. io.linkedhelper reads its own `adapter.dst_node`.
+- **For an ED,** the first layer sets the ED as the assigned ILK and its conscious as `dst_node`.
+- **Proposed:** the assigned ILK must be charged to the IO's own tenant, the same rule io.api
+  applies to a `by_ilk` subject (`validate_explicit_subject_ilk`).
 
 ### 7.2 What the messages carry
 
 **Decided** (notes §18, §19): in the messages, **the ED is the person, and the conscious is the
 hand that wrote.**
 
-- **Today:**
-  - an inbound message carries the writer's ILK as `src_ilk` and no `dst_ilk`
-    (`build_inbound_user_message_to_router`);
-  - an agent's reply carries the person as `dst_ilk` and the agent node's own ILK as `src_ilk`,
-    stamped by the runtime (`build_reply_meta`, `crates/fluxbee_ai_sdk/src/message.rs`).
+**Today:**
 
-  So the far end of a conversation is a node, not the person it speaks for.
-- **Then:**
-  - an IO assigned to a person stamps that person as `dst_ilk` on the way in;
-  - the conscious's reply goes out as the ED, and the node that wrote it stays named as the hand
-    (the message's trace and cognition's hands already name it).
+- **Inbound.** io.slack and io.wapp build each inbound message in
+  `InboundProcessor::process_message_parts` (`nodes/io/common/src/inbound.rs`), with the writer's
+  ILK as `src_ilk` and no `dst_ilk`. io.linkedhelper already stamps the profile it carries as
+  `dst_ilk`: a working precedent.
+- **Reply.** `build_reply_meta` (`crates/fluxbee_ai_sdk/src/message.rs`) sets the person as
+  `dst_ilk` and clears `src_ilk`. Then `stamp_reply` (`crates/fluxbee_ai_sdk/src/runtime.rs`) sets
+  the agent node's own ILK as `src_ilk`, if empty, and names it as `meta.context.writer`.
+- **The router binds the sending node's name** (`routing.src_l2_name`) to its socket. It **does not
+  bind `src_ilk` to the sender**: it reads it as given ([control-path-hardening-v1](control-path-hardening-v1.md)).
+  io.api's own comment says its `by_ilk` is safe only while no consumer treats a forwarded `src_ilk`
+  as an authenticated principal (`nodes/io/io-api/src/main.rs`).
+
+**Then:**
+
+- **An IO assigned to a person stamps that person as `dst_ilk`** on the way in.
+- **The conscious's reply carries the ED as `src_ilk`.** **Proposed by the review**, since the
+  natural way to build it is a hole:
+  - **Where the ED comes from.** The ED the conscious speaks as comes **from its own config**,
+    written by SY.deploy and checked there: virtual, and in the same tenant. It is never copied from
+    the incoming message. Copying it, the mirror of `build_reply_meta`, would let whoever writes a
+    `dst_ilk` choose who an agent speaks as, a real person included.
+  - **Who stamps it.** The runtime stamps the ED on that node's replies only. The responsibilities'
+    agents never stamp it, and no node ever replies as a real person.
+  - **The rule changed** (§2.2, 4) and its contract test change on purpose.
+- **A person's `src_ilk` is accepted only from the person's IO, or from that person's registered
+  hand.** **Proposed by the review.**
+  - **Why.** Once an ED acts on who is talking (its boss asks it to approve a refund), an unbound
+    `src_ilk` is a hole: any node, in any tenant, could write as the boss.
+  - **The model.** SY.vault's binding of a caller to its node (`check_caller_binding`,
+    `src/bin/sy_vault.rs`), placed in the router, which is the place for what is global (§2.1).
+  - **io.api.** Its `by_ilk` refuses virtual ILKs.
+- **The hand stays recorded** in four places:
+  - `routing.src_l2_name`, bound by the router;
+  - the trace entry's `from`;
+  - `meta.context.writer`, which SY.storage keeps as `writer_ilk` and `writer_name`;
+  - cognition's `agent_node`.
+- **What the writer names is open, and it matters** (§8.2):
+  - **If it stays the conscious,** cognition reads the ED's words as an agent's on any path that
+    keeps the writer (a WF's forward, for one). They are not analyzed and give no feelings.
+  - **If it becomes the ED,** the node is named only by `routing.src_l2_name` and the trace.
 
 ### 7.3 The email
 
 An ED has an email, no matter what (notes §22). **No email IO exists.** The IO nodes are io.api,
-io.blob, io.cloud, io.linkedhelper, io.slack, io.wapp and io.web. So an email IO is part of the
-ED's native layer.
+io.blob, io.cloud, io.linkedhelper, io.slack, io.wapp, io.web and the simulator io.sim. An email IO
+is part of the ED's native layer.
+
+**Today an email is an `identification` field, not a channel** (`src/bin/sy_identity.rs`). An email
+IO's sender ids must match the address registered on the person, or every message by email is a
+stranger.
 
 ### 7.4 A common channel
 
-Two EDs never hold the same number, but they may use a common one, such as the company's phone.
-That takes an IO of its own, made as a common resource (notes §16). **Open:** whose deployment
-that IO is, and which ED answers a message that comes in through it.
+**Decided** (notes §16): two EDs never hold the same number, but they may use a common one, such
+as the company's phone, through an IO of its own made as a common resource.
+
+**Open:** whose deployment that IO is, and which ED answers what comes in through it.
+
+### 7.5 Who writes through an ED's IOs
+
+A WF's `send_message` to an IO names no `src_ilk`, and its writer is the WF
+(`go/nodes/wf/wf-generic/node/actions.go`). If a responsibility's WF writes to people through the
+ED's IO, it does not speak as the ED. **Open:** who may write through an ED's IOs, and as whom.
 
 ---
 
@@ -347,51 +567,107 @@ that IO is, and which ED answers a message that comes in through it.
 
 ### 8.1 The pair
 
-**Decided** (notes §17, §18): conversations are joined by **the pair**: two people, real or
-virtual, whatever the channel.
+**Decided** (notes §17, §18):
 
-- **Who pairs with whom:**
-  - a person and an ED: Ana and Laura;
-  - two EDs: Laura in sales and Martín in projects, who settle by chat and then by email whether a
-    billing is approved;
-  - two people the system sees talk.
-- **The id is the same from both sides.** {Laura, Martín} joins their Slack and their email.
-- **It is computed, not stored.** Once both people ride in the message (§7.2), the pair comes from
-  `src_ilk` and `dst_ilk`.
-- **Each side keeps its own memory of the other.** What Laura remembers of Martín is Laura's. The
-  pair joins the channels, and the owner keeps the memories apart: today's rule, that memory belongs
-  to whoever serves the conversation.
+- **Start with the pair:** a person and an ED, and two EDs too. The operator's example: Laura in
+  sales and Martín in projects settle by chat, and maybe by email after, whether a billing is
+  approved.
+- **The id.** The operator expects the messages to carry another id that joins a pair's channels,
+  to analyze them as a subdomain of each communication.
+
+**Proposed in the talk:**
+
+- **The same id from both sides:** {Laura, Martín} joins their Slack and their email.
+- **Computed, not stored,** from `src_ilk` and `dst_ilk` once both people ride in the message (§7.2).
+- **Each side keeps its own memory of the other.** What Laura remembers of Martín is Laura's. The id
+  joins the channels, and the owner keeps the memories apart.
+
+**What the panel found:**
+
+- **Each IO names its senders inside itself.**
+  - io.slack builds a sender's external id as `<node name>:<user>`.
+  - io.wapp builds it as `<phone_number_id>:<wa_id>`, under the stated rule that two IO nodes
+    messaged by the same customer must resolve to two identities.
+  - The lookup is tenant-scoped.
+- **So, today:**
+  - Ana writing to Laura and to Martín is two ILKs, and Ana on two channels is two ILKs, until a
+    frontdesk merge on a vouched email joins them.
+  - Laura's address seen by Martín's IO resolves to a new temporary ILK, never to Laura.
+  - Across tenants, one ED never finds the other.
+- **The pair holds only within one tenant, and after a merge,** unless the IOs assigned to a person
+  resolve their senders across the tenant, which reverses the per-IO rule. **Open.**
 
 ### 8.2 What cognition does today
 
-- **Memory, feelings and last turns are per communication `(thread_id, agent ILK)`**
-  (`CommunicationKey`, `src/bin/sy_cognition.rs`). A thread is per channel and interlocutor, so
-  Ana's WhatsApp and Ana's email are two memories.
-- **The news already cross channels, by person.** A news item is an episode of a conversation's
-  people: public gossip, not memories or feelings. It is kept for the whole installation, fades with
-  time, and belongs to its protagonist. An agent gets up to 5, and never passes them on
-  ([cognition-hands-v1](cognition-hands-v1.md) §12).
-- **Cognition analyzes the turns of people,** and between agents it keeps only the immediate memory
-  (cognition-hands §12.3, 2). Once EDs ride as people (§7.2), an ED–ED talk is a person–person talk
-  that cognition already analyzes.
+- **Memory, feelings and the last turns are per communication.**
+  - The key is `(thread_id, agent ILK)` (`CommunicationKey`, `src/bin/sy_cognition.rs`).
+  - The agent ILK is the ILK of the node that produced the turn.
+  - The router finds a package by `(thread_id, agent_node)`.
+  - Only a thread's first agent takes it, and each agent sees only its own.
+- **The news cross channels, by person.** A news item is an episode: public gossip about a
+  conversation's people, kept for the whole installation, fading with time, belonging to its
+  protagonist. An agent gets up to 5 ([cognition-hands-v1](cognition-hands-v1.md) §12).
+- **Whether a person is at the other end** is decided from the writer first (`meta.context.writer`),
+  and only then from the ILKs. A turn written by an agent is not analyzed: between agents there is
+  only the immediate memory.
+
+**So two of the talk's expectations do not hold as they were said:**
+
+- **An ED–ED talk is not "a person–person talk cognition already analyzes".**
+  - The conscious is the writer of each reply, so its turns read as an agent's.
+  - The analysis of an ED–ED talk works only where the receiving IO resolves the other ED's address
+    to its ILK, which the per-IO naming of §8.1 prevents.
+  - Analyzing ED–ED talks changes the rule "between agents, only the immediate memory". **Open,**
+    with cognition.
+- **On the ED's side, the episodes name the conscious, not the ED.**
+  - Cognition takes the holding agent's ILK as one of an episode's people, and narrates it as "the
+    agent".
+  - So the episodes of Laura's conversations are about {the conscious, Ana}, never {Laura, Ana}, and
+    never reach a conversation where Laura is the party.
 
 ### 8.3 What changes in cognition
 
-The operator expects cognition to need **one more id when an ED is involved**: it groups an ED's
-threads with the same person, so they are analyzed together as a subdomain of each communication
-(notes §7, §17). This is reviewed with cognition when it is touched. Two points to verify:
+The operator expects cognition to need one more id when an ED is involved, to group an ED's threads
+with the same person and analyze them together (notes §7, §17). Reviewed with cognition when it is
+touched. What the panel settled for that review:
 
-- with the reply going out as the ED (§7.2), whose ILK keys the memory: the ED's or the
-  conscious's node's;
-- what of the package (memories, feelings, turns) the pair brings across channels.
+- **The memory follows the node, whatever `src_ilk` says.**
+  - The ED on the reply does not change whose memory it is.
+  - With several instances, each instance is its own node, with its own ILK and its own memory of
+    Ana, and its package carries only the turns it handled.
+  - The pair's id still works across instances, because it comes from the message; the memory does
+    not follow it.
+  - For an ED's instances to share memory, **cognition's key and the router's package lookup move
+    from the node to the ED.**
+- **Cognition takes the ED in place of the agent's ILK** for episodes, for the narrator, and for
+  whose news a package carries.
+- **News whose protagonist is virtual** reach every tenant today, since news are filtered by person
+  and not by tenant. Either they stay in the ED's tenant, or the operator accepts it. **Open.**
+- **Cognition's tuned numbers move.**
+  - With the ED in every turn's ILKs, the ILK similarity of a person's turn and its answer goes
+    from 0.707 to 1.0, so scopes unbind less.
+  - Each context and reason gains weight for the ED.
+
+  Benign, but to know.
 
 ### 8.4 What waits
 
-- **A matter that spans several people** (order #123, with Ana by WhatsApp and her boss by email).
-  It needs judgment to assign a message to a matter, so it would come later as cognition's analysis
-  inside each pair, like today's contexts (notes §17).
-- **The person who is two ILKs** (D13). Within one tenant, the merge already joins them (§9).
-  Across tenants it stays open.
+- **A matter spanning several people,** such as order #123, with Ana by WhatsApp and her boss by
+  email. Proposed in the talk: it needs judgment to assign a message to a matter, so it would come
+  later, as cognition's analysis inside each pair. **Open.**
+- **The person who is two ILKs** (D13): within one tenant a merge joins them (§9); across tenants it
+  stays open.
+
+### 8.5 Two EDs that answer each other
+
+`ai.generic` answers every user message, and each inbound message starts a new cycle, with a new
+trace and a TTL of 16. Two EDs that answer each other by email or WhatsApp loop without end.
+
+- **Today the only stop is Slack's,** and only by accident: io.slack drops every post that has a
+  `bot_id`, so an ED–ED talk in Slack never arrives at all.
+
+**Required before ED–ED talk is enabled:** something that stops such an exchange, and a decision on
+Slack's filter.
 
 ---
 
@@ -401,104 +677,147 @@ threads with the same person, so they are analyzed together as a subdomain of ea
 
 1. **A stranger writes.** The IO provisions a temporary ILK for them in its own tenant
    (`provision_on_miss`).
-2. **The IO's frontdesk gate** (io.slack and io.wapp, `nodes/io/common/src/frontdesk_gate.rs`): for
-   a sender who is not `complete`, it sends the frontdesk a structured handoff with the channel and
-   the address, then delivers the message anyway. The gate is off by default and turned on with
-   `io.frontdesk.enabled`.
-3. **The router's force rule:** a message the router resolves, from a temporary sender, goes to the
-   frontdesk.
+2. **The IO's frontdesk gate** (io.slack and io.wapp, `nodes/io/common/src/frontdesk_gate.rs`).
+   - **What it does:** for a sender who is not `complete`, it hands the frontdesk the channel and the
+     address, then delivers the message anyway.
+   - **When:** it is off by default, and turned on with `io.frontdesk.enabled`.
+3. **The router's force rule** sends a temporary sender to the frontdesk.
+   - It applies only to a message the router resolves.
+   - An ED's IOs set `dst_node`, so their messages are never resolved: the rule never applies to an
+     ED's channels. For an ED, only the IO's gate involves the frontdesk.
+   - If they were moved to the router's resolve, every temporary sender would go to the frontdesk
+     first, which contradicts "the ED does the human part". With no user policy loaded, everything
+     else would be dropped.
 4. **SY.frontdesk.gov is the one registrar.** It registers by command (`frontdesk_handoff`, taken
    only from an `IO.` sender) or by chat (its own LLM and `ilk_register`).
-5. **Vouched and claimed.** A handoff's own email is vouched, and a vouched email a person of the
+5. **Vouched and claimed.** A handoff's own email is vouched. A vouched email that a person of the
    tenant already has merges the temporary ILK into that person (`MERGED`). An email typed in a chat
-   is claimed: it is stored, and nothing merges on it.
-6. **Cloud's `register_human`** hands a vouched email.
+   is claimed, and nothing merges on it.
+6. **Cloud's `register_human`** hands a vouched email, through IO.cloud straight to the frontdesk
+   (§2.1).
 
 **For an ED** (notes §20, §21):
 
-- **The ED does the human part.** "¿Con quién hablo?", as a person would. The frontdesk stays the
+- **The ED does the human part,** "¿con quién hablo?", as a person would. The frontdesk stays the
   one registrar.
-- **A join needs what a channel vouches.** "Soy Ana, mi mail es `ana@acme.com`" is a claim. A code
-  sent to that address and repeated in the WhatsApp is a proof. Who sends the frontdesk that proof
-  is open; the IO already may, and it owns the channel's datum.
-- **For now, simple.** The process will be reinforced later: a contact who becomes a "user" of the
-  system will need a mechanism, and maybe an approval.
+- **For now, simple.** A join across a contact's channels is fine to leave for later. Later, the
+  process is reinforced: a contact who becomes a "user" of the system will need a mechanism, and
+  maybe an approval.
+- **Never a proof through an ED's own mailbox** (§3.1). How a contact's channels are joined is
+  **open**.
+- **Identity trusts an IO by its name's prefix.** Any `IO.*` node may add an address to any ILK, and
+  may vouch an email in a handoff. That is fine while every IO is Fluxbee's own code. Before IOs
+  come from Archi's particular sources or from packages, the IO's tenant must match the target's.
+  **Proposed.**
 
 ---
 
-## 10. People, their positions and responsibilities
+## 10. People: their positions and responsibilities
 
 ### 10.1 What the ED needs
 
 An ED needs to know its boss, and who in its company handles what, so it can pass a problem on.
-Start simple, learn and tune, but with all of it: the hierarchy, the responsibilities, and the
-capabilities the assigned solutions make explicit (notes §23). Identity v3's claims stay out for
-now.
+
+The operator: start simple, learn and tune, but with all of it (notes §23):
+
+- the hierarchy;
+- the responsibilities;
+- the capabilities that the assigned solutions make explicit.
+
+Identity v3's claims stay out for now.
 
 ### 10.2 What exists, and what is not touched
 
 - **Identity v2's roles and capabilities:** retired, never built. Identity rejects `roles` and
   `capabilities` ([history/10-identity-v2](history/10-identity-v2.md)).
 - **Identity v2.1's agent definition:** built. An `agent` ILK's role, skills, handbooks and
-  personality are named by hash (§1.1). It is not touched.
+  personality are named by hash. Not touched.
 - **Identity v3's claims and recognition:** drafted on 2026-04-13, not built
-  ([future_implementations/10-identity-v3](future_implementations/10-identity-v3.md)). This
-  document leaves them as the later direction.
-- **A relation between two people** (a boss, who reports to whom) exists in no design and no code.
+  ([future_implementations/10-identity-v3](future_implementations/10-identity-v3.md)). Left as the
+  later direction.
+- **A relation between two people,** a boss or who reports to whom, exists in no design and no
+  code.
 
 ### 10.3 The profile
 
-A person's profile is for people only, real or virtual, never for an agent node:
+**Proposed in the talk** (notes §23), for the review:
 
-- **position:** free text, such as "sales manager";
-- **reports to:** another person's ILK. This is the hierarchy;
-- **responsibilities:** short free texts;
-- for an ED, **capabilities are not typed:** they are its deployments in SY.deploy, each with its
-  why;
-- the company, given at birth (§3).
+- **For people only,** real or virtual, never for an agent node.
+- **Position:** free text, such as "sales manager".
+- **Reports to:** another person's ILK, in the same tenant. This is the hierarchy.
+- **Responsibilities:** short free texts.
+- **An ED's capabilities are not typed:** they are its deployments in SY.deploy, each with its why.
+- **The company** comes at birth (§3). The position and the boss come when it is hired.
 
-The texts are free and there is no catalog: learn first. This is knowledge for the EDs, neither a
-membership nor a permission. That keeps the decision of 2026-10-14/15: the admin edits it from
-Cloud, and Fluxbee keeps it because the ED acts on it here (the operator, 2026-10-30: before moving
-data, ask what acts on it).
+The texts are free and there is no catalog: learn first. It is knowledge for the EDs, neither a
+membership nor a permission, and an exception to the decision of 2026-10-14/15 (§2.2, 1).
 
 ### 10.4 Where it lives, and how it travels
 
-**Decided** (notes §24, §25): **identity owns it, and nothing large changes in identity.**
+**Decided** (notes §24, §25):
 
-- **Stored with the person** in identity's database, as identity keeps the person's other data.
-  Cloud's `register_human` already stores `phone`, `company_name` and a free `attributes` object in
-  the person's `identification`.
-- **Projected to a blob the agents read:** `people/<ilk_id>/<version>.json`, one file per person
-  and version, written once. A change is a new version.
-- **Named in the SHM.** Each `IlkEntry` ends in 8 reserved bytes, written as zeros and read by
-  nobody. They hold the profile's version (0 means none). The ILK id is already in the entry, so id
-  and version name the file. There is no new field and no new SHM version (today 6, with the 1160-byte
-  `IlkEntry` that the Go SDK mirrors).
-- **Changed by one command.** Today nothing changes a person after registration: `ILK_UPDATE` only
-  adds channels, and only SY.orchestrator may send it. It would also take the profile, from
-  SY.admin, which exposes one action to Cloud and Archi. At birth, the profile comes in the creation
-  itself.
-- **Read locally.** An agent's tool reads the SHM entry, then reads the file with `read_blob`. There
-  is no request to anyone.
-- **Syncthing's lag** (A-338). On another hive, the SHM can name a version whose file has not
-  arrived yet. Old versions stay, so a reader takes the newest one present.
+- identity owns it;
+- nothing large changes in identity;
+- the extra data goes in a blob that agents read, and the shared memory keeps its name.
+
+**Proposed** (notes §25 and the review), each to confirm:
+
+- **Its own typed field on the person,** in identity's database, with its replication. Never inside
+  `identification`:
+  - a repeated `ILK_REGISTER` replaces `identification` whole, so a repeated `register_human` would
+    wipe a profile kept there;
+  - `identification.node_name` becomes the SHM's `handler_node`;
+  - `identification.email` drives merges.
+- **One file per version,** written once. A change is a new version.
+- **Its name in the SHM.**
+  - The blob store names files flat, `<name>_<hash16>.<ext>`, and checks the content against that
+    hash. It refuses `/`, and allows only `[A-Za-z0-9._-]` (`crates/fluxbee_sdk/src/blob/mod.rs`).
+  - So the 8 reserved bytes at the end of each `IlkEntry` hold the profile's **16-hex hash
+    prefix**: exactly 8 bytes. The file name is fixed from it, such as `profile-<uuid>_<hash16>.json`.
+  - The bytes are written as zeros and read by nobody today. The size stays 1160 and the SHM version
+    stays 6, in its three copies: `src/shm/mod.rs`, the Rust SDK's `identity.rs` and the Go SDK's
+    `identity_shm.go`.
+  - The value lives in the database record, since the SHM is rebuilt from it.
+- **Not through `read_blob`.**
+  - `read_blob`'s model is that a blob's name is the permission to read it, from any tenant (A-106),
+    and every node reads every tenant's SHM.
+  - A name computed from the SHM would make one company's org chart readable to another's
+    prompt-injected agent.
+  - So the profiles live in a folder of their own, outside `read_blob`'s namespace, like Archi's
+    agent assets. The motherbee sends that folder, and the spokes only receive it. It is exempt
+    from the blob GC, which, when enabled, reaps active blobs older than 30 days.
+  - **A people tool** reads them and serves only the ILKs whose SHM `tenant_id` is the agent's own.
+- **Changed by one command, scoped by tenant.**
+  - **No command today edits a person field by field:** a re-registration replaces
+    `identification` whole, and `ILK_UPDATE` only adds channels, from SY.orchestrator, to its own
+    hive's nodes.
+  - **The new command:**
+    - takes the profile from **exactly `SY.admin@motherbee`** (as `ILK_RETIRE_HIVE` does);
+    - answers *not found* unless the person and the boss are charged to the envelope's tenant;
+    - SY.admin exposes it to Cloud and Archi as one action.
+  - **Who adds channels:** SY.orchestrator alone, as today.
+  - **At an ED's birth** the company comes in the creation itself.
+- **Syncthing's lag** (A-338). On another hive the SHM can name a file that has not arrived yet.
+  **Open:** the tool answers "not yet", or the record keeps the previous hash to fall back on.
 
 ---
 
 ## 11. The ED's agents
 
-- **The conscious:** one agent, dedicated to the interaction (notes §5). Its personality is the
-  ED's: who it is (nationality, languages, time zone, background). It comes in the native layer.
-- **The responsibilities' agents:** they come with their solutions, each with its own ILK and
-  definition. They are listed in the ED's grouping in SY.deploy (notes §6, §9).
-- **Their tools are an unfinished topic** (notes §24). The base tools are the thread state, the
-  artifact generators, `get_current_time`, `read_blob`, and the HTML pages
-  (`docs/reference/agent-tools.json`). An ED needs at least a people tool ("my boss", "who in my
-  tenant handles X"), reading the SHM and the profile blobs. An agent's tool may already go through
-  SY.admin, as `publish_html_page` does.
+- **The conscious:** one agent, dedicated to the interaction (notes §5).
+  - Its personality is the ED's: who it is (nationality, languages, time zone, background).
+  - It comes in the native layer: the node raises the skeleton empty, and Archi assigns it the
+    infra's tools (notes §6).
+- **The responsibilities' agents** come with their solutions, each with its own ILK and definition.
+  They are listed under the ED's grouping in SY.deploy.
+- **Their tools are an unfinished topic** (notes §24).
+  - **Today:** the base tools are the thread state, the artifact generators, `get_current_time`,
+    `read_blob` and the HTML pages (`docs/reference/agent-tools.json`). An agent's tool may go
+    through SY.admin, as `publish_html_page` does.
+  - **The ED needs at least a people tool** (§10.4): "my boss", "who in my tenant handles X".
+  - **Thread-state tools are per node,** so instances do not share them.
 - **The conscious as several instances** of the same agent is agreed (notes §7). How a message
-  reaches one, and the order within a person's line, waits for the end (§13).
+  reaches one, and the order of a person's line, wait for the end (§13).
 
 ---
 
@@ -511,44 +830,44 @@ resolverlo así… (did:web / did:webvh + agent-card.json) + (did:key + Credenci
 
 ### 12.1 The pieces
 
-What each piece would be for an ED:
-
-- **A DID** (W3C [Decentralized Identifiers v1.0](https://www.w3.org/TR/did-core/)), an identifier
-  that resolves to a document with the ED's public keys and endpoints:
+- **A DID** (W3C [Decentralized Identifiers v1.0](https://www.w3.org/TR/did-core/)) is an
+  identifier that resolves to a document with the ED's public keys and endpoints. Three methods
+  matter here:
   - **`did:web`** ([the method](https://w3c-ccg.github.io/did-method-web/)) is anchored in a domain:
     `did:web:<domain>` resolves to `https://<domain>/.well-known/did.json`, and
-    `did:web:<domain>:<path>` to `https://<domain>/<path>/did.json`. It is simple, and as strong as
-    the domain and its web server.
+    `did:web:<domain>:<path>` to `https://<domain>/<path>/did.json`. It is simple, and only as strong
+    as the domain and its web server.
   - **`did:webvh`** ([DIF, v1.0](https://identity.foundation/didwebvh/), formerly `did:tdw`) is
-    `did:web` with a verifiable history: a log of the document's versions, with an identifier whose
-    security does not rest on DNS.
+    `did:web` with a verifiable history: a hash-chained, signed log of the document's versions, with
+    a self-certifying id. Its history can be verified without trusting the web host, though it
+    still resolves through the domain over HTTPS.
   - **`did:key`** (the W3C CCG method) is a public key written as a DID, with nothing to host and
-    nothing to pay: an Ed25519 key pair, whose public key is the identifier (`did:key:z6Mk…`).
-    Unreadable to people, and not discoverable on the web by itself.
+    nothing to pay. It is an Ed25519 key pair whose public key is the identifier (`did:key:z6Mk…`),
+    with no key rotation. It is unreadable to people, and not discoverable on the web by itself.
 - **An agent card** ([A2A 1.0.0](https://a2a-protocol.org/latest/specification/)) is a JSON
-  document at `https://<domain>/.well-known/agent-card.json` (the path since A2A v0.3; before,
-  `agent.json`). It names the agent, its skills, its endpoints and its security schemes, so other
-  agents can find it and talk to it.
-- **Verifiable credentials** ([W3C VC Data Model 2.0](https://www.w3.org/TR/vc-data-model/), a
-  Recommendation since May 2025) are signed claims among issuers, holders and verifiers. An example
-  is "Laura works for Acme, in sales", issued by Acme and verifiable by anyone.
+  document at `https://<domain>/.well-known/agent-card.json` (the path since A2A v0.3; before, it
+  was `agent.json`). It names the agent, its skills, its endpoints and its security schemes, so
+  other agents can find it and talk to it.
+- **Verifiable credentials** ([W3C VC Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/), a
+  Recommendation since May 2025) are signed claims among issuers, holders and verifiers. An example:
+  "Laura works for Acme, in sales", issued by Acme and verifiable by anyone.
 
 ### 12.2 The operator's ideas (2026-11-25)
 
 The operator brought two methods and a combination, as ideas to adapt.
 
 - **Method 1, a domain and open standards:** `did:web` or `did:webvh` plus `agent-card.json`. It
-  is the freest and most universal method, the one open protocols such as A2A adopt.
+  is the freest and most universal method, and the one open protocols such as A2A adopt.
   - **Cost:** a domain, or nothing under a subdomain of the company's own; a free TLS certificate
     (Let's Encrypt).
   - **Portability:** total. If the company leaves Fluxbee, it points its DNS or the file elsewhere,
     and the ED's URL and DID stay the same.
 - **Method 2, keys alone:** `did:key` plus verifiable credentials. The company signs a credential
-  saying the key belongs to its ED.
+  that says the key belongs to its ED.
   - **Cost:** nothing.
   - **Portability:** high, since the keys go with the company.
   - **Limit:** nobody can discover the ED by it alone.
-- **Combined, the recommended architecture.** The domain gives discovery on the web, and the
+- **The two combined, the recommended architecture:** the domain gives discovery on the web, and the
   Ed25519 signature gives authenticity that does not depend on Fluxbee.
 
 **Method 1's weak points, and what covers each:**
@@ -557,22 +876,22 @@ The operator brought two methods and a combination, as ideas to adapt.
 | --- | --- |
 | The domain expires or its DNS is hijacked: the identity goes away, or to someone else | Renewal and DNS security are the domain owner's. |
 | Silent changes: the file can be edited with no public trace | `did:webvh`'s history, or signed versions. |
-| A hacked web server changes the card's contacts to impersonate the ED | The card's signature, which only helps when the verifier takes the key from a place the attacker cannot change: `did:webvh`'s log, or a `did:key` the company vouched for in a credential. |
+| A hacked web server changes the card's contacts to impersonate the ED | The card's signature. It helps only when the verifier takes the key from a place the attacker cannot change: `did:webvh`'s log, or a `did:key` the company vouched for in a credential. |
 | Every lookup tells the server who looked, and when (*phone home*) | Inherent to `did:web`. |
 
 **The card is a passport, with the least exposure.**
 
-- **It holds:** the ED's name, a description of its position, its company (`provider`), its
-  skills, its connection URL (`supportedInterfaces`), how to authenticate (`securitySchemes`) and
-  its signatures.
+- **It holds:** the ED's name, a description of its position, its company (`provider`), its skills,
+  its connection URL (`supportedInterfaces`), how to authenticate (`securitySchemes`) and its
+  signatures.
 - **It never holds:** prompts, personality instructions, clients' history, keys or tokens.
-- **No channel in the public card.** A WhatsApp number or an email published on the web is
-  harvested within hours for spam and prompt injection. A2A has two levels for this:
-  1. the public card: who the ED is, the company behind it, and how to start a secure technical
-     contact;
-  2. the extended card: when the public card sets `capabilities.extendedAgentCard`, a caller who
+- **No channel goes in the public card.** A WhatsApp number or an email published on the web is
+  harvested within hours, for spam and prompt injection. A2A has two levels for this:
+  1. **The public card:** who the ED is, the company behind it, and how to start a secure technical
+     contact.
+  2. **The extended card:** when the public card sets `capabilities.extendedAgentCard`, a caller who
      authenticates with a scheme the public card declares gets an extended card
-     (`GetExtendedAgentCard`), which may reveal the direct channels and special permissions.
+     (`GetExtendedAgentCard`). It may reveal the direct channels and special permissions.
 - **Who reads the card:** machines, not people:
   - other companies' agents, to learn the ED's skills and how to talk to it;
   - security gateways and B2B systems, which check the signature before they accept a mail, an
@@ -581,47 +900,56 @@ The operator brought two methods and a combination, as ideas to adapt.
 
 **Checked against A2A 1.0.0 (2026-11-25):**
 
-- **Fields:**
-  - The card's required fields are `name`, `description`, `supportedInterfaces`, `version`,
-    `capabilities`, `defaultInputModes`, `defaultOutputModes` and `skills`.
-  - `protocolVersion` goes in each interface, next to its `url` and its `protocolBinding`
-    (`JSONRPC`, `GRPC`, `HTTP+JSON`).
-  - `provider` takes `organization` and `url`.
-  - A skill requires `id`, `name`, `description` and `tags`.
-  - A signature is a JWS (RFC 7515) with `protected` and `signature`.
+- **The card's fields.** Its required fields are `name`, `description`, `supportedInterfaces`,
+  `version`, `capabilities`, `defaultInputModes`, `defaultOutputModes` and `skills`.
+- **Each interface** carries its own `protocolVersion`, next to its `url` and its `protocolBinding`
+  (`JSONRPC`, `GRPC` or `HTTP+JSON`).
+- **`provider`** takes `organization` and `url`.
+- **A skill** requires `id`, `name`, `description` and `tags`.
+- **A signature** is a JWS (RFC 7515) with `protected` and `signature`.
+- The example the operator brought fits all of the above, with two exceptions:
+  - **There is no plural `/.well-known/agents.json`.** A2A defines only one card per host, at the
+    well-known path, and leaves registries without a standard API. So each ED needs a host of its
+    own, such as `laura.acme.com/.well-known/agent-card.json`, or a registry, or direct
+    configuration. `did:web` does allow paths (`did:web:acme.com:agents:laura`).
+  - **In 1.0.0, `securitySchemes` wraps one scheme kind.** The OpenAPI-style
+    `{"type": "http", "scheme": "bearer"}` of the example may not be its shape. Check it against the
+    specification at build time, along with the signature's canonicalization (its §8.4).
 
-  The example the operator brought fits all of this.
-- **No plural `/.well-known/agents.json`.** A2A defines only one card per host, at the well-known
-  path, and leaves registries without a standard API. So each ED needs a host of its own, such as
-  `laura.acme.com/.well-known/agent-card.json`, or a registry or direct configuration.
-  `did:web` does allow paths (`did:web:acme.com:agents:laura`).
-- **`securitySchemes` is a wrapper of one scheme kind in 1.0.0.** The OpenAPI-style
-  `{"type": "http", "scheme": "bearer"}` of the operator's example may not be its shape. Check it
-  against the specification at build time, along with the signature's canonicalization (its §8.4).
+### 12.3 What it means in Fluxbee
 
-### 12.3 What it would mean in Fluxbee (ideas for the talk, nothing decided)
+**Decided** (the operator, 2026-11-25; notes §27):
 
-- **The card's skills are the ED's responsibilities:** its deployments in SY.deploy, one skill
-  each. They are not an agent's *skills* (identity v2.1), which is the same word with another
-  meaning (§1.1). The card can be generated from the ED's grouping and its profile (position,
-  company).
-- **The card's interface is a channel.** `supportedInterfaces` points at an A2A endpoint into
-  Fluxbee: an A2A IO node, through which other companies' agents talk to the ED. It is one more of
-  its channels (§7), assigned to it like the others.
-- **The extended card's "legitimate client"** is the reinforced contact process of §9: who has
-  proved who they are.
-- **Keys:** the ED's Ed25519 key in SY.vault, in its tenant. For Method 2's portability, the
+- **It shares data with identity.** Part of the card comes from what §10 keeps on the person: its
+  name, its position and its company. That overlap is why the operator wanted it in this design.
+- **Private data stays private, and people are the standard.** An ED exposes what a person would
+  expose, and nothing more.
+- **Everything is served by Fluxbee, through the edge.**
+
+**Proposed** (ideas for the talk):
+
+- **The card's skills are the ED's responsibilities:** its deployments in SY.deploy, one skill each.
+  They are not an agent's *skills* (identity v2.1). The card can be generated from the ED's grouping
+  and its profile.
+- **The card's interface is a channel.** `supportedInterfaces` is required, and points at an A2A
+  endpoint into Fluxbee, through which other companies' agents talk to the ED. It is one more of the
+  ED's channels (§7), assigned like the others, and subject to §8.5. The first draft named a new A2A
+  IO node; the operator asked to simplify it (notes §27). The simplest candidate is io.api: it is
+  already the HTTP door through the edge, with a bearer of its own and a subject ILK in its tenant.
+  An A2A adapter in io.api would serve the A2A methods. **Open.**
+- **The extended card's "legitimate client"** is the reinforced contact process of §9: someone who
+  has proved who they are.
+- **Keys:** the ED's Ed25519 key goes in SY.vault, in its tenant. For Method 2's portability, the
   company must be able to take it out.
-- **Hosting:** the company's domain keeps portability. Fluxbee could serve the files through its
-  edge and web node, with SY.admin's own ACME certificates, when the company points a name at the
-  installation; or the company could host static files that Fluxbee generates. `did:webvh` adds
-  its log file to host.
+- **Hosting through the edge:** the company points a name of its own at the installation, such as
+  `laura.acme.com`. The edge serves the card and the DID document there, with SY.admin's own ACME
+  certificate. `did:webvh` adds its log file to serve.
 
 **Open** (a talk of its own, after the review):
 
-- who hosts the DID document and the agent card;
+- which node serves the well-known files behind the edge;
 - who holds the keys, and how the company takes them out;
-- who issues the credentials (the company through Cloud, Fluxbee Cloud itself) and who verifies
+- who issues the credentials (the company through Cloud, or Fluxbee Cloud itself), and who verifies
   them;
 - the A2A IO;
 - what the extended card reveals, and to whom.
@@ -630,49 +958,74 @@ The operator brought two methods and a combination, as ideas to adapt.
 
 ## 13. Open questions
 
-Kept for later, each with where it was raised:
-
-1. **The instances and the line,** left for the end (notes §8, §19). How a message reaches one of
-   the conscious's instances, and how one person's messages keep their order:
-   - `ai.generic` runs 4 turns at once and queues 128, with no order per conversation (notes §5);
-   - the router delivers to one node by name;
-   - the operator dislikes the router deciding anything about load;
-   - an ILK's `handler_node` already reaches OPA, a possible place for "who answers for this person".
-2. **The user OPA policy, one for the installation** (§5.6).
-3. **The matter across people,** and **D13 across tenants** (§8.4).
-4. **The common channel:** whose it is, and who answers (§7.4).
-5. **The frontdesk's reinforced process:** a contact who becomes a "user" (§9).
-6. **An AI check of deployments** (§5.5).
-7. **The ED's Cloud account,** and its birth path against `register_human` (§3).
-8. **Its identity on the internet** (§12).
-9. **The agents' tools** (§11).
-10. **"Something more" in the core:** IO + AI + something Fluxbee builds that is useful (notes §4).
+1. **The instances and the line,** left for the end (notes §5, §6, §7, §8, §26):
+   - how a message reaches one of the conscious's instances, and how one person's messages keep
+     their order;
+   - the operator wants this done by a tool of the system's own, never a WF, and dislikes the router
+     deciding anything about load;
+   - each instance is its own ILK in the ED's list, and today each holds its own memory (§8.3);
+   - `ai.generic` runs 4 turns at once and queues 128, with no order per conversation;
+   - the router delivers to one node by name.
+2. **What the writer names** on the conscious's replies (§7.2).
+3. **Cognition's key and the router's package lookup,** from the node to the ED (§8.3).
+4. **ED–ED talk:**
+   - loops (§8.5);
+   - Slack's bot filter (§8.5);
+   - per-IO naming of senders (§8.1);
+   - analysis between agents (§8.2).
+5. **The mixing of channels,** and analysis beyond today's cognition (notes §16, §17).
+6. **The user OPA policy,** one for the installation, and the other shared things (§5.6).
+7. **How SY.deploy runs its steps:** the executor or one by one (§5.1). Also where it runs, and its
+   state's persistence (§5.3).
+8. **The matter across people,** and **D13 across tenants** (§8.4).
+9. **The common channel:** whose it is, and who answers (§7.4). **Who writes through an ED's
+   IOs** (§7.5).
+10. **The frontdesk's reinforced process,** and how a contact's channels are joined (§9).
+11. **An AI check of deployments** (§5.5).
+12. **Its identity on the internet** (§12).
+13. **The agents' tools** (§11).
+14. **"Something more" in the core:** IO + AI + something Fluxbee builds that is useful (notes §4).
     One candidate is the tasks on timers (notes §1.2).
-11. **The line between infra and an ED's deployments** (§6.4).
-12. **Identity v3's claims,** when simple is not enough (§10).
+15. **The line between infra and an ED's deployments** (§6.4).
+16. **Where the ED's list of ILKs lives,** and whether nodes read it in the shared memory (§4.2).
+17. **Roles and capabilities, to review better** (notes §15), and **identity v3's claims** when
+    simple is not enough (§10).
+18. **Cloud's flow for hiring:**
+    - assigning responsibilities and solutions;
+    - what Cloud stores;
+    - Cloud's contract (create with the company, hire, assign, list, edit, end);
+    - what becomes of `provision_node` (§2.2, 2).
+19. **The ED's permissions** (notes §26).
+20. **Where sources live,** as a repository with versions: Archi's solutions chapter (notes §8).
+21. **News about a virtual protagonist** across tenants (§8.3).
+22. **The profile file's lag** across hives (§10.4).
 
 ---
 
 ## 14. What it touches
 
-This is an inventory for choosing what to touch first, not an order:
+This is an inventory for choosing what to touch first, not an order.
 
 | Part | What changes |
 | --- | --- |
-| SY.identity | The `virtual` flag bit. The profile: stored, projected to the blob, its version in the SHM's reserved bytes. `ILK_UPDATE` takes the profile from SY.admin. |
-| SY.admin | The ED's actions handed to SY.deploy. The deployments' list and reads. The profile's change. Their exposure to IO.cloud and Archi. |
-| SY.deploy | New: deployments, their manifests and history, groupings, checks, plans run through SY.admin. |
-| Archi | Sources with blanks, the plain-ED source, a catalog for EDs, its agents' definitions in a source, and cleaning up its loose launches. |
-| The reconciler | Shared with SY.deploy, or moved to it. |
-| The IO family | The assigned ILK in `io.*`; `dst_ilk` stamped on the way in; a new email IO; the common-resource IO. |
-| The AI SDK and ai.generic | The reply goes out as the person, with the hand named; a people tool reading the SHM and the profile blobs. |
-| SY.cognition | Grouping by pair (§8.3). |
+| SY.identity | The `virtual` bit with its own constant. Merges into a virtual ILK refused. Cloud's person actions refuse it. The profile as its own field, its file, and its hash in the reserved bytes. A profile command scoped by tenant, from exactly `SY.admin@motherbee`. |
+| The router | A person's `src_ilk` accepted only from the person's IO or registered hand. Maybe the `virtual` bit in OPA's input. The package lookup by ED, for instances. |
+| SY.admin | A bounded `mesh_access` row for SY.deploy. A "create a virtual person" action. The ED's actions handed to SY.deploy. The deployments' list. The profile action. Their exposure to IO.cloud and Archi. |
+| SY.deploy | New: deployments, manifests, journal and history, groupings, a deterministic step builder, checks, waves, capacity. |
+| SY.orchestrator | A retire mode that never purges. A recreate that keeps the ILK. |
+| Archi | Sources with blanks and an identity part, released versions, the plain-ED source, a catalog for EDs. Refusing SY.deploy's nodes and sources with blanks. Cleaning up its loose launches. |
+| The reconciler | Shared with SY.deploy, or moved to it, with sections for an ED. |
+| The IO family | The assigned ILK in `io.*`, in the IO's tenant. `dst_ilk` stamped on the way in. Sender resolution for IOs assigned to a person. A new email IO. The common-resource IO. Slack's bot filter. Matching the IO's tenant before IOs come from packages. |
+| io.api | `by_ilk` refuses virtual ILKs. |
+| The AI SDK and ai.generic | The ED stamped from the conscious's config. The writer's choice. The contract test changed. A stop for ED–ED loops. A people tool. |
+| SY.cognition | Grouping by pair. The memory keyed by ED. The ED in episodes, the narrator and news. News of a virtual protagonist. |
+| The blob tree | A profiles folder outside `read_blob`'s, sent by the motherbee, exempt from the GC. |
 | SY.frontdesk.gov | Later (§9). |
-| Fluxbee Cloud's contract | Create an ED with its company; list, edit, and kill. |
-| The SDKs' SHM readers | The `virtual` bit and the profile's version. |
+| Fluxbee Cloud's contract | Create with the company and an idempotency key, answered *accepted*. Hire, assign, list, edit, end. |
+| The SHM readers (three copies) | The `virtual` bit, and the profile's hash. |
 
-**Also recorded:** io.web and io.cloud are system nodes and should be `SY.web` and `SY.cloud`
-(FINDINGS A-363).
+**Also recorded:** io.web and io.cloud are system nodes and should be `SY.web` and `SY.cloud`, with
+the open-source install's question (FINDINGS A-363).
 
 ---
 
@@ -683,3 +1036,80 @@ Each gets a talk of its own (notes §1):
 - IO nodes from a package;
 - tasks on timers;
 - a conversation viewer in Archi, from Fluxbee Cloud's team's `tools/visor-casos`.
+
+---
+
+## 16. The panel review (2026-11-25)
+
+Five reviewers read the first draft against the code and the notes, each through one lens. Each
+heading below names its lens.
+
+### 16.1 Facts
+
+- **One blocker:** the profile's blob name. Blob names are flat and hashed, so the first draft's
+  `people/<ilk>/<version>.json` could not exist (§10.4).
+- **Five majors:**
+  - a re-registration does edit a person;
+  - nodes do record who launched them;
+  - the inbound function the draft cited is unused, and io.linkedhelper is a precedent;
+  - cognition reads the writer first;
+  - IO.cloud's `register_human` skips SY.admin.
+- **Minors and §12 corrections:**
+  - the VC 2.0 link;
+  - `did:webvh` still resolves through the domain.
+
+### 16.2 Fidelity
+
+- **Proposals stated as decisions:** the pair's details, the profile's shape and its command.
+- **ED–ED analysis against cognition's rule.**
+- **Infra dropped as a grouping.**
+- **Unstated changes to earlier decisions:** companies in Cloud, Cloud's role, one manifest per
+  tenant. Now listed in §2.2.
+- **Open points missing from §13.**
+
+### 16.3 Identity and security
+
+- **High:** an unbound `src_ilk` becomes something EDs act on (§7.2).
+- **High:** a stranger can merge into an ED through its LLM-read mailbox (§3.1).
+- **Medium:** a cross-tenant read through `read_blob` (§10.4).
+- **Medium:** a profile command with no tenant scope (§10.4).
+- **Medium:** `handler_node` (§3).
+- **Medium:** news across tenants (§8.3).
+- **Low:** Cloud's person actions, trust in the `IO.` prefix, and the flag's constant and OPA.
+
+### 16.4 CD and operation
+
+- **Steps:** no deterministic step builder exists, and the executor's limits (§5.1).
+- **ILKs:** no removal keeps an ILK; recreate makes a new one (§4.3).
+- **Admission:** SY.deploy's admission in SY.admin (§4.1).
+- **Timeouts:** Cloud's waits, and duplicate births (§4.1).
+- **Partial failures and restarts** (§5.3).
+- **Versions:** they are neither released nor pinned (§6.1).
+- **Shared things:** routes, VPN rules, runtimes and node names (§5.6).
+- **Capacity** (§5.7).
+
+### 16.5 Messaging and cognition
+
+- **The source of the reply's ED** (§7.2).
+- **Per-IO naming breaks the pair across EDs** (§8.1).
+- **ED–ED loops** (§8.5).
+- **Memory keyed by the node** (§8.3).
+- **Episodes name the conscious** (§8.2).
+- **Minors:** the writer, the force rule, `handler_node`, and cognition's numbers.
+
+### 16.6 Needs the operator's call
+
+Applied as wording and facts, the panel's findings need these calls from the operator:
+
+1. The four changes to earlier decisions (§2.2).
+2. An ED is not a person for merges, for a Cloud account, or for Cloud's person actions (§3.1).
+3. A person's `src_ilk` bound in the router (§7.2).
+4. The conscious's ED, taken from its config (§7.2). What the writer names (§13.2).
+5. The memory keyed by the ED (§8.3).
+6. How SY.deploy runs its steps (§5.1), and its bounded admission (§4.1).
+7. The retire mode, and a recreate that keeps the ILK (§4.3).
+8. The profile's storage: its own field and folder, a tenant-scoped tool, and a tenant-scoped
+   command (§10.4).
+9. ED–ED talk and its prerequisites (§8.5, §13.4).
+10. Released versions and waves (§6.1).
+11. Capacity (§5.7).

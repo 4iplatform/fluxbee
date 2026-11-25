@@ -639,7 +639,27 @@ Options (b), a label over several agents, and (c), one node that does everything
     name a version whose file has not arrived; the old versions stay, so a reader takes the newest
     one present.
 
-## 26. Later questions (not yet)
+## 26. Notes, 2026-11-25 (later): the design and its panel
+
+- **The operator:** before any code, a complete document with everything talked, then a panel
+  review to check it all, then choose what to touch. The design is
+  [digital-executive-v1-design](digital-executive-v1-design.md); a panel of five reviewed it the
+  same day (its §16). The operator: the panel's problems are talked all together.
+
+## 27. Notes, 2026-11-25 (later): its identity on the internet
+
+- **The operator's material:** two methods and their combination, taken as ideas to adapt
+  (design §12.2): a domain and open standards (`did:web` or `did:webvh` plus `agent-card.json`);
+  keys alone (`did:key` plus credentials); both combined. Also: the card is a passport, with no
+  channel in the public card and the direct channels only in the extended card.
+- **Why it goes in this design:** part of its data is shared with what identity keeps (the
+  profile).
+- **Private data stays private; take people as the standard.**
+- **Everything through Fluxbee, with the edge.**
+- **The A2A interface:** the first draft named a new IO for it; the operator asked to talk it, to
+  simplify it.
+
+## 28. Later questions (not yet)
 
 - The ED's agents' tools: which ones, and what of the shared memory they read.
 
