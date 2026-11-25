@@ -396,7 +396,40 @@ Options (b), a label over several agents, and (c), one node that does everything
   - The number or address an agent writes from today is its IO node's configuration (§3), not a
     channel of any ILK.
 
-## 16. Later questions (not yet)
+## 16. Notes, 2026-11-25 (later): the order's path, and the ED is a person
+
+- **The CD node's name:** `SY.cd`, or `SY.cdeploy` (open).
+- **The operator's picture of the path:** SY.cd takes orders from Cloud, and from there runs in the
+  infra what it knows a deploy needs, using SY.admin and reading Archi's CI; SY.admin runs the
+  commands SY.cd asks, in the order and the way the deploy needs. The operator finds Cloud → SY.admin
+  → SY.cd → SY.admin "medio complicado".
+- **The ED is a virtual person** (the operator: the ED's first difference). It has all a person can
+  have: email, phone, Slack, a LinkedIn identity and so on; for every purpose but the legal ones, it
+  is a person.
+- **Still pending:** the mixing of channels, and the full analysis of the conversations beyond
+  cognition's analysis of today.
+- **No two EDs share a number,** but they may use a common one, such as the company's phone: an IO
+  of its own, special for that, a common resource.
+- **The ED's ILK type:** maybe only a flag that says virtual or real, and nothing more; touch little.
+- **Facts read for it (2026-11-25):**
+  - The same path exists today for WFs: SY.admin hands a deploy to SY.wf-rules, and SY.wf-rules
+    launches, rebinds, restarts and deletes its WF nodes through SY.admin with the node actions
+    every launcher uses; the admin lets it act only on its own hive's `WF.*` nodes
+    (`go/sy-wf-rules/node/node_lifecycle.go`, [wf-standard-path-v1](wf-standard-path-v1.md)).
+  - Archi's plans run the same way: Archi builds a plan, and SY.admin's executor runs it step by
+    step, in order.
+  - Every user action goes through SY.admin (the operator, 2026-10-15), and IO.cloud relays only to
+    SY.admin: Cloud reaches what SY.admin exposes to it.
+  - Identity's shared memory gives each ILK a 16-bit `flags` field (`IlkEntry`, `src/shm/mod.rs`),
+    of which four bits are in use (`FLAG_ACTIVE`, `FLAG_DELETED`, `FLAG_STALE`, `FLAG_FROZEN`). A
+    "virtual" bit fits there with no change to the layout, and a reader that does not know it
+    ignores it. A person's rules (an email, channels, a complete registration) would then hold for an
+    ED as they are.
+
+## 17. Later questions (not yet)
+
+- The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
+  a message that comes in through it.
 
 - The line between infra and an ED's deployments: a hive, a tenant's provider key in SY.vault, an
   edge exposure (a solution's manifest declares hives in its topology today).
