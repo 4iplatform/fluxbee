@@ -526,10 +526,41 @@ Options (b), a label over several agents, and (c), one node that does everything
   IO, which does not exist**: the IO nodes are io.api, io.blob, io.cloud, io.linkedhelper, io.slack,
   io.wapp and io.web (`nodes/io`).
 
-## 22. Later questions (not yet)
+## 22. Notes, 2026-11-25 (later): the company's people and their roles, what exists
+
+- **An ED has an email, no matter what** (the operator: inevitable). So an email IO is part of what
+  the ED needs (§21: none exists).
+- **The company's people and their roles:** to order it if needed, reviewing well what exists first
+  (the operator: there is something).
+- **What exists (read 2026-11-25):**
+  - **Identity v2's roles and capabilities, retired.** Tags from a controlled vocabulary (roles such
+    as `operator` or `supervisor`, capabilities such as `billing` or `escalation`)
+    ([history/10-identity-v2](history/10-identity-v2.md)). Never built: `ILK_REGISTER` and
+    `ILK_UPDATE` reject `roles` and `capabilities`, and identity keeps no vocabulary.
+  - **Identity v2.1's agent definition, built** (§14): role, skills, handbooks and personality by
+    hash, for `agent` ILKs only.
+  - **Identity v3's claims, drafted and not built**
+    ([future_implementations/10-identity-v3](future_implementations/10-identity-v3.md), 2026-04-13;
+    [the claims and normative model](future_implementations/fluxbee_identity_claims_normative_model.md)).
+    A descriptive model: *"identity describes, the normative layer orients, enforcement acts"*.
+    - A claim is a statement about one ILK, with exactly one facet: `domain` (what it may speak
+      about: `billing`, `sales`), `function` (what it knows how to do: `can_invoice`, `can_refund`)
+      or `responsibility` (what it is assigned to handle as a duty: `billing_intake`). Declared by
+      the ILK itself, by an authority or by the system; a key in the code's canonical catalog is
+      `canonical`, any other is emergent (not for hard authorization).
+    - **Recognition:** another ILK recognizes a claim, explicitly and on record.
+    - An institutional role (office, jurisdiction, a charter's reference) for gov and system nodes
+      only. The normative layer (a constitution, charters) is documents.
+    - Nothing of it is in the code.
+  - **Companies and their members are Cloud's** ([io-cloud-api](io-cloud-api.md) §8; the operator,
+    2026-10-14 and 10-15): Fluxbee keeps the infrastructure (identity, permissions, what is spent),
+    Cloud keeps companies, members, billing and the law.
+  - **A relation between two people** (one's supervisor, who reports to whom) is in no design and no
+    code: v2's `supervisor` was a tag, v3's claims are about one ILK.
+
+## 23. Later questions (not yet)
 
 - The frontdesk's reinforced process: a contact who becomes a "user", its mechanism and approval.
-- The ED's email: an email IO.
 
 - The common IO (a company's phone shared by its EDs): whose deployment it is, and which ED answers
   a message that comes in through it.
