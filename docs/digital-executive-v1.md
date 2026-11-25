@@ -379,10 +379,24 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Cloud's normal path is Cloud → the edge → IO.cloud → SY.admin, over the list of exposed actions
     ([io-cloud-api](io-cloud-api.md)).
 
-## 15. Later questions (not yet)
+## 15. Notes, 2026-11-25 (later): the list is the CD node's
 
-- The list of EDs: which side keeps it, Cloud (as it keeps companies and their members) or Fluxbee
-  (the ED's ILK and the CD node's groupings), and what the other reads.
+- **Cloud does not keep the list of EDs.** SY.admin must be able to create everything and see what
+  exists. The keeper is the CD node: a list of the deployments in the infra, where an ED is one of
+  them, and the capabilities attached to an ED are listed there too, as deployments.
+- **Roles, capabilities and the rest are messy,** to review better; a priori the operator likes the
+  two levels: at the ED's level, a responsibility, a capability and a company role are one thing, a
+  solution deployed in the ED; at an agent's level, the role, skills, handbooks and personality
+  already built, which each solution would declare for its agents (the manifest refuses them today).
+  The ED's personality is its conscious's, in the first layer.
+- **Facts read for it (2026-11-25), an ED against identity's rules today:**
+  - Only a person may hold an email: identity refuses one in a non-human ILK's identification
+    (`src/bin/sy_identity.rs`, "Only a person has an email").
+  - `set_ilk_definition` takes only an ILK of type `agent` (`INVALID_ILK_TYPE` otherwise).
+  - The number or address an agent writes from today is its IO node's configuration (§3), not a
+    channel of any ILK.
+
+## 16. Later questions (not yet)
 
 - The line between infra and an ED's deployments: a hive, a tenant's provider key in SY.vault, an
   edge exposure (a solution's manifest declares hives in its topology today).
