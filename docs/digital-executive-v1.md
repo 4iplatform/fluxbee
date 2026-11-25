@@ -308,7 +308,37 @@ Options (b), a label over several agents, and (c), one node that does everything
   - Fluxbee Cloud launches a tenant's IO nodes through IO.cloud's `provision_node`.
   - The operator launches any node with `run_node` (SY.admin's HTTP API or Archi's SCMD).
 
-## 12. Later questions (not yet)
+## 12. Notes, 2026-11-25 (later): the record's why, templates, and what infra is
+
+- **All of this is the user's, not the system's** (the operator): the solutions talked about are user
+  solutions. In passing: io.web is system and should be `SY.web` (FINDINGS A-363).
+- **A name of its own per ED,** as in every CD.
+- **The CD's record needs an owner,** not as the tenant but as the grouping of the why: to understand
+  why something is running, at a glance, e.g. "ED such, capability such", something that says what
+  it is, to list it fast and see what each deployed thing does.
+- **Solutions made ahead for EDs:** defaults already built for EDs, and a deployment only assigns
+  them things: the assignment of general solutions to many deployments.
+- **No deployments "a lo loco":** ordering what each solution is for, everything runs as a solution;
+  loose launches are only for debugging, maintenance and the like. Those are Archi's, and Archi
+  removes them after (the operator imagines so).
+- **Removing a whole grouping** (a test's, for one): yes, and the CD node does it.
+- **Infra is everything a user needs to run an ED with its own solutions.**
+- **Each ED needs its own CRM connector:** nothing is shared between EDs.
+- **Facts read for it (2026-11-25):**
+  - Nothing running records who deployed it. SY.wf-rules keeps no owner for a WF; Archi infers which
+    solution a WF or the user policy is by matching its saved manifests against what runs
+    (`wf_declared_by`, `opa_policy_declared_by`, `src/bin/sy_architect.rs`); a node carries no owner
+    at all.
+  - A solution's manifest has no parameters: node names and configs are written out. The only
+    template today is a runtime's: a node's config is written at its launch from the template of its
+    runtime's version.
+  - Removing what a grouping deployed kills nodes; an ILK with history is disabled, never deleted
+    (the operator, 2026-11-11).
+
+## 13. Later questions (not yet)
+
+- The line between infra and an ED's deployments: a hive, a tenant's provider key in SY.vault, an
+  edge exposure (a solution's manifest declares hives in its topology today).
 
 - How a message reaches one of the conscious's instances, and the order within a person's line (left
   for the end).

@@ -583,6 +583,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-359 🔵 SY.admin's executor gives its model a step's args unmasked when the step asks it to fill a field (low; SY.admin; found by 0.1.152's review; A-337's sibling).
 - A-360 🔵 `node_control_config_set`'s help names `postgres_url` as SY.storage's and SY.identity's secret field, which they refuse (low; SY.admin; found by 0.1.152's review).
 - A-362 🔵 `vault_delete`'s help names `tenant_id` a body field; SY.admin's HTTP route reads it only from the query, so a key of another tenant answers KEY_NOT_FOUND (low; SY.admin; found by 0.1.152's gate).
+- A-363 🔵 io.web is a system node named as an IO node: it should be SY.web (low, naming and model; the operator, 2026-11-25, in the Digital Executive talk).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1659,6 +1660,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-363 [General/io.web] 🔵 low (the operator, 2026-11-25, in the Digital Executive talk; read in the code) — io.web is a system node named as an IO node: it should be SY.web
+
+- **What:** io.web is the platform's own: the orchestrator lists it among the core IO runtimes
+  (`CORE_IO_RUNTIMES`, `src/bin/sy_orchestrator.rs`, with io.cloud and io.blob), it runs only in the
+  root tenant, and only where the operator starts it (`packaging/base-nodes.json`). It serves no
+  user's solution. The operator: it is system, so its name is `SY.web`.
+- **To check before renaming:** what the `IO.` prefix carries besides the name (the edge's
+  externalize rule, the router's edge-to-IO path, the policy's prefixes), the edge's proxy target,
+  and io.cloud and io.blob, which sit in the same list.
+- **Status:** recorded, not scheduled.
 
 ### A-362 [General/admin] 🔵 low (found 2026-11-20 by 0.1.152's gate; seen on 8.x, read in the code; there before it) — `vault_delete`'s help names `tenant_id` a body field, and SY.admin's HTTP route reads it only from the query
 
