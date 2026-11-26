@@ -5978,6 +5978,7 @@ mod tests {
             skill_hashes: Vec::new(),
             handbook_hashes: Vec::new(),
             personality_hash: None,
+            is_virtual: false,
         }
     }
 
