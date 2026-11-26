@@ -1099,7 +1099,8 @@ the open-source install's question (FINDINGS A-363).
 4. **The profile:** its field, its folder, its command and the people tool.
 5. **Its identity on the internet, stage 1:** the DID document and the company's credential.
 
-Each stage gets a build design of its own before any code.
+Each stage gets a build design of its own before any code. Stage 1:
+[digital-executive-v1-stage-1](digital-executive-v1-stage-1.md).
 
 ---
 
