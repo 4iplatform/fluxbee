@@ -669,7 +669,17 @@ Options (b), a label over several agents, and (c), one node that does everything
 - **The name:** no problem. The one problem, not one for now: names repeat (first and last name);
   later, see whether they repeat, or move to A2A.
 
-## 29. Later questions (not yet)
+## 29. Notes, 2026-11-25 (later): the calls on the panel's findings
+
+- **The recommendations, one by one** (design §16.6): the operator, *"sí a todo"*, with two notes:
+  - **The profiles' folder:** review the code and multi-node: *"sería como activar un área de system
+    que syncthing, solo revisar"*. Reviewed (design §10.5): the sibling of Archi's agent-assets
+    folder, a dist folder the motherbee sends and the workers receive.
+  - **ED–ED talk out of the first stage:** *"ok por ahora pero veremos el tema seguro"*.
+- **Capacity:** about 150 EDs is fine now.
+- **8.x is not untouchable:** reinstall it if a change needs it.
+
+## 30. Later questions (not yet)
 
 - The ED's agents' tools: which ones, and what of the shared memory they read.
 
