@@ -453,6 +453,9 @@ struct LifecycleChanges {
 
 /// Error code + human detail in one String (`CODE|detail`); the handler splits it so the caller
 /// sees WHAT blocked the op (e.g. which node identities are still in the tenant).
+/// The longest display name or company a virtual person takes: the identity SHM's display name.
+const VIRTUAL_PERSON_NAME_MAX_BYTES: usize = 128;
+
 fn lifecycle_error(code: &str, detail: &str) -> String {
     format!("{code}|{detail}")
 }
@@ -1211,10 +1214,13 @@ impl IdentityStore {
             return Err("ACCOUNT_AMBIGUOUS".to_string());
         }
         if let Some(existing) = self.ich_lookup.get(&key).cloned() {
-            // A virtual person's address never resolves for an IO: the IO would stamp the ED's
-            // ILK on what a stranger wrote from that address, and a `cloud` key would hand the
-            // stranger a Fluxbee Cloud account on it, which an ED never holds
-            // (docs/digital-executive-v1-design.md §3.1).
+            // A provision never lands on a virtual person: the IO would stamp the ED's ILK on what
+            // a stranger wrote from that address, and a `cloud` key would hand the stranger a
+            // Fluxbee Cloud account on it, which an ED never holds
+            // (docs/digital-executive-v1-design.md §3.1). This is the fallback only: an IO resolves
+            // an address in the identity SHM first and provisions on a miss, so once an ED holds
+            // channels (stage 2) the IOs' own lookup must leave them out too
+            // (docs/digital-executive-v1-stage-1.md §7).
             if self.ilks.get(&existing).is_some_and(|ilk| ilk.is_virtual) {
                 return Err(virtual_refusal(
                     MSG_ILK_PROVISION,
@@ -1334,11 +1340,25 @@ impl IdentityStore {
                 "display_name must not be empty",
             ));
         }
+        // The SHM keeps a display name in 128 bytes and would cut a longer one, maybe inside a
+        // character: refuse it instead, and the company with the same bound.
+        if display_name.len() > VIRTUAL_PERSON_NAME_MAX_BYTES {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "display_name must be at most 128 bytes",
+            ));
+        }
         let company_name = req
             .company_name
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        if company_name.is_some_and(|value| value.len() > VIRTUAL_PERSON_NAME_MAX_BYTES) {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "company_name must be at most 128 bytes",
+            ));
+        }
         let Some(tenant) = self.tenants.get(&tenant_id) else {
             return Err("INVALID_TENANT".to_string());
         };
@@ -16205,7 +16225,15 @@ mod tests {
         let err = ed_create(&mut store, &LC_TENANT.to_uppercase(), "Laura", None)
             .expect_err("another spelling");
         assert_eq!(err, "INVALID_REQUEST");
+        // A name or a company longer than the SHM's 128 bytes creates nothing; 128 is fine.
+        let long = "ñ".repeat(65);
+        for (name, company) in [(long.as_str(), None), ("Laura", Some(long.as_str()))] {
+            let (code, _) =
+                ed_refusal(ed_create(&mut store, LC_TENANT, name, company).expect_err("too long"));
+            assert_eq!(code, "INVALID_REQUEST");
+        }
         assert_eq!(store.ilks, before);
+        ed_create(&mut store, LC_TENANT, &"a".repeat(128), None).expect("128 bytes fit");
     }
 
     #[test]
