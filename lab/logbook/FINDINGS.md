@@ -584,6 +584,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-360 🔵 `node_control_config_set`'s help names `postgres_url` as SY.storage's and SY.identity's secret field, which they refuse (low; SY.admin; found by 0.1.152's review).
 - A-362 🔵 `vault_delete`'s help names `tenant_id` a body field; SY.admin's HTTP route reads it only from the query, so a key of another tenant answers KEY_NOT_FOUND (low; SY.admin; found by 0.1.152's gate).
 - A-363 🔵 io.web and io.cloud are system nodes named as IO nodes: they should be SY.web and SY.cloud (low, naming and model; the operator, 2026-11-25, in the Digital Executive talk).
+- A-364 🔵 `externalize` with `fanout_family` defaults `inbound_family` to `user`, which io.wapp drops as a reply with no target: a WhatsApp fan-out made without it loses every event (low; SY.admin; found 2026-11-26 reading the code for the ED's stage 2).
+- A-365 🔵 io.wapp's contract lists `identity.*`, `io.blob.*`, `node.*` and `runtime.*` as optional fields it never reads (low; io.wapp; found 2026-11-26 reading the code for the ED's stage 2).
+- A-366 🔵 Archi's designer is told a resource without `ownership` defaults to `external`; the code defaults a node to `solution`, and the reconciler never reads a node's ownership (low; Archi; found 2026-11-26 reading the code for the ED's stage 2).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1660,6 +1663,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-366 [Archi] 🔵 low (found 2026-11-26 reading the code for the Digital Executive's stage 2; read in the code, not seen on 8.x) — a node's `ownership`: the designer is told `external` by default, the code says `solution`, and the reconciler reads neither
+
+- **What:** the designer's prompt says a resource without `ownership` defaults to `"external"`, which
+  the reconciler "will not delete or modify" (`src/bin/sy_architect.rs`, the manifest rules). A
+  node's `DesiredNode` defaults it to `"solution"` (`default_solution_ownership`,
+  `src/bin/sy_architect/pipeline_types.rs`), and `reconcile_nodes`
+  (`src/bin/sy_architect/reconciler.rs`) never reads a node's ownership: any running node with a
+  declared name is taken as the solution's, and its config pushed.
+- **Effect:** a node the designer marks `external`, to leave it alone, is still reconciled.
+- **Where it matters next:** the Digital Executive's nodes (docs/digital-executive-v1-stage-2.md
+  §5 reserves their names in SY.admin instead).
+- **Status:** recorded, not scheduled.
+
+### A-365 [IO/io.wapp] 🔵 low (found 2026-11-26 reading the code for the Digital Executive's stage 2; read in the code) — io.wapp's contract lists optional fields it never reads
+
+- **What:** `IoWappAdapterConfigContract`'s optional fields (`nodes/io/common/src/io_wapp_adapter_config.rs`)
+  are `io.dst_node`, `io.graph_api_version`, `io.blob.*`, `identity.target`,
+  `identity.timeout_ms`, `node.*` and `runtime.*`. io.wapp reads only the first two
+  (`nodes/io/io-wapp/src/main.rs`); its identity target and timeout come from the environment.
+- **Effect:** an operator or Archi who sets one of the others, from the help, changes nothing and
+  is not told.
+- **Status:** recorded, not scheduled. io.wapp is test-grade until the IO family's normalization.
+
+### A-364 [General/admin] 🔵 low (found 2026-11-26 reading the code for the Digital Executive's stage 2; read in the code, not seen on 8.x) — a WhatsApp fan-out made without `inbound_family` silently drops every event
+
+- **What:** SY.admin's `externalize` defaults `inbound_family` to `"user"` (`src/bin/sy_admin.rs`,
+  the externalize handler). io.wapp takes its webhooks only as `io.wapp.inbound.v1`
+  (`IO_WAPP_INBOUND_FAMILY`, `nodes/io/io-wapp/src/main.rs`). Its catch-all treats any other
+  message as a reply to send, and drops one with no `wapp_post` target. The edge answers Meta 200
+  either way.
+- **Effect:** a fan-out made with the default looks fine everywhere, and no WhatsApp message ever
+  arrives.
+- **Fix to weigh:** the fan-out's family from the runtime it fans out to, or `externalize` refusing a
+  `fanout_family` without `inbound_family`; and the runbook saying it.
+- **Status:** recorded, not scheduled. The ED's stage 2 sets it explicitly
+  (docs/digital-executive-v1-stage-2.md §9).
 
 ### A-363 [General/io.web] 🔵 low (the operator, 2026-11-25, in the Digital Executive talk; read in the code) — io.web and io.cloud are system nodes named as IO nodes: they should be SY.web and SY.cloud
 
