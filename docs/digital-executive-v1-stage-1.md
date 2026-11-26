@@ -137,8 +137,10 @@ to `enforce`. Each change of mode is a release, explicit and recorded, with no n
 
 ## 4. Smaller items in this stage
 
-- **io.api's `by_ilk` refuses a virtual ILK** (`ILK_VIRTUAL`), next to its tenant check
-  (`validate_explicit_subject_ilk`, `nodes/io/io-api/src/main.rs`).
+- **io.api's `by_ilk` refuses a virtual ILK** with `ilk_virtual` (io.api's codes are lowercase),
+  after its tenant check (`validate_explicit_subject_ilk`, `nodes/io/io-api/src/main.rs`): an ILK
+  the tenant does not know answers `subject_not_found`, virtual or not, so another tenant learns
+  nothing.
 - **The help** of the touched actions (`create_virtual_person`, `delete_ilk`, `restore_ilk`,
   `set_ilk_tenant`, `register_human`) names the virtual case.
 - **Archi's handbook:** a line on what a virtual person is, and that the operator creates one only
