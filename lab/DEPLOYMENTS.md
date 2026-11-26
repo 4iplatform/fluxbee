@@ -21,6 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
+| **0.1.153** | 2026-11-25 | `93a4024a` | motherbee + spokes (core), the Digital Executive's stage 1, release A ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md)): the identity SHM's virtual-person bit (`ILK_FLAG_VIRTUAL`, its three copies), SY.identity's virtual person (migration v6, `ILK_CREATE_VIRTUAL` from SY.admin@motherbee only, the `ILK_VIRTUAL` refusals of merges, re-registration, channels and provisions), SY.admin's `create_virtual_person` and Cloud's person actions refused on an ED, io.api's `by_ilk` refusing one, Archi's SCMD route | ✅ live, gate0253 31/31 PASS (one tool FAIL re-run PASS) | snapshot `pre-ed1-0-1-153` · `apt install fluxbee=0.1.152` (migration v6 only adds a column) |
 | **0.1.152** | 2026-11-20 | `9dfe1a4d` | motherbee + spokes (core), two binaries, one branch each: Archi (SY.architect) takes an identity's whole lifecycle in SCMD on SY.admin's own routes (purges included, run directly as every SCMD; each mutation tracked, apart from what Archi's AI may write; the dead staged-action path removed), A-348 (SCMD config `?replace` and the binding fields), A-307's Archi part (`BUSY`), A-327 (the explanation turn reads the prompt cache); SY.admin A-358 (a `hive` upstream at an address io.web refuses is refused at publish, `HIVE_ADDRESS_REFUSED`) and A-337 (the plan review sees no secret; a plan holding the mask refused), the purge help as the code has it | ✅ live, checked on 8.x | snap `pre-archi-0-1-152` (all 4 VMs) · `apt install fluxbee=0.1.151` + 0.1.151's `update_installation` (nothing one-way) |
 | **0.1.151** | 2026-11-19 | `890d258f` | motherbee + spokes (core), io.web stage 2.2's R2, the binaries, one branch per binary ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): io.web a transparent reverse proxy to each exposure's upstream (every method, bodies and streams frame by frame, WebSockets, no wait of its own; the Origin check; the header table; a renewal moves the sessions; what is open cut at once when the access ends), SY.edge the pass-through (every method but CONNECT and TRACE, bodies, WebSockets in their connection's scope, no wait of its own, TCP keepalive, every cookie pair, HSTS, frame_origins), SY.admin `publish_cloud_endpoint`'s `cloud_origins`; with A-356 and A-357 (SY.admin's executor contract) | ✅ live, checked on 8.x | snap `pre-web22-0-1-151` (all 4 VMs) · `apt install fluxbee=0.1.150` + 0.1.150's `update_installation` (nothing one-way; exposures go back to the placeholder; io.web's and the edge's files hold the origins, which their 0.1.150 refuses: each serves SY.admin's next push, within 60 s; 0.1.150's SY.admin drops the origins from its registry, so name them again after coming back) |
 | **0.1.150** | 2026-11-19 | `671dc2ca` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.2's R1 ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): `IO_WEB_EXPOSURES` carries `cloud_origins`, the origins of the Fluxbee Cloud page that may frame the exposures, absent on the wire while empty; SY.admin and io.web send and read none before R2 | ✅ replaced by 0.1.151 | snap `pre-websdk-0-1-150` (deleted 2026-11-19) · `apt install fluxbee=0.1.149` + 0.1.149's `update_installation` (nothing one-way) |
@@ -161,6 +162,62 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.153 — the Digital Executive's stage 1, release A: a virtual person, and what it refuses
+
+- **Date:** 2026-11-25 (ART) · **Previous version:** 0.1.152 · **Commit:** `93a4024a`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the Digital Executive (ED), the operator's first large topic of 2026-11-20. Its design
+  ([digital-executive-v1-design](../docs/digital-executive-v1-design.md), reviewed by a panel of five
+  and decided with the operator on 2026-11-25) and the order of the work (§15) put the base of
+  identity and security first; this is its build design's release A
+  ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §5).
+- **What changed (five branches, each CI-green, rebased and fast-forwarded):**
+  - `coa/shm-virtual-flag` (shared, alone on its branch): `ILK_FLAG_VIRTUAL` (0x0100) in
+    `src/shm/mod.rs`, the Rust SDK (`IdentityIlkOption.is_virtual`, `virtual` on the wire) and the Go
+    SDK (`IlkFacts.Virtual`); no layout or `IDENTITY_VERSION` change.
+  - `coa/identity-ed1` (SY.identity): migration v6 `virtual_person` (`is_virtual`); the record's
+    field and the SHM bit; a replica may neither set nor clear it; `ILK_CREATE_VIRTUAL` only from
+    `SY.admin@motherbee`, on the primary, never in the root or a deleted, pending or suspended
+    tenant, names at most 128 bytes; `ILK_VIRTUAL` refuses a merge into or out of a virtual person
+    (Cloud's `register_human` included), its re-registration, any channel added to it
+    (`ILK_ADD_CHANNEL` and `ILK_UPDATE`), and a provision landing on it.
+  - `coa/admin-ed1` (SY.admin): `create_virtual_person` (`POST /hives/{hive}/identity/virtual-people`,
+    the operator and Archi, not Cloud); IO.cloud's `delete_ilk`, `restore_ilk` and `set_ilk_tenant`
+    on a virtual ILK answer `403 ILK_VIRTUAL` (the SHM's flag, an `ILK_GET` for a marked one); the
+    tenant refusals 404 and 409, never 500.
+  - `coa/ioapi-ed1` (io.api): `by_ilk` answers `ilk_virtual` for an ED its tenant knows, and
+    `subject_not_found` for any ILK it does not, an ED of another tenant included.
+  - `coa/archi-ed1` (SY.architect): the operator's SCMD for the same route, run at once and tracked.
+- **Review:** one round per branch. Identity: nothing high or medium; two lows fixed (the names'
+  bound, a comment), two carried to stage 2 (§7). SY.admin and io.api: one medium (the 500s) and one
+  low (io.api told another tenant an ILK was an ED), both fixed. The router's branch (release B) is
+  apart.
+- **Build:** CI green on each branch and on `93a4024a`. Build on fb-build 01:57:12–02:28:17Z
+  (31.1 min, against 14.6 for 0.1.152: noted), publish 16 s.
+- **The deploy:** the gate's mark at 02:29:05Z; `ops deploy 0.1.153 --snapshot pre-ed1-0-1-153 --drop
+  pre-archi-0-1-152` in 324 s (snapshots 32.0 s, the motherbee's apt 163.2 s, its admin on the version
+  48.2 s, the spokes answering 12.9 s, the update's call 31.0 s, the hives on the target 19.1 s, health
+  10.3 s). On the target after the update's call: the motherbee 4.4 s, egress1 35.7 s, ingress1
+  39.9 s, worker1 44.5 s. The update (`upd-1795660404230`) closed with every hive on the target.
+  Health clean; the web line `open=0 fail=0 origins=1`.
+- **Checked on 8.x (the gate, gate0253, 02:34–02:37Z; `scratchpad/gate-tools/r153_gate.py`,
+  git-ignored; 31 PASS, one FAIL of the tool's own re-run PASS; no model call):**
+  - **The smoke:** a new node RUNNING in 3.8 s on 0.1.153, stopped; a stopped one reads STOPPED.
+  - **A virtual person over HTTP:** created in pruebas in 1.4 s; read back virtual, human, complete,
+    no channel; the ILK list shows it virtual. Refused: an unknown tenant `INVALID_TENANT`, the root
+    `TENANT_ROOT_NOT_REGISTRABLE` (the tool first named a wrong root id), a 129-byte name and an
+    unknown field `INVALID_REQUEST`.
+  - **Cloud's door:** `delete_ilk`, `restore_ilk` and `set_ilk_tenant` on the ED answer `ILK_VIRTUAL`
+    in 0.5 s each, the ED untouched; `create_virtual_person` is no Cloud op; a real person
+    registered, deleted and restored through the door as before.
+  - **Archi's SCMD** creates a second one in 3.1 s, tracked, read back virtual.
+  - **The operator** deletes, restores, deletes and purges both; each reads gone.
+  - **Not checked live:** the merge and channel refusals and io.api's `by_ilk` (no live path reaches
+    them with an ED that holds no email or channel in this stage): SY.identity's and io.api's tests.
+  - **Cleaned:** both EDs, the control person, the smoke node.
+- **Rollback:** snapshot `pre-ed1-0-1-153`, or `apt install fluxbee=0.1.152` and 0.1.152's
+  `update_installation`: migration v6 only adds a column an older binary never names.
 
 ## 0.1.152 — Archi's SCMD identity lifecycle with A-348, A-307's Archi part and A-327; SY.admin's A-358 and A-337
 
