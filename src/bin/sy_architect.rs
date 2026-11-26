@@ -12847,14 +12847,15 @@ fn system_get_may_run(method: &str, action: &str) -> bool {
 /// come (`action_in_command_log`), and `fluxbee_system_get` never runs it (`system_get_may_run`).
 /// It is a question of its own, apart from `admin_action_allows_ai_write`, which leaves the purges
 /// out and stays as it was: every action that list names, and the changes an SCMD maps outside
-/// it: an ILK's charge to a tenant and its purge, a tenant's creation, its update, its sponsor and
-/// its purge, a tap, and the global user policy's clear.
+/// it: an ILK's charge to a tenant and its purge, a virtual person's creation, a tenant's creation,
+/// its update, its sponsor and its purge, a tap, and the global user policy's clear.
 fn is_mutating_admin_action(action: &str) -> bool {
     admin_action_allows_ai_write(action)
         || matches!(
             action,
             "set_ilk_tenant"
                 | "purge_ilk"
+                | "create_virtual_person"
                 | "create_tenant"
                 | "update_tenant"
                 | "set_tenant_sponsor"
@@ -13918,6 +13919,20 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "set_tenant_sponsor".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        // A virtual person, a Digital Executive's ILK (docs/digital-executive-v1-stage-1.md §1.2): the
+        // operator's tests in this stage, run at once and recorded like the other identity writes.
+        ("POST", ["hives", hive_id, "identity", "virtual-people"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for create_virtual_person must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "create_virtual_person".to_string(),
                 target_hive: (*hive_id).to_string(),
                 params,
             })
@@ -35453,6 +35468,13 @@ mod tests {
                 json!({ "ilk_id": ilk }),
             ),
             (
+                r#"curl -X POST /hives/motherbee/identity/virtual-people -d '{"tenant_id":"tnt:11111111-1111-1111-1111-111111111111","display_name":"Laura","company_name":"Client Co"}'"#
+                    .to_string(),
+                "create_virtual_person",
+                json!({ "tenant_id": "tnt:11111111-1111-1111-1111-111111111111",
+                        "display_name": "Laura", "company_name": "Client Co" }),
+            ),
+            (
                 r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
                     .to_string(),
                 "create_tenant",
@@ -35553,6 +35575,7 @@ mod tests {
             ("POST", "/hives".to_string()),
             ("DELETE", "/hives/worker1".to_string()),
             ("POST", "/hives/worker1/identity/tenants".to_string()),
+            ("POST", "/hives/worker1/identity/virtual-people".to_string()),
             ("PUT", format!("/hives/worker1/identity/tenants/{tenant}")),
             (
                 "POST",
@@ -35641,6 +35664,7 @@ mod tests {
             "purge_ilk",
             "purge_tenant",
             "set_ilk_tenant",
+            "create_virtual_person",
             "create_tenant",
             "update_tenant",
             "set_tenant_sponsor",
@@ -35666,6 +35690,7 @@ mod tests {
             "purge_ilk",
             "purge_tenant",
             "set_ilk_tenant",
+            "create_virtual_person",
             "create_tenant",
             "update_tenant",
             "set_tenant_sponsor",
