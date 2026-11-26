@@ -28,8 +28,8 @@ use crate::shm::{
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, ShmError, TapEntry, VpnAssignment,
     ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE,
-    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
-    OPA_STATUS_LOADING, OPA_STATUS_OK,
+    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, ILK_FLAG_VIRTUAL, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+    OPA_STATUS_ERROR, OPA_STATUS_LOADING, OPA_STATUS_OK,
 };
 use fluxbee_sdk::mesh::{
     install_crypto_provider, peer_hive_from_cert, HiveRegistry, MeshTlsMaterial,
@@ -1168,6 +1168,17 @@ async fn handle_message(
     // L2-LOOKUP-5 / L2-LOOKUP-7: stamp the authoritative L2 name, overwriting
     // anything the sender may have set.
     msg.routing.src_l2_name = Some(src_handle.name.clone());
+    // A person's src_ilk only from a sender that may carry it, now that the name is the router's
+    // (docs/digital-executive-v1-stage-1.md §3), whatever the destination.
+    if !src_ilk_binding_passes(
+        &msg,
+        Some(&src_handle.sender),
+        router_uuid,
+        SRC_ILK_BIND_MODE,
+        |ilk_id| identity_person(hive_id, ilk_id),
+    )? {
+        return Ok(());
+    }
 
     if msg.routing.ttl == 0 {
         send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
@@ -4073,6 +4084,18 @@ async fn handle_wan_message(
     // The name is now canonicalized to the authenticated bucket hive (EDGE-01 above).
     let mut msg = msg.clone();
     msg.routing.src_l2_name = Some(src_info.name.clone());
+    // A person's src_ilk only from a sender that may carry it, named for the hive that
+    // authenticated it (docs/digital-executive-v1-stage-1.md §3). The sender's own router binds it
+    // first; this one does not trust another hive's to.
+    if !src_ilk_binding_passes(
+        &msg,
+        Some(sender),
+        ctx.router_uuid,
+        SRC_ILK_BIND_MODE,
+        |ilk_id| identity_person(&ctx.hive_id, ilk_id),
+    )? {
+        return Ok(());
+    }
 
     if msg.routing.ttl == 0 {
         send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
@@ -5237,6 +5260,18 @@ async fn handle_peer_message(
         .await
         .get(peer_uuid)
         .map(|peer| peer.sender.clone());
+    // A person's src_ilk only from a sender that may carry it (docs/digital-executive-v1-stage-1.md
+    // §3), checked here once the link any answer takes is known. The sibling that took the message
+    // from its node binds it first.
+    if !src_ilk_binding_passes(
+        &msg,
+        reply_link.as_ref(),
+        router_uuid,
+        SRC_ILK_BIND_MODE,
+        |ilk_id| identity_person(hive_id, ilk_id),
+    )? {
+        return Ok(());
+    }
     let mut senders: Vec<LocalDelivery> = Vec::new();
     if msg.routing.ttl == 0 {
         if let Some(link) = &reply_link {
@@ -6747,6 +6782,253 @@ fn get_src_ilk_from_meta(meta: &Meta) -> Option<String> {
 
 fn set_src_ilk_in_meta(meta: &mut Meta, src_ilk: &str) {
     meta.src_ilk = Some(src_ilk.to_string());
+}
+
+/// What the router does with a message whose sender may not carry the person its `src_ilk` names
+/// (docs/digital-executive-v1-stage-1.md §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SrcIlkBindMode {
+    /// Logs `src_ilk_bind would_refuse` and delivers the message as it did before the binding.
+    Report,
+    /// Answers the sender `UNREACHABLE` `SRC_ILK_NOT_BOUND` and delivers nothing. Built and tested
+    /// now, shipped by the release that switches `SRC_ILK_BIND_MODE`, which drops this attribute.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the router reports until a release enforces")
+    )]
+    Enforce,
+}
+
+/// The binding's mode is the router's code, not a setting: each change of mode is a release,
+/// explicit and recorded (stage 1 §3.3). This one reports; once the gates on 8.x read no refusal
+/// that matters, a release switches it to `Enforce`.
+const SRC_ILK_BIND_MODE: SrcIlkBindMode = SrcIlkBindMode::Report;
+
+/// The UNREACHABLE reason for a message whose sender may not carry the person its `src_ilk` names.
+const UNREACHABLE_SRC_ILK_NOT_BOUND: &str = "SRC_ILK_NOT_BOUND";
+
+/// Messages the binding refused, or would have refused while it reports, process-wide. Each line
+/// about one carries the total.
+static SRC_ILK_NOT_BOUND: AtomicU64 = AtomicU64::new(0);
+
+/// The identity SHM's type byte for a person (`SHM_ILK_TYPE_HUMAN` in `src/bin/sy_identity.rs`).
+const SHM_ILK_TYPE_HUMAN: u8 = 0;
+
+/// A person the identity SHM holds, as the binding needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Person {
+    /// A Digital Executive (`ILK_FLAG_VIRTUAL`).
+    is_virtual: bool,
+}
+
+/// Whether `sender`, the name the router stamped on a message, may carry `person` as its `src_ilk`
+/// (docs/digital-executive-v1-stage-1.md §3.1 and §3.2, read in the code on 2026-11-25):
+/// - an `IO.*` carries the writer of an inbound message;
+/// - a `WF.*`'s `send_message` to a node that is not an IO speaks for its instance's person;
+/// - an `SY.*` is Fluxbee's own code, and today only SY.architect's impersonation sends a person.
+///
+/// An `AI.*` never does: its replies carry its own ILK (`stamp_reply`). A virtual person is taken
+/// only from an `SY.*` (Archi, for the operator's tests) until stage 2 adds the IOs of its channels
+/// and its registered hand.
+fn src_ilk_sender_allowed(sender: &str, person: Person) -> bool {
+    if person.is_virtual {
+        return sender.starts_with("SY.");
+    }
+    ["IO.", "WF.", "SY."]
+        .iter()
+        .any(|prefix| sender.starts_with(prefix))
+}
+
+/// The binding of a person's `src_ilk` to who may send it, on a message whose sender's name the
+/// router has just stamped (docs/digital-executive-v1-stage-1.md §3). Whether the message goes on:
+/// `false` only in `Enforce`, once the sender has been answered over `link` (`None` on a sibling's
+/// frame whose link is gone, which no answer reaches). Only a `src_ilk` in which `person_of` finds
+/// a person gets a verdict. An agent's or a system's ILK, one the SHM does not hold (an alias, a
+/// temporary not yet replicated), a value that is no ILK, and an SHM the router cannot read: the
+/// message goes on as it did before the binding.
+fn src_ilk_binding_passes(
+    msg: &Message,
+    link: Option<&LinkSender>,
+    router_uuid: Uuid,
+    mode: SrcIlkBindMode,
+    person_of: impl FnOnce(&[u8; 16]) -> Option<Person>,
+) -> Result<bool, RouterError> {
+    let Some(src_ilk) = msg.meta.src_ilk.as_deref().map(str::trim) else {
+        return Ok(true);
+    };
+    let Some(ilk_id) = src_ilk
+        .strip_prefix("ilk:")
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+    else {
+        return Ok(true);
+    };
+    let Some(person) = person_of(ilk_id.as_bytes()) else {
+        return Ok(true);
+    };
+    let sender = msg.routing.src_l2_name.as_deref().unwrap_or_default();
+    if src_ilk_sender_allowed(sender, person) {
+        return Ok(true);
+    }
+    let not_bound_total = SRC_ILK_NOT_BOUND.fetch_add(1, Ordering::Relaxed) + 1;
+    match mode {
+        SrcIlkBindMode::Report => {
+            tracing::warn!(
+                sender,
+                src_ilk,
+                dst = %original_dst(msg),
+                trace_id = %msg.routing.trace_id,
+                virtual_person = person.is_virtual,
+                not_bound_total,
+                "src_ilk_bind would_refuse"
+            );
+            Ok(true)
+        }
+        SrcIlkBindMode::Enforce => {
+            tracing::warn!(
+                sender,
+                src_ilk,
+                dst = %original_dst(msg),
+                trace_id = %msg.routing.trace_id,
+                virtual_person = person.is_virtual,
+                not_bound_total,
+                "src_ilk_bind refused"
+            );
+            if let Some(link) = link {
+                send_unreachable_to(msg, link, router_uuid, UNREACHABLE_SRC_ILK_NOT_BOUND)?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// The persons of one hive's identity SHM, by ILK id, for the binding of a person's `src_ilk`,
+/// which runs on every message. A lookup reads the region's sequence and looks the ILK up in a
+/// hash map. The persons are read again (each ILK's id, type and flags, `read_ilk_kinds`, not the
+/// whole entries) only when the sequence moves: on a write of SY.identity's, and on its heartbeat,
+/// every 5 s.
+struct IdentityPeople {
+    hive_id: String,
+    reader: Option<IdentityRegionReader>,
+    /// When the region was last opened, or its opening last failed.
+    opened_at: Option<Instant>,
+    /// The sequence `people` was read at. `None` before the first read, after a failed one, and
+    /// once the region is opened again.
+    seq: Option<u64>,
+    /// The active persons, by ILK id: whether each is virtual.
+    people: HashMap<[u8; 16], bool>,
+    /// Whether the router said it cannot open the region, so it says it once.
+    unavailable_said: bool,
+}
+
+/// The router's view of its hive's persons. Process-wide, as a router serves one hive: the task of
+/// any of the three paths looks a person up in it without locking any of the router's tables. It
+/// is held for a lookup, and for a read again when the region moved.
+static IDENTITY_PEOPLE: std::sync::Mutex<Option<IdentityPeople>> = std::sync::Mutex::new(None);
+
+/// How often the view tries to open the identity region while it has none, or while its writer
+/// does not beat. SY.identity creates the region again when its limits change, and a reader of the
+/// old one would keep what it last held.
+const IDENTITY_PEOPLE_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The person `ilk_id` names in `hive_id`'s identity SHM. `None` for an agent, a system ILK, an
+/// inactive or unknown ILK, and while the router cannot read the region.
+fn identity_person(hive_id: &str, ilk_id: &[u8; 16]) -> Option<Person> {
+    let mut guard = IDENTITY_PEOPLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard
+        .as_ref()
+        .is_none_or(|people| people.hive_id != hive_id)
+    {
+        *guard = Some(IdentityPeople::new(hive_id));
+    }
+    guard.as_mut()?.person(ilk_id)
+}
+
+impl IdentityPeople {
+    fn new(hive_id: &str) -> Self {
+        Self {
+            hive_id: hive_id.to_string(),
+            reader: None,
+            opened_at: None,
+            seq: None,
+            people: HashMap::new(),
+            unavailable_said: false,
+        }
+    }
+
+    fn person(&mut self, ilk_id: &[u8; 16]) -> Option<Person> {
+        self.keep_open();
+        let reader = self.reader.as_ref()?;
+        let seq = reader.seq()?;
+        if self.seq != Some(seq) {
+            match reader.read_ilk_kinds() {
+                Ok((read_at, kinds)) => {
+                    self.people = kinds
+                        .iter()
+                        .filter(|kind| {
+                            kind.flags & FLAG_ACTIVE != 0 && kind.ilk_type == SHM_ILK_TYPE_HUMAN
+                        })
+                        .map(|kind| (kind.ilk_id, kind.flags & ILK_FLAG_VIRTUAL != 0))
+                        .collect();
+                    self.seq = Some(read_at);
+                }
+                Err(err) => {
+                    // A write held the region past the seqlock's wait: no verdict for this
+                    // message, and the next one reads again.
+                    tracing::debug!(error = %err, "src_ilk_bind could not read the identity region");
+                    self.seq = None;
+                    return None;
+                }
+            }
+        }
+        self.people
+            .get(ilk_id)
+            .map(|&is_virtual| Person { is_virtual })
+    }
+
+    /// Opens the region when the view has none, or when its writer has not beaten for
+    /// `HEARTBEAT_STALE_MS`, at most once per `IDENTITY_PEOPLE_REOPEN_INTERVAL`. A failed opening
+    /// keeps the region already open: what it last held is better than no verdict.
+    fn keep_open(&mut self) {
+        let beating = self
+            .reader
+            .as_ref()
+            .and_then(IdentityRegionReader::debug_state)
+            .is_some_and(|state| {
+                now_epoch_ms().saturating_sub(state.heartbeat) <= HEARTBEAT_STALE_MS
+            });
+        if beating
+            || self
+                .opened_at
+                .is_some_and(|at| at.elapsed() < IDENTITY_PEOPLE_REOPEN_INTERVAL)
+        {
+            return;
+        }
+        self.opened_at = Some(Instant::now());
+        let shm_name = format!("/jsr-identity-{}", self.hive_id);
+        match IdentityRegionReader::open_read_only_auto(&shm_name) {
+            Ok(reader) => {
+                if self.reader.is_none() {
+                    tracing::info!(shm = %shm_name, "src_ilk_bind reads the identity region");
+                }
+                self.reader = Some(reader);
+                self.seq = None;
+                self.unavailable_said = false;
+            }
+            Err(err) => {
+                if self.reader.is_none() && !self.unavailable_said {
+                    tracing::warn!(
+                        shm = %shm_name,
+                        error = %err,
+                        "src_ilk_bind cannot open the identity region: a person's src_ilk gets no \
+                         verdict until it can"
+                    );
+                    self.unavailable_said = true;
+                }
+            }
+        }
+    }
 }
 
 fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::IdentitySnapshot) {
@@ -19175,5 +19457,511 @@ mod tests {
         let body = &src[start..end];
         assert!(body.contains("RouterRegionReader::open_read_only_owned_by(&shm_name, own_uid)"));
         assert!(!body.contains("RouterRegionReader::open_read_only(&"));
+    }
+
+    /// An ILK entry of `ilk_type` with `flags`, for the binding of a person's `src_ilk`.
+    fn binding_ilk(ilk_id: Uuid, ilk_type: u8, flags: u16) -> IlkEntry {
+        IlkEntry {
+            ilk_id: *ilk_id.as_bytes(),
+            ilk_type,
+            registration_status: 2,
+            flags,
+            tenant_id: [0u8; 16],
+            display_name: [0u8; 128],
+            handler_node: [0u8; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0u8; 2],
+            role_hash: [0u8; 32],
+            skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
+            created_at: 1,
+            updated_at: 1,
+            personality_hash: [0u8; 32],
+            _reserved: [0u8; 8],
+        }
+    }
+
+    /// A hive of the test's own and its identity region, holding `ilks`, under the name the router
+    /// opens (`/jsr-identity-<hive>`), short enough for macOS's 31 bytes. The caller unlinks it.
+    fn binding_identity_region(ilks: &[IlkEntry]) -> (String, crate::shm::IdentityRegionWriter) {
+        let hive = format!("ed1{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let name = format!("/jsr-identity-{hive}");
+        unlink_test_shm(&name);
+        let mut writer = crate::shm::IdentityRegionWriter::open_or_create(
+            &name,
+            Uuid::new_v4(),
+            &hive,
+            true,
+            crate::shm::IdentityRegionLimits {
+                max_ilks: 8,
+                max_tenants: 1,
+                max_vocabulary: 1,
+                max_ilk_aliases: 1,
+            },
+        )
+        .expect("the identity region");
+        for ilk in ilks {
+            writer.upsert_ilk_entry(*ilk).expect("an ILK");
+        }
+        (hive, writer)
+    }
+
+    /// A user message from `sender` to `dst`, as its node sends it, carrying `src_ilk`.
+    fn message_as(sender: Uuid, dst: Uuid, src_ilk: Option<&str>) -> Message {
+        Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(dst.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                src_ilk: src_ilk.map(str::to_string),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        }
+    }
+
+    /// The same message as the router stamped it with `sender`'s name.
+    fn stamped_as(name: &str, src_ilk: Option<&str>) -> Message {
+        let mut msg = message_as(Uuid::new_v4(), Uuid::new_v4(), src_ilk);
+        msg.routing.src_l2_name = Some(name.to_string());
+        msg
+    }
+
+    /// Stage 1 §3.2: a person's `src_ilk` is taken from an IO, a WF or an SY; a virtual person's
+    /// only from an SY. An AI, a router or any other name is refused, and the prefixes are the
+    /// node kinds' exact ones.
+    #[test]
+    fn a_persons_src_ilk_is_bound_to_io_wf_and_sy_and_a_virtual_ones_to_sy() {
+        let person = Person { is_virtual: false };
+        let virtual_person = Person { is_virtual: true };
+        for (sender, for_person, for_virtual) in [
+            ("IO.slack@motherbee", true, false),
+            ("IO.api@worker1", true, false),
+            ("IO.cloud@motherbee", true, false),
+            ("WF.onboarding@motherbee", true, false),
+            ("SY.architect@motherbee", true, true),
+            ("SY.frontdesk.gov@motherbee", true, true),
+            ("AI.support@motherbee", false, false),
+            ("RT.gateway@motherbee", false, false),
+            ("io.slack@motherbee", false, false),
+            ("IOX.slack@motherbee", false, false),
+            ("WFX@motherbee", false, false),
+            ("", false, false),
+        ] {
+            assert_eq!(
+                src_ilk_sender_allowed(sender, person),
+                for_person,
+                "a person from {sender:?}"
+            );
+            assert_eq!(
+                src_ilk_sender_allowed(sender, virtual_person),
+                for_virtual,
+                "a virtual person from {sender:?}"
+            );
+        }
+    }
+
+    /// Only a `src_ilk` in which the SHM finds a person gets a verdict: none, a blank one, a value
+    /// that is no ILK, and an ILK that is not a person's (an agent's, a system's, an unknown one)
+    /// go on, even enforced and from an AI, and nobody is answered.
+    #[test]
+    fn a_src_ilk_that_names_no_person_gets_no_verdict() {
+        let ilk = format!("ilk:{}", Uuid::new_v4());
+        let (link, mut answers) = link_queue("node");
+        for src_ilk in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("ilk:not-a-uuid"),
+            Some("tnt:7f0c1a52-6c3e-4a8e-9a55-2d7b1f0e9c11"),
+        ] {
+            let msg = stamped_as("AI.gate@motherbee", src_ilk);
+            let passes = src_ilk_binding_passes(
+                &msg,
+                Some(&link),
+                Uuid::new_v4(),
+                SrcIlkBindMode::Enforce,
+                |_| panic!("{src_ilk:?} is no ILK: the SHM is not asked"),
+            )
+            .expect("bound");
+            assert!(passes, "{src_ilk:?}");
+        }
+        // An agent, a system ILK and an unknown one: the SHM's view holds persons only.
+        let msg = stamped_as("AI.gate@motherbee", Some(&ilk));
+        let passes = src_ilk_binding_passes(
+            &msg,
+            Some(&link),
+            Uuid::new_v4(),
+            SrcIlkBindMode::Enforce,
+            |_| None,
+        )
+        .expect("bound");
+        assert!(passes);
+        assert!(answers.try_recv().is_err(), "nobody is answered");
+    }
+
+    /// Report, the mode this release ships: a sender that may not carry the person is logged with
+    /// the sender, the ILK, the destination and the trace, and counted, and its message goes on
+    /// unanswered. One that may carry it is not logged.
+    #[test]
+    fn reported_a_person_from_an_ai_is_logged_counted_and_delivered() {
+        let ilk = format!("ilk:{}", Uuid::new_v4());
+        let (link, mut answers) = link_queue("node");
+        let journal = TestJournal::default();
+        let before = SRC_ILK_NOT_BOUND.load(Ordering::Relaxed);
+        let msg = stamped_as("AI.gate@motherbee", Some(&ilk));
+        let allowed = stamped_as("IO.slack@motherbee", Some(&ilk));
+        {
+            let _capture = journal.capture();
+            for msg in [&msg, &allowed] {
+                let passes = src_ilk_binding_passes(
+                    msg,
+                    Some(&link),
+                    Uuid::new_v4(),
+                    SrcIlkBindMode::Report,
+                    |_| Some(Person { is_virtual: false }),
+                )
+                .expect("bound");
+                assert!(passes, "reported, the message goes on");
+            }
+        }
+        assert!(answers.try_recv().is_err(), "nobody is answered");
+        assert!(
+            SRC_ILK_NOT_BOUND.load(Ordering::Relaxed) > before,
+            "counted"
+        );
+        let text = journal.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("src_ilk_bind would_refuse"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let Destination::Unicast(dst) = &msg.routing.dst else {
+            unreachable!("a unicast")
+        };
+        for field in [
+            "AI.gate@motherbee",
+            ilk.as_str(),
+            dst.as_str(),
+            msg.routing.trace_id.as_str(),
+            "not_bound_total=",
+        ] {
+            assert!(lines[0].contains(field), "{field}: {}", lines[0]);
+        }
+        assert!(!text.contains(&allowed.routing.trace_id), "{text}");
+    }
+
+    /// Enforce, built for a later release: the sender is answered UNREACHABLE `SRC_ILK_NOT_BOUND`
+    /// over its link and the message stops. A virtual person from an IO is refused too; from an SY
+    /// it goes on.
+    #[test]
+    fn enforced_a_person_from_an_ai_is_answered_src_ilk_not_bound() {
+        let ilk = format!("ilk:{}", Uuid::new_v4());
+        let (link, mut answers) = link_queue("node");
+        let journal = TestJournal::default();
+        let msg = stamped_as("AI.gate@motherbee", Some(&ilk));
+        let from_io = stamped_as("IO.slack@motherbee", Some(&ilk));
+        let from_sy = stamped_as("SY.architect@motherbee", Some(&ilk));
+        {
+            let _capture = journal.capture();
+            let passes = src_ilk_binding_passes(
+                &msg,
+                Some(&link),
+                Uuid::new_v4(),
+                SrcIlkBindMode::Enforce,
+                |_| Some(Person { is_virtual: false }),
+            )
+            .expect("bound");
+            assert!(!passes, "enforced, the message stops");
+        }
+        let answer = unreachable_answer(&mut answers, &msg);
+        assert_eq!(answer.reason, UNREACHABLE_SRC_ILK_NOT_BOUND);
+        assert!(
+            journal.text().contains("src_ilk_bind refused"),
+            "{}",
+            journal.text()
+        );
+
+        let virtual_person = |_: &[u8; 16]| Some(Person { is_virtual: true });
+        let passes = src_ilk_binding_passes(
+            &from_io,
+            Some(&link),
+            Uuid::new_v4(),
+            SrcIlkBindMode::Enforce,
+            virtual_person,
+        )
+        .expect("bound");
+        assert!(!passes, "a virtual person from an IO");
+        assert_eq!(
+            unreachable_answer(&mut answers, &from_io).reason,
+            UNREACHABLE_SRC_ILK_NOT_BOUND
+        );
+        let passes = src_ilk_binding_passes(
+            &from_sy,
+            Some(&link),
+            Uuid::new_v4(),
+            SrcIlkBindMode::Enforce,
+            virtual_person,
+        )
+        .expect("bound");
+        assert!(passes, "a virtual person from an SY");
+
+        // A sibling's frame whose link is gone stops unanswered.
+        let passes =
+            src_ilk_binding_passes(&msg, None, Uuid::new_v4(), SrcIlkBindMode::Enforce, |_| {
+                Some(Person { is_virtual: false })
+            })
+            .expect("bound");
+        assert!(!passes);
+        assert!(answers.try_recv().is_err());
+    }
+
+    /// Release B ships the binding reporting; switching it to `Enforce` is release C's, on purpose
+    /// (stage 1 §3.3).
+    #[test]
+    fn the_binding_ships_reporting() {
+        assert_eq!(SRC_ILK_BIND_MODE, SrcIlkBindMode::Report);
+    }
+
+    /// The router's view of the persons: an active human is one, virtual or not; an agent, a
+    /// system ILK, an inactive human and an unknown ILK are not. A write the view has not read
+    /// moves the region's sequence, and the next lookup sees it. A hive with no region has none.
+    #[test]
+    fn the_identity_view_holds_the_active_persons_and_follows_the_region() {
+        let person = Uuid::new_v4();
+        let virtual_person = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let system = Uuid::new_v4();
+        let inactive = Uuid::new_v4();
+        let (hive, mut writer) = binding_identity_region(&[
+            binding_ilk(person, SHM_ILK_TYPE_HUMAN, FLAG_ACTIVE),
+            binding_ilk(
+                virtual_person,
+                SHM_ILK_TYPE_HUMAN,
+                FLAG_ACTIVE | ILK_FLAG_VIRTUAL,
+            ),
+            binding_ilk(agent, 1, FLAG_ACTIVE),
+            binding_ilk(system, 2, FLAG_ACTIVE),
+            binding_ilk(inactive, SHM_ILK_TYPE_HUMAN, 0),
+        ]);
+        let mut view = IdentityPeople::new(&hive);
+        assert_eq!(
+            view.person(person.as_bytes()),
+            Some(Person { is_virtual: false })
+        );
+        assert_eq!(
+            view.person(virtual_person.as_bytes()),
+            Some(Person { is_virtual: true })
+        );
+        for other in [agent, system, inactive, Uuid::new_v4()] {
+            assert_eq!(view.person(other.as_bytes()), None, "{other}");
+        }
+
+        let late = Uuid::new_v4();
+        writer
+            .upsert_ilk_entry(binding_ilk(late, SHM_ILK_TYPE_HUMAN, FLAG_ACTIVE))
+            .expect("a later person");
+        assert_eq!(
+            view.person(late.as_bytes()),
+            Some(Person { is_virtual: false })
+        );
+        unlink_test_shm(&format!("/jsr-identity-{hive}"));
+
+        let mut nowhere = IdentityPeople::new("ed1none");
+        assert_eq!(nowhere.person(person.as_bytes()), None);
+    }
+
+    /// The local path, end to end: a node that may not carry a person sends as one, the router
+    /// logs it and delivers it; an IO's message with the same person is delivered unlogged.
+    #[tokio::test]
+    async fn a_local_node_sending_as_a_person_is_reported_and_delivered() {
+        let person = Uuid::new_v4();
+        let (hive, _writer) =
+            binding_identity_region(&[binding_ilk(person, SHM_ILK_TYPE_HUMAN, FLAG_ACTIVE)]);
+        let src_ilk = format!("ilk:{person}");
+        let (agent, io, receiver) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (agent_tx, mut agent_rx) = link_queue("node");
+        let (io_tx, _io_rx) = link_queue("node");
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([
+            (
+                agent,
+                NodeHandle {
+                    name: format!("AI.gate@{hive}"),
+                    vpn_id: 0,
+                    sender: agent_tx,
+                    connected_at: 0,
+                },
+            ),
+            (
+                io,
+                NodeHandle {
+                    name: format!("IO.slack@{hive}"),
+                    vpn_id: 0,
+                    sender: io_tx,
+                    connected_at: 0,
+                },
+            ),
+            (
+                receiver,
+                NodeHandle {
+                    name: format!("WF.receiver@{hive}"),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            ),
+        ])));
+        let from_agent = message_as(agent, receiver, Some(&src_ilk));
+        let from_io = message_as(io, receiver, Some(&src_ilk));
+        let journal = TestJournal::default();
+        {
+            let _capture = journal.capture();
+            for msg in [&from_agent, &from_io] {
+                handle_message(
+                    msg,
+                    &nodes,
+                    &Arc::new(Mutex::new(Fib::default())),
+                    &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+                    &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                    &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+                    &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+                    &Arc::new(Mutex::new(OpaResolver::new())),
+                    &Arc::new(Mutex::new(BroadcastCache::new())),
+                    &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                    &stream::StreamHandle::detached(),
+                    &hive,
+                    &format!("SY.frontdesk.gov@{hive}"),
+                    &format!("RT.gateway@{hive}"),
+                    Uuid::new_v4(),
+                    false,
+                    &Arc::new(Mutex::new(None)),
+                    &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+                    None,
+                )
+                .await
+                .expect("handled");
+            }
+        }
+        unlink_test_shm(&format!("/jsr-identity-{hive}"));
+
+        for msg in [&from_agent, &from_io] {
+            let frame = receiver_rx.try_recv().expect("delivered as today");
+            let delivered: Message = serde_json::from_slice(&frame).expect("a message");
+            assert_eq!(delivered.routing.trace_id, msg.routing.trace_id);
+            assert_eq!(delivered.meta.src_ilk.as_deref(), Some(src_ilk.as_str()));
+        }
+        assert!(agent_rx.try_recv().is_err(), "reported, not answered");
+        let text = journal.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("src_ilk_bind would_refuse"))
+            .unwrap_or_else(|| panic!("the report: {text}"));
+        assert!(line.contains(&format!("AI.gate@{hive}")), "{line}");
+        assert!(line.contains(&from_agent.routing.trace_id), "{line}");
+        // The IO's message, with the same person, is not reported.
+        assert_eq!(
+            text.matches("src_ilk_bind would_refuse").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    /// The WAN path, end to end: another hive's agent sending as one of this hive's persons is
+    /// logged under the name its hive authenticated, and delivered.
+    #[tokio::test]
+    async fn a_wan_frame_from_an_agent_as_a_person_is_reported_and_delivered() {
+        let person = Uuid::new_v4();
+        let (hive, _writer) =
+            binding_identity_region(&[binding_ilk(person, SHM_ILK_TYPE_HUMAN, FLAG_ACTIVE)]);
+        let ctx = wan_context_of(&hive, None);
+        let remote = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await =
+            Some(lsa_with_remote_node("worker1", remote, "AI.gate@worker1"));
+        let receiver = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
+        ctx.nodes.lock().await.insert(
+            receiver,
+            NodeHandle {
+                name: format!("WF.receiver@{hive}"),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let frame = message_as(remote, receiver, Some(&format!("ilk:{person}")));
+        let (link, mut answers) = link_queue("node");
+        let journal = TestJournal::default();
+        {
+            let _capture = journal.capture();
+            handle_wan_message(
+                &frame,
+                &link,
+                &ctx,
+                "worker1",
+                Uuid::new_v4(),
+                "RT.gateway@worker1",
+                1,
+            )
+            .await
+            .expect("handled");
+        }
+        unlink_test_shm(&format!("/jsr-identity-{hive}"));
+
+        let delivered = receiver_rx.try_recv().expect("delivered as today");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("a message");
+        assert_eq!(delivered.routing.trace_id, frame.routing.trace_id);
+        assert!(answers.try_recv().is_err(), "reported, not answered");
+        let text = journal.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("src_ilk_bind would_refuse"))
+            .unwrap_or_else(|| panic!("the report: {text}"));
+        assert!(line.contains("AI.gate@worker1"), "{line}");
+        assert!(line.contains(&frame.routing.trace_id), "{line}");
+    }
+
+    /// The three paths a sender's message enters a router by bind a person's `src_ilk` with the
+    /// shipped mode, after the router stamped the sender's name and before anything routes it.
+    #[test]
+    fn the_three_paths_bind_a_persons_src_ilk_once_the_sender_is_named() {
+        let src = include_str!("mod.rs");
+        for (handler, stamp) in [
+            (
+                "async fn handle_message(",
+                "msg.routing.src_l2_name = Some(src_handle.name.clone());",
+            ),
+            (
+                "async fn handle_wan_message(",
+                "msg.routing.src_l2_name = Some(src_info.name.clone());",
+            ),
+            (
+                "async fn handle_peer_message(",
+                "msg.routing.src_l2_name = Some(src_node.name.clone());",
+            ),
+        ] {
+            let start = src.find(handler).expect(handler);
+            let end = start + src[start..].find("\n}\n").expect("its end");
+            let body = &src[start..end];
+            let stamped = body.find(stamp).expect(stamp);
+            let routed = stamped
+                + body[stamped..]
+                    .find("match &msg.routing.dst {")
+                    .expect("the routing");
+            let between = &body[stamped..routed];
+            assert!(
+                between.contains("src_ilk_binding_passes(")
+                    && between.contains("SRC_ILK_BIND_MODE"),
+                "{handler} binds a person's src_ilk between the stamp and the routing"
+            );
+        }
     }
 }
