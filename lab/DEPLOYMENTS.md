@@ -21,6 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
+| **0.1.154** | 2026-11-25 | `ba6d0d9a` | motherbee + spokes (core), the router alone, the Digital Executive's stage 1, release B ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §3): the router binds a person's `src_ilk` to its sender (IO, WF, SY; a virtual person's to SY) on its three paths, in REPORT mode (a would-be refusal only logs `src_ilk_bind would_refuse`, throttled); a background watcher publishes the view of the hive's persons and aliases, the message path never reads the region | ✅ live, gate0254 17 PASS, no FAIL | snapshot `pre-router-ed1-0-1-154` · `apt install fluxbee=0.1.153` |
 | **0.1.153** | 2026-11-25 | `93a4024a` | motherbee + spokes (core), the Digital Executive's stage 1, release A ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md)): the identity SHM's virtual-person bit (`ILK_FLAG_VIRTUAL`, its three copies), SY.identity's virtual person (migration v6, `ILK_CREATE_VIRTUAL` from SY.admin@motherbee only, the `ILK_VIRTUAL` refusals of merges, re-registration, channels and provisions), SY.admin's `create_virtual_person` and Cloud's person actions refused on an ED, io.api's `by_ilk` refusing one, Archi's SCMD route | ✅ live, gate0253 31/31 PASS (one tool FAIL re-run PASS) | snapshot `pre-ed1-0-1-153` · `apt install fluxbee=0.1.152` (migration v6 only adds a column) |
 | **0.1.152** | 2026-11-20 | `9dfe1a4d` | motherbee + spokes (core), two binaries, one branch each: Archi (SY.architect) takes an identity's whole lifecycle in SCMD on SY.admin's own routes (purges included, run directly as every SCMD; each mutation tracked, apart from what Archi's AI may write; the dead staged-action path removed), A-348 (SCMD config `?replace` and the binding fields), A-307's Archi part (`BUSY`), A-327 (the explanation turn reads the prompt cache); SY.admin A-358 (a `hive` upstream at an address io.web refuses is refused at publish, `HIVE_ADDRESS_REFUSED`) and A-337 (the plan review sees no secret; a plan holding the mask refused), the purge help as the code has it | ✅ live, checked on 8.x | snap `pre-archi-0-1-152` (all 4 VMs) · `apt install fluxbee=0.1.151` + 0.1.151's `update_installation` (nothing one-way) |
 | **0.1.151** | 2026-11-19 | `890d258f` | motherbee + spokes (core), io.web stage 2.2's R2, the binaries, one branch per binary ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): io.web a transparent reverse proxy to each exposure's upstream (every method, bodies and streams frame by frame, WebSockets, no wait of its own; the Origin check; the header table; a renewal moves the sessions; what is open cut at once when the access ends), SY.edge the pass-through (every method but CONNECT and TRACE, bodies, WebSockets in their connection's scope, no wait of its own, TCP keepalive, every cookie pair, HSTS, frame_origins), SY.admin `publish_cloud_endpoint`'s `cloud_origins`; with A-356 and A-357 (SY.admin's executor contract) | ✅ live, checked on 8.x | snap `pre-web22-0-1-151` (all 4 VMs) · `apt install fluxbee=0.1.150` + 0.1.150's `update_installation` (nothing one-way; exposures go back to the placeholder; io.web's and the edge's files hold the origins, which their 0.1.150 refuses: each serves SY.admin's next push, within 60 s; 0.1.150's SY.admin drops the origins from its registry, so name them again after coming back) |
@@ -162,6 +163,65 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.154 — the router binds a person's src_ilk, in report mode (the Digital Executive's stage 1, release B)
+
+- **Date:** 2026-11-25 (ART) · **Previous version:** 0.1.153 · **Commit:** `ba6d0d9a`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The router alone
+  (shared code, METHOD §9).
+- **Why:** once an ED acts on who is talking, an unbound `src_ilk` is a hole: any node could write as
+  a person ([digital-executive-v1-design](../docs/digital-executive-v1-design.md) §7.2, the panel's
+  high). The operator: report first, then enforce (stage 1 §3.3, §6).
+- **What changed (`coa/router-ed1`, two builder commits and the review's fix, rebased and
+  fast-forwarded):**
+  - **The rule:** after the router stamps the sender's name, on the local, sibling and WAN paths:
+    - a `src_ilk` naming an active person in the identity SHM (or an active alias of one, or the
+      person's bare UUID) is bound to an `IO.`, `WF.` or `SY.` sender;
+    - a virtual person's is bound to `SY.` only.
+  - **REPORT mode** (in the code; `enforce` is built and tested, a later release): a would-be refusal
+    logs `src_ilk_bind would_refuse` with the path, sender, ILK, destination, trace and totals, at
+    most once a minute per (sender, ILK), and the message is delivered unchanged.
+  - **The view:** a background watcher reads the identity region every 200 ms, off the message path:
+    - it rebuilds only on an even, moved sequence;
+    - it keeps the last view on a write under way or a failed read;
+    - it reopens the region at most once a second, only when there is none or its heartbeat is
+      stale.
+
+    The message path takes one read lock and does one lookup. `src/shm/mod.rs` gained a reader of
+    each ILK's id, type and flags and of the aliases, under one seqlock pass.
+- **Review:** one round. A high: the first build's hot path spun up to 5 ms under a process-wide
+  lock on an odd sequence (an identity killed mid-write), about 200 msg/s for every message with an
+  ILK. It was fixed before the build by the watcher. Lows fixed: the path in the line, its throttle,
+  the bare UUID, aliases, and a test of enforce per path.
+- **Build:** CI green on the branch at `ba6d0d9a`. Build on fb-build 02:42:32–02:59:44Z (17.2 min),
+  publish before the mark.
+- **The deploy:** the mark at 03:00:41Z; `ops deploy 0.1.154 --snapshot pre-router-ed1-0-1-154 --drop
+  pre-ed1-0-1-153` in 277 s:
+  - **Phases:** snapshots 32.8 s, the motherbee's apt 134.8 s, its admin on the version 48.4 s, the
+    spokes answering 9.4 s, the update's call 22.1 s, the hives on the target 15.4 s, health 6.0 s.
+  - **On the target after the update's call:** the motherbee 5.2 s, egress1 and ingress1 27.6 s,
+    worker1 31.8 s.
+  - **Health:** clean.
+- **Checked on 8.x (the gate, gate0254, 03:06–03:07Z; `scratchpad/gate-tools/r154_gate.py` and
+  `r154_probe.py`, git-ignored; 17 PASS, no FAIL, no model call):**
+  - **The smoke:** a new node RUNNING in 4.3 s on 0.1.154, stopped; a stopped one reads STOPPED.
+  - **The probe on worker1's router socket,** under throwaway names, each message to itself and read
+    back, all four delivered:
+    - an `AI.*` as a real person: `would_refuse`, `path=local`;
+    - an `IO.*` as the same person: nothing logged;
+    - an `AI.*` with the person's bare UUID: `would_refuse`;
+    - an `IO.*` as a virtual person: `would_refuse`, `virtual_person=true`.
+  - **The sweep:** in every hive's router journal since the deploy, no `src_ilk_bind` line outside the
+    probe's. The motherbee's and worker1's watchers read their identity region (9 persons, 0
+    aliases).
+  - **Ingress1 and egress1 have no identity region** (they keep no identity), so their routers give
+    no verdict and warn once. Nothing is lost: only `SY.*` nodes run there, and what they relay over
+    the WAN was checked at its origin's router.
+  - **Cleaned:** the person, the virtual person, the smoke node.
+- **Next:** the report stays on with the installation's own traffic. Its lines are read again before
+  `enforce` (release C, the operator's call), along with the bare-UUID and alias cases it now covers.
+- **Rollback:** snapshot `pre-router-ed1-0-1-154`, or `apt install fluxbee=0.1.153` and 0.1.153's
+  `update_installation`: nothing one-way.
 
 ## 0.1.153 — the Digital Executive's stage 1, release A: a virtual person, and what it refuses
 
