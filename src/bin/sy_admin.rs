@@ -15371,6 +15371,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "NOT_FOUND"
         | "ILK_NOT_FOUND"
         | "TENANT_NOT_FOUND"
+        // SY.identity's answer for a tenant it does not hold when it creates a person: a virtual
+        // person's creation is the first SY.admin action it reaches (create_virtual_person).
+        | "INVALID_TENANT"
         | "NODE_NOT_FOUND"
         | "BLOB_NOT_FOUND"
         | "KEY_NOT_FOUND"
@@ -15416,6 +15419,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "TENANT_NOT_DELETED"
         // A node of a tenant that is not active is not started (docs/ilk-tenant-model-v1.md §2.3).
         | "TENANT_NOT_ACTIVE"
+        // Nor is a person born in one: a pending or suspended tenant (create_virtual_person).
+        | "TENANT_PENDING"
+        | "TENANT_SUSPENDED"
         | "TENANT_DELETED"
         | "ILK_NOT_DELETED"
         | "ILK_KEY_CONFLICT"
@@ -20062,7 +20068,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "create_virtual_person" => vec![
             "A virtual person is a human ILK marked virtual: a Digital Executive (docs/digital-executive-v1-design.md §3). It is created only this way, by the primary's SY.identity (ILK_CREATE_VIRTUAL, which takes it from SY.admin alone), never by a registration or a provision.",
-            "It is born with its registration complete, charged to tenant_id, with display_name and an optional company_name, and with no channels. The tenant must exist and never be the root one: TENANT_ROOT_NOT_REGISTRABLE, TENANT_NOT_FOUND or TENANT_DELETED otherwise.",
+            "It is born with its registration complete, charged to tenant_id, with display_name and an optional company_name, and with no channels. The tenant must exist, be active, and never be the root one: INVALID_TENANT (404) for one SY.identity does not hold, TENANT_DELETED, TENANT_PENDING or TENANT_SUSPENDED (409), or TENANT_ROOT_NOT_REGISTRABLE (403) otherwise; a display_name or company_name over 128 bytes answers INVALID_REQUEST.",
             "The answer is {status, ilk_id, tenant_id, virtual: true}; get_ilk and list_ilks show virtual.",
             "In this stage for the operator's tests: the operator's HTTP API and Archi, never Fluxbee Cloud. Remove one with delete_ilk, then purge_ilk.",
             "A virtual person refuses Fluxbee Cloud's delete_ilk, restore_ilk and set_ilk_tenant, any merge into it, and a channel from an IO node: each answers ILK_VIRTUAL. Cloud's register_human with an email a virtual person holds answers ILK_VIRTUAL from SY.identity, and nothing is merged.",
@@ -34363,6 +34369,11 @@ mod tests {
     fn identity_delete_errors_map_to_operator_http_statuses() {
         assert_eq!(error_code_to_http_status("ILK_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("TENANT_NOT_FOUND"), 404);
+        // A virtual person's creation reaches SY.identity's register-side tenant codes.
+        assert_eq!(error_code_to_http_status("INVALID_TENANT"), 404);
+        assert_eq!(error_code_to_http_status("TENANT_PENDING"), 409);
+        assert_eq!(error_code_to_http_status("TENANT_SUSPENDED"), 409);
+        assert_eq!(error_code_to_http_status("TENANT_DELETED"), 409);
         assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
         assert_eq!(error_code_to_http_status("TENANT_ROOT_NOT_ALLOWED"), 403);
         for refused in [
@@ -50755,8 +50766,11 @@ mod tests {
         let notes = admin_action_request_notes("create_virtual_person");
         for words in [
             "TENANT_ROOT_NOT_REGISTRABLE",
-            "TENANT_NOT_FOUND",
+            "INVALID_TENANT",
             "TENANT_DELETED",
+            "TENANT_PENDING",
+            "TENANT_SUSPENDED",
+            "128 bytes",
             "virtual: true",
             "register_human",
             "ILK_VIRTUAL",
