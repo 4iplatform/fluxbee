@@ -1,6 +1,6 @@
 # The Digital Executive v1, stage 1: the base of identity and security
 
-**Status:** the build design, 2026-11-25, for the operator's review. No code yet.
+**Status:** the build design, 2026-11-25, agreed with the operator the same day (§6). Building.
 
 **What it builds:** stage 1 of [digital-executive-v1-design](digital-executive-v1-design.md) §15.
 - **The ED's ILK:** a person's ILK with the `virtual` flag.
@@ -87,7 +87,7 @@ works:
 | `WF.*` | A WF's `send_message` to a node that is not an IO speaks for the instance's person: `src_ilk` is the person. A forward keeps the source's meta. | `go/nodes/wf/wf-generic/node/actions.go` |
 | `SY.architect` | Archi's impersonation sends a user message as a chosen ILK, so the operator can test an agent as a person. | `src/bin/sy_architect.rs` |
 | `AI.*` | Never a person: a reply carries the agent's own ILK (`stamp_reply`), pinned by a contract test. | `crates/fluxbee_ai_sdk/src/runtime.rs` |
-| Others (`SY.*`, `RT.*`) | Their own ILK, or none. | |
+| Other `SY.*` | Their own ILK, or none. SY.frontdesk.gov's replies carry the person as `dst_ilk`, not `src_ilk`; the Go system nodes (SY.timer, SY.wf-rules, SY.opa.rules) never set it. | `nodes/gov/ai-frontdesk-gov`, `go/sy-*` |
 
 ### 3.2 The rule
 
@@ -98,9 +98,10 @@ works:
 
   Every destination, not only a resolve.
 - **When it applies:** when `meta.src_ilk` names an ILK whose type in the identity SHM is `human`.
-- **For a person who is not virtual,** it is accepted from an `IO.*`, a `WF.*` or `SY.architect`
-  sender.
-- **For a virtual ILK,** it is accepted only from `SY.architect`, for the operator's tests. Stage 2
+- **For a person who is not virtual,** it is accepted from an `IO.*`, a `WF.*` or a `SY.*` sender.
+  Every system node is Fluxbee's own code (the operator, 2026-11-25: *"¿los SY? por SY.frontdesk"*),
+  and today only SY.architect sends a person's ILK.
+- **For a virtual ILK,** it is accepted only from a `SY.*` sender (Archi, for the operator's tests). Stage 2
   adds the owner of one of its channels (each channel's `owner_l2_name`, in the SHM) and its
   registered hand.
 - **Anything else is refused.** The sender gets an `UNREACHABLE` with a new reason,
@@ -178,11 +179,11 @@ SHM's layout, so none should.
 
 ---
 
-## 6. For the operator
+## 6. The operator's calls (2026-11-25)
 
-1. **The router's allowed senders** for a person's `src_ilk`: `IO.*`, `WF.*` and `SY.architect`
-   (§3.2). Is any sender missing, or one too many?
-2. **Report first, then enforce,** with a release for each mode (§3.3).
-3. **The operator keeps `delete_ilk`, `restore_ilk` and `set_ilk_tenant` on an ED in this stage,**
-   for tests and cleanup (§2.2).
-4. **Two releases, A and B** (§5).
+1. **The allowed senders:** `IO.*`, `WF.*` and every `SY.*` (*"¿los SY? por SY.frontdesk"*).
+2. **Report first, then enforce:** *"primero que ande, después que sea seguro"*; if something
+   clashes, talk before.
+3. **The operator keeps the person actions on an ED in this stage:** yes, and *"rompe todo sin
+   problemas, ahora es avanzar lo más importante"*.
+4. **The releases:** their order and number are mine to choose.
