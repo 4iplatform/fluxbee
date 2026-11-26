@@ -671,7 +671,7 @@ Options (b), a label over several agents, and (c), one node that does everything
 
 ## 29. Notes, 2026-11-25 (later): the calls on the panel's findings
 
-- **The recommendations, one by one** (design §16.6): the operator, *"sí a todo"*, with two notes:
+- **The recommendations, one by one** (design §17.6): the operator, *"sí a todo"*, with two notes:
   - **The profiles' folder:** review the code and multi-node: *"sería como activar un área de system
     que syncthing, solo revisar"*. Reviewed (design §10.5): the sibling of Archi's agent-assets
     folder, a dist folder the motherbee sends and the workers receive.
