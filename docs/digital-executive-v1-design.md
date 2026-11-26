@@ -918,25 +918,31 @@ The operator brought two methods and a combination, as ideas to adapt.
 
 ### 12.3 What it means in Fluxbee
 
-**Decided** (the operator, 2026-11-25; notes §27):
+**Decided** (the operator, 2026-11-25; notes §27, §28):
 
 - **It shares data with identity.** Part of the card comes from what §10 keeps on the person: its
   name, its position and its company. That overlap is why the operator wanted it in this design.
 - **Private data stays private, and people are the standard.** An ED exposes what a person would
   expose, and nothing more.
 - **Everything is served by Fluxbee, through the edge.**
+- **The easy part first, in stages.**
+  1. The DID document (the passport and its keys) and the credential the company signs. Neither
+     needs an interface to talk through.
+  2. The A2A card, later, and only while it costs nothing.
+- **Not through io.api:** better not to mix the two. How identity is exposed, only for this, is seen
+  when it is built.
+- **The name:** the DID and its host come from the ED's first and last name. Names repeat, which is
+  no problem for now; whether to handle repeats, or to move to A2A, is seen later.
 
 **Proposed** (ideas for the talk):
 
 - **The card's skills are the ED's responsibilities:** its deployments in SY.deploy, one skill each.
   They are not an agent's *skills* (identity v2.1). The card can be generated from the ED's grouping
   and its profile.
-- **The card's interface is a channel.** `supportedInterfaces` is required, and points at an A2A
-  endpoint into Fluxbee, through which other companies' agents talk to the ED. It is one more of the
-  ED's channels (§7), assigned like the others, and subject to §8.5. The first draft named a new A2A
-  IO node; the operator asked to simplify it (notes §27). The simplest candidate is io.api: it is
-  already the HTTP door through the edge, with a bearer of its own and a subject ILK in its tenant.
-  An A2A adapter in io.api would serve the A2A methods. **Open.**
+- **The card's interface is a channel,** for stage 2. `supportedInterfaces` is required, and points
+  at an A2A endpoint into Fluxbee, through which other companies' agents talk to the ED. It is one
+  more of the ED's channels (§7), and subject to §8.5. Not io.api (decided above). **Open** until
+  stage 2.
 - **The extended card's "legitimate client"** is the reinforced contact process of §9: someone who
   has proved who they are.
 - **Keys:** the ED's Ed25519 key goes in SY.vault, in its tenant. For Method 2's portability, the

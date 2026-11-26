@@ -659,7 +659,17 @@ Options (b), a label over several agents, and (c), one node that does everything
 - **The A2A interface:** the first draft named a new IO for it; the operator asked to talk it, to
   simplify it.
 
-## 28. Later questions (not yet)
+## 28. Notes, 2026-11-25 (later): the easy part first
+
+- **Stages, the easy part first** (the operator): first the DID document and the credential the
+  company signs, which need no interface; the A2A card later, and only while it is free (*"mientras
+  que sea gratis, sino no vamos por eso"*).
+- **Not io.api:** it does not serve for this; better not to mix. How to expose identity, only for
+  this, is seen in its moment.
+- **The name:** no problem. The one problem, not one for now: names repeat (first and last name);
+  later, see whether they repeat, or move to A2A.
+
+## 29. Later questions (not yet)
 
 - The ED's agents' tools: which ones, and what of the shared memory they read.
 
