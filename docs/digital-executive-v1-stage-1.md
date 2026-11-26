@@ -188,3 +188,16 @@ SHM's layout, so none should.
 3. **The operator keeps the person actions on an ED in this stage:** yes, and *"rompe todo sin
    problemas, ahora es avanzar lo más importante"*.
 4. **The releases:** their order and number are mine to choose.
+
+## 7. Carried forward, from the review round (2026-11-25)
+
+- **To stage 2, an ED's channels in the IOs' own lookup.** An IO resolves a sender's address in the
+  identity SHM first, and provisions only on a miss. SY.identity's refusal to provision onto a
+  virtual person is the fallback. Once an ED holds channels, the IOs' lookup must leave them out,
+  or check `ILK_FLAG_VIRTUAL`: otherwise mail *from* an ED's address would carry the ED's ILK.
+- **To stage 2, an idempotency key on a virtual person's creation.** In this stage only the operator
+  creates one, and a retry after a timeout makes a second one, cleaned by hand. Cloud's path
+  (design §4.1) carries its own id for the ED.
+- **Before `enforce` (release C), two ways around the router's rule:**
+  - a bare UUID with no `ilk:` prefix, which some consumers also resolve to the person;
+  - an active alias, which the pre-resolve turns back into its person.
