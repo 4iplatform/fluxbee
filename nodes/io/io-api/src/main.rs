@@ -1404,8 +1404,20 @@ fn validate_explicit_subject_ilk(
         )
     };
     let snapshot = list_ilks_from_hive_id(hive_id).map_err(unavailable)?;
+    let known = ilk_belongs_to_tenant(&snapshot.ilks, ilk_id, tenant_id) || {
+        let channels = list_ich_options_from_hive_id(hive_id).map_err(unavailable)?;
+        ilk_has_channel_in_scope(&channels, ilk_id, tenant_id)
+    };
+    if !known {
+        // Any ILK this tenant does not know answers the same, a virtual one included: the answer
+        // tells another tenant nothing about it (docs/io/io-api-node-spec.md, by_ilk).
+        return Err(ApiIngressError::new(
+            "subject_not_found",
+            "requested subject is not known to this IO.api tenant",
+        ));
+    }
     // A virtual person (a Digital Executive) speaks only through what it was given: its own IO
-    // nodes and its conscious. An integrator's `by_ilk` never speaks as one, in any tenant
+    // nodes and its conscious. An integrator's `by_ilk` never speaks as one, even of its own tenant
     // (docs/digital-executive-v1-stage-1.md §4).
     if ilk_is_virtual(&snapshot.ilks, ilk_id) {
         return Err(ApiIngressError::new(
@@ -1413,18 +1425,7 @@ fn validate_explicit_subject_ilk(
             "requested subject is a virtual person (a Digital Executive); by_ilk cannot name one",
         ));
     }
-    if ilk_belongs_to_tenant(&snapshot.ilks, ilk_id, tenant_id) {
-        return Ok(());
-    }
-    let channels = list_ich_options_from_hive_id(hive_id).map_err(unavailable)?;
-    if ilk_has_channel_in_scope(&channels, ilk_id, tenant_id) {
-        Ok(())
-    } else {
-        Err(ApiIngressError::new(
-            "subject_not_found",
-            "requested subject is not known to this IO.api tenant",
-        ))
-    }
+    Ok(())
 }
 
 fn ilk_is_virtual(ilks: &[IdentityIlkOption], ilk_id: &str) -> bool {

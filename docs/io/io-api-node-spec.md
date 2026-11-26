@@ -233,7 +233,9 @@ remain Edge 502/504.
 `explicit_subject by_ilk` replaces subject data with an `ilk`. IO.api accepts an ILK its
 instance's tenant knows: one charged to that tenant, or one holding a channel in the tenant's scope
 (someone who wrote to one of its IO nodes; `docs/ilk-tenant-model-v1.md` §2.3, D12). Any other ILK,
-unknown or not, returns the same `subject_not_found` error.
+unknown or not, returns the same `subject_not_found` error. An ILK the tenant knows that is a
+virtual person, a Digital Executive, returns `ilk_virtual`: `by_ilk` never speaks as one
+(`docs/digital-executive-v1-stage-1.md` §4).
 
 Prohibited request authority fields:
 
