@@ -33,7 +33,7 @@ use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
     IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry,
     VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
-    IDENTITY_DEFINITION_MAX_HANDBOOKS, IDENTITY_DEFINITION_MAX_SKILLS,
+    IDENTITY_DEFINITION_MAX_HANDBOOKS, IDENTITY_DEFINITION_MAX_SKILLS, ILK_FLAG_VIRTUAL,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -176,6 +176,13 @@ const MSG_TNT_PURGE_RESPONSE: &str = "TNT_PURGE_RESPONSE";
 // once the hive is gone.
 const MSG_ILK_RETIRE_HIVE: &str = "ILK_RETIRE_HIVE";
 const MSG_ILK_RETIRE_HIVE_RESPONSE: &str = "ILK_RETIRE_HIVE_RESPONSE";
+// The Digital Executive's stage 1 (docs/digital-executive-v1-stage-1.md §1.2): a virtual person is
+// born only this way, on the operator's SY.admin's word.
+const MSG_ILK_CREATE_VIRTUAL: &str = "ILK_CREATE_VIRTUAL";
+const MSG_ILK_CREATE_VIRTUAL_RESPONSE: &str = "ILK_CREATE_VIRTUAL_RESPONSE";
+/// What a virtual person refuses (docs/digital-executive-v1-design.md §3.1): a merge, a channel
+/// added, a Fluxbee Cloud account. The detail names the action refused (`virtual_refusal`).
+const ILK_VIRTUAL: &str = "ILK_VIRTUAL";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityDbSecretSource {
@@ -397,6 +404,17 @@ struct IlkRetireHiveRequest {
     hive_id: String,
 }
 
+/// ILK_CREATE_VIRTUAL: a Digital Executive's ILK, a person with the `virtual` flag, charged to
+/// `tenant_id` (docs/digital-executive-v1-stage-1.md §1.2). Born with its company and no channel.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkCreateVirtualRequest {
+    tenant_id: String,
+    display_name: String,
+    #[serde(default)]
+    company_name: Option<String>,
+}
+
 /// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason, 16 characters at most).
 /// A person's or a node's own delete is `direct`: deleting a tenant marks no ILK
 /// (docs/ilk-tenant-model-v1.md §2.3).
@@ -437,6 +455,12 @@ struct LifecycleChanges {
 /// sees WHAT blocked the op (e.g. which node identities are still in the tenant).
 fn lifecycle_error(code: &str, detail: &str) -> String {
     format!("{code}|{detail}")
+}
+
+/// A virtual person's refusal of `action` (docs/digital-executive-v1-stage-1.md §2): ILK_VIRTUAL,
+/// with the action named in its detail so the caller sees which of its steps was refused.
+fn virtual_refusal(action: &str, why: &str) -> String {
+    lifecycle_error(ILK_VIRTUAL, &format!("{action}: {why}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,6 +557,16 @@ struct IlkRecord {
     /// `retired: hive` (`RETIRED_REASON_PREFIX`).
     #[serde(default)]
     deleted_reason: Option<String>,
+    /// A virtual person: a Digital Executive, a `human` ILK born only by ILK_CREATE_VIRTUAL
+    /// (docs/digital-executive-v1-design.md §3). It takes no merge, no channel added and no
+    /// Fluxbee Cloud account (§3.1). `virtual` on the wire, and only when true, so a record or a
+    /// delta from a binary that predates it reads as a person.
+    #[serde(
+        default,
+        rename = "virtual",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    is_virtual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -828,6 +862,13 @@ impl IdentityStore {
                     "deleted_at_ms": ilk.deleted_at_ms,
                     "deleted_reason": ilk.deleted_reason,
                 }))
+                // `virtual` only on a virtual person's row, as its record carries it.
+                .map(|mut row| {
+                    if ilk.is_virtual {
+                        row["virtual"] = Value::Bool(true);
+                    }
+                    row
+                })
                 .map(|row| (ilk_id.to_string(), row))
             })
             .collect();
@@ -1049,6 +1090,7 @@ impl IdentityStore {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             };
             let needs_upsert = self
                 .ilks
@@ -1169,6 +1211,16 @@ impl IdentityStore {
             return Err("ACCOUNT_AMBIGUOUS".to_string());
         }
         if let Some(existing) = self.ich_lookup.get(&key).cloned() {
+            // A virtual person's address never resolves for an IO: the IO would stamp the ED's
+            // ILK on what a stranger wrote from that address, and a `cloud` key would hand the
+            // stranger a Fluxbee Cloud account on it, which an ED never holds
+            // (docs/digital-executive-v1-design.md §3.1).
+            if self.ilks.get(&existing).is_some_and(|ilk| ilk.is_virtual) {
+                return Err(virtual_refusal(
+                    MSG_ILK_PROVISION,
+                    "the channel belongs to a virtual person, which no IO provisions",
+                ));
+            }
             let mut change = None;
             if let Some(ilk) = self.ilks.get_mut(&existing) {
                 // A node's own `cloud` channel answers no signup of a person.
@@ -1237,6 +1289,7 @@ impl IdentityStore {
             }],
             deleted_at_ms: None,
             deleted_reason: None,
+            is_virtual: false,
         };
         self.ich_lookup.insert(key, ilk_id.clone());
         self.ilks.insert(ilk_id.clone(), ilk);
@@ -1267,6 +1320,69 @@ impl IdentityStore {
                     .is_some_and(|ilk| ilk.ilk_type.trim() == "human"))
     }
 
+    /// ILK_CREATE_VIRTUAL: a Digital Executive's ILK (docs/digital-executive-v1-stage-1.md §1.2). A
+    /// person (`human`, `complete`) with the `virtual` flag, charged to `tenant_id`, born with its
+    /// name and company and no channel. The tenant must take registrations, as ILK_REGISTER's does,
+    /// and is never the root one, which holds no person. Answers `{ilk_id, tenant_id, virtual}`.
+    fn create_virtual_person(&mut self, req: IlkCreateVirtualRequest) -> Result<Value, String> {
+        let tenant_id = req.tenant_id.trim().to_string();
+        let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
+        let display_name = req.display_name.trim();
+        if display_name.is_empty() {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "display_name must not be empty",
+            ));
+        }
+        let company_name = req
+            .company_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(tenant) = self.tenants.get(&tenant_id) else {
+            return Err("INVALID_TENANT".to_string());
+        };
+        if tenant.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
+        if tenant.status.eq_ignore_ascii_case("pending") {
+            return Err("TENANT_PENDING".to_string());
+        }
+        if tenant.status.eq_ignore_ascii_case("suspended") {
+            return Err("TENANT_SUSPENDED".to_string());
+        }
+        if tenant_id == DEFAULT_ROOT_TENANT_ID {
+            return Err("TENANT_ROOT_NOT_REGISTRABLE".to_string());
+        }
+        let ilk_id = format!("ilk:{}", Uuid::new_v4());
+        let mut identification = Map::new();
+        identification.insert("display_name".to_string(), json!(display_name));
+        if let Some(company_name) = company_name {
+            identification.insert("company_name".to_string(), json!(company_name));
+        }
+        self.ilks.insert(
+            ilk_id.clone(),
+            IlkRecord {
+                ilk_id: ilk_id.clone(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: tenant_id.clone(),
+                identification: Value::Object(identification),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+                deleted_reason: None,
+                is_virtual: true,
+            },
+        );
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": ilk_id,
+            "tenant_id": tenant_id,
+            "virtual": true,
+        }))
+    }
+
     fn register_ilk(
         &mut self,
         req: IlkRegisterRequest,
@@ -1275,6 +1391,14 @@ impl IdentityStore {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         let _ = parse_prefixed_uuid(&req.tenant_id, "tnt")?;
         validate_ilk_type(&req.ilk_type)?;
+        // A registration of the ILK itself replaces its identification whole, and a virtual
+        // person's is SY.admin's to give (ILK_CREATE_VIRTUAL), never a frontdesk's or a node's.
+        if self.ilks.get(&req.ilk_id).is_some_and(|ilk| ilk.is_virtual) {
+            return Err(virtual_refusal(
+                MSG_ILK_REGISTER,
+                "a virtual person is never registered again",
+            ));
+        }
         let Some(target_tenant) = self.tenants.get(&req.tenant_id) else {
             return Err("INVALID_TENANT".to_string());
         };
@@ -1363,6 +1487,13 @@ impl IdentityStore {
                 if existing.ilk_type.trim() == "system" {
                     return Err("SYSTEM_ILK_PROTECTED".to_string());
                 }
+                // Nor the ILK a node name lands on, if it were a virtual person's.
+                if existing.is_virtual {
+                    return Err(virtual_refusal(
+                        MSG_ILK_REGISTER,
+                        "a virtual person is never registered again",
+                    ));
+                }
                 // An ILK's tenant changes only through ILK_SET_TENANT, which records it and takes
                 // people only: a node is born and dies in its tenant (D6), its temporary included.
                 if existing.tenant_id != req.tenant_id {
@@ -1388,6 +1519,7 @@ impl IdentityStore {
                         channels: Vec::new(),
                         deleted_at_ms: None,
                         deleted_reason: None,
+                        is_virtual: false,
                     },
                 );
             }
@@ -1412,6 +1544,20 @@ impl IdentityStore {
         holder_id: String,
         merge_alias_ttl_secs: u64,
     ) -> Result<Value, String> {
+        // A virtual person's inbox is read by its conscious, an LLM: a proof code sent there can be
+        // asked back from it, so no email proof ever merges anyone into it. This is also Fluxbee
+        // Cloud's register_human, which reaches identity as a frontdesk's ILK_REGISTER
+        // (docs/digital-executive-v1-design.md §3.1).
+        if self
+            .ilks
+            .get(&holder_id)
+            .is_some_and(|holder| holder.is_virtual)
+        {
+            return Err(virtual_refusal(
+                MSG_ILK_REGISTER,
+                "the email belongs to a virtual person, which takes no merge",
+            ));
+        }
         let Some(source) = self.ilks.get(&req.ilk_id) else {
             // A new ilk cannot take an email someone in the tenant already has.
             return Err("DUPLICATE_EMAIL".to_string());
@@ -1461,6 +1607,20 @@ impl IdentityStore {
             .ilks
             .get(old_ilk_id)
             .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
+        // Every merge passes here, whatever path asked for it: none joins a virtual person, in or
+        // out (docs/digital-executive-v1-design.md §3.1). Its callers refuse first with their own
+        // action's name; this is the net under them.
+        if source.is_virtual
+            || self
+                .ilks
+                .get(canonical_ilk_id)
+                .is_some_and(|canonical| canonical.is_virtual)
+        {
+            return Err(virtual_refusal(
+                "merge",
+                "a virtual person takes no merge, in or out",
+            ));
+        }
         if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
             return Err("INVALID_MERGE_SOURCE".to_string());
         }
@@ -1546,6 +1706,22 @@ impl IdentityStore {
             .get(&req.ilk_id)
             .map(|ilk| ilk.tenant_id.clone())
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        // A virtual person's channels come through SY.admin in a later stage, never from an IO or
+        // a frontdesk, and no merge joins it, in or out (docs/digital-executive-v1-stage-1.md §2.1).
+        if self.ilks.get(&req.ilk_id).is_some_and(|ilk| ilk.is_virtual) {
+            return Err(virtual_refusal(
+                MSG_ILK_ADD_CHANNEL,
+                "no channel is added to a virtual person",
+            ));
+        }
+        if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
+            if self.ilks.get(old_ilk).is_some_and(|ilk| ilk.is_virtual) {
+                return Err(virtual_refusal(
+                    MSG_ILK_ADD_CHANNEL,
+                    "a virtual person is never merged into another ILK",
+                ));
+            }
+        }
         let scope = resolve_channel_scope(
             &req.channel.channel_type,
             req.channel.scope.as_deref(),
@@ -1626,6 +1802,15 @@ impl IdentityStore {
             Some(entry) if entry.deleted_at_ms.is_none() => entry.tenant_id.clone(),
             _ => return Err("ILK_NOT_FOUND".to_string()),
         };
+        // The same rule as ILK_ADD_CHANNEL's: no channel is added to a virtual person here.
+        if !req.add_channels.is_empty()
+            && self.ilks.get(&req.ilk_id).is_some_and(|ilk| ilk.is_virtual)
+        {
+            return Err(virtual_refusal(
+                MSG_ILK_UPDATE,
+                "no channel is added to a virtual person",
+            ));
+        }
         // The orchestrator adds a node's own channels: they live in the node's tenant, a Fluxbee
         // Cloud account is never one of them, and none is another ILK's. All checked before
         // anything changes.
@@ -2996,7 +3181,7 @@ impl IdentityStore {
                     tracing::warn!(
                         ilk_id = %ilk.ilk_id,
                         hive_id = %hive_id,
-                        "replica push ignored: an id in another spelling, a change of the ILK's tenant, a node channel that names another scope, a Fluxbee Cloud account, or a channel another ILK holds, or the mark of a system ILK the primary does not hold (purged)"
+                        "replica push ignored: an id in another spelling, a change of the ILK's tenant, a node channel that names another scope, a Fluxbee Cloud account, or a channel another ILK holds, or the mark of a system ILK the primary does not hold (purged), or a virtual flag other than the primary's"
                     );
                 }
                 acceptable
@@ -3088,6 +3273,16 @@ fn ingest_ilk_type_authorized(ilk: &IlkRecord, publisher_hive: &str) -> bool {
         return false;
     }
     ilk.ilk_id == deterministic_system_ilk_id(node_name)
+}
+
+/// A replica-pushed ilk carries the `virtual` flag exactly as the primary holds it: it may not set
+/// it on an ILK the primary holds without it, nor create an ILK with it, since a virtual person is
+/// born only by ILK_CREATE_VIRTUAL on the primary (docs/digital-executive-v1-stage-1.md §1). Nor
+/// clear it: a virtual person without it would take the merges it refuses. A replica only echoes
+/// what the primary told it, so a flag that differs is forged or from a binary that predates it,
+/// and the primary's record stands either way.
+fn ingest_virtual_flag_authorized(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
+    incoming.is_virtual == existing.is_some_and(|existing| existing.is_virtual)
 }
 
 /// Per-hive authority: is `publisher_hive` allowed to push this delta? A replica
@@ -3243,6 +3438,13 @@ impl IdentityRuntime {
         // (FINDINGS A-191): no prefix, no other hive's SY.admin.
         allowed_exacts.insert(
             MSG_ILK_RETIRE_HIVE,
+            HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
+        );
+        // A virtual person is born on the operator's SY.admin's word alone, as a hive's retirement
+        // is: no prefix, no other hive's SY.admin, never Archi or the frontdesk directly
+        // (docs/digital-executive-v1-stage-1.md §1.2).
+        allowed_exacts.insert(
+            MSG_ILK_CREATE_VIRTUAL,
             HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
         );
         if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
@@ -3626,7 +3828,7 @@ impl IdentityRuntime {
                                 )
                                 .await
                             }
-                            Err(code) => error_payload(&code, "failed to provision ilk"),
+                            Err(code) => op_error_payload(&code, "failed to provision ilk"),
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -3750,7 +3952,7 @@ impl IdentityRuntime {
                                 )
                                 .await
                             }
-                            Err(code) => error_payload(&code, "failed to add channel"),
+                            Err(code) => op_error_payload(&code, "failed to add channel"),
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -3883,7 +4085,7 @@ impl IdentityRuntime {
                                 ok
                             }
                         }
-                        Err(code) => error_payload(&code, "failed to update ilk"),
+                        Err(code) => op_error_payload(&code, "failed to update ilk"),
                     }
                 }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -4000,6 +4202,44 @@ impl IdentityRuntime {
                     Err(_) => error_payload(
                         "INVALID_REQUEST",
                         "ILK_RETIRE_HIVE takes {hive_id}, the removed hive's id, and nothing else",
+                    ),
+                }
+            }
+            MSG_ILK_CREATE_VIRTUAL => {
+                match serde_json::from_value::<IlkCreateVirtualRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.create_virtual_person(req) {
+                            Ok(ok) => {
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .collect();
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    None,
+                                    "failed to persist the virtual person",
+                                    ok,
+                                )
+                                .await
+                            }
+                            Err(code) => {
+                                op_error_payload(&code, "failed to create the virtual person")
+                            }
+                        }
+                    }
+                    // A fixed text: the request's values are not repeated (FINDINGS A-232).
+                    Err(_) => error_payload(
+                        "INVALID_REQUEST",
+                        "ILK_CREATE_VIRTUAL takes {tenant_id, display_name, company_name?} and nothing else",
                     ),
                 }
             }
@@ -5324,7 +5564,7 @@ fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, Ide
             ilk_id: *ilk_uuid.as_bytes(),
             ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
             registration_status: parse_registration_status_for_shm(&ilk.registration_status),
-            flags: FLAG_ACTIVE,
+            flags: ilk_entry_flags(ilk),
             tenant_id: *tenant_uuid.as_bytes(),
             display_name: [0u8; 128],
             handler_node: [0u8; 128],
@@ -5535,6 +5775,18 @@ fn tenant_entry_from_record(tenant: &TenantRecord) -> Result<TenantEntry, Identi
     Ok(entry)
 }
 
+/// An ILK entry's flags in the identity SHM: `FLAG_ACTIVE`, and `ILK_FLAG_VIRTUAL` for a virtual
+/// person, so the router and the SDKs tell an ED from a person without asking identity
+/// (docs/digital-executive-v1-stage-1.md §1.1). Every reader masks `FLAG_ACTIVE`, so one that does
+/// not know the new bit ignores it.
+fn ilk_entry_flags(ilk: &IlkRecord) -> u16 {
+    if ilk.is_virtual {
+        FLAG_ACTIVE | ILK_FLAG_VIRTUAL
+    } else {
+        FLAG_ACTIVE
+    }
+}
+
 fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
     let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
@@ -5543,7 +5795,7 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         ilk_id: *ilk_uuid.as_bytes(),
         ilk_type: parse_ilk_type_for_shm(&ilk.ilk_type),
         registration_status: parse_registration_status_for_shm(&ilk.registration_status),
-        flags: FLAG_ACTIVE,
+        flags: ilk_entry_flags(ilk),
         tenant_id: *tenant_uuid.as_bytes(),
         display_name: [0u8; 128],
         handler_node: [0u8; 128],
@@ -7195,6 +7447,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_RESTORE => MSG_TNT_RESTORE_RESPONSE,
         MSG_TNT_PURGE => MSG_TNT_PURGE_RESPONSE,
         MSG_ILK_RETIRE_HIVE => MSG_ILK_RETIRE_HIVE_RESPONSE,
+        MSG_ILK_CREATE_VIRTUAL => MSG_ILK_CREATE_VIRTUAL_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
         _ => "SYSTEM_ERROR",
@@ -7221,6 +7474,7 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_TNT_RESTORE
             | MSG_TNT_PURGE
             | MSG_ILK_RETIRE_HIVE
+            | MSG_ILK_CREATE_VIRTUAL
     )
 }
 
@@ -7679,7 +7933,8 @@ fn is_pending_signup(ilk: &IlkRecord) -> bool {
 /// an ILK the primary holds (a node is born and dies in its tenant, D6), only channels it may hold
 /// (see `replica_channels_acceptable`), and no channel another ILK holds or keeps reserved. Nor a
 /// marked system ILK the primary does not hold (FINDINGS A-191): that is the retired ILK the
-/// operator purged while the replica was cut off, which its next full sync drops.
+/// operator purged while the replica was cut off, which its next full sync drops. Nor a `virtual`
+/// flag other than the primary's (`ingest_virtual_flag_authorized`).
 fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool {
     let existing = store.ilks.get(&incoming.ilk_id);
     ilk_record_ids_canonical(incoming)
@@ -7687,6 +7942,7 @@ fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool 
             && incoming.deleted_at_ms.is_some()
             && is_well_known_system_ilk(incoming))
         && existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
+        && ingest_virtual_flag_authorized(incoming, existing)
         && replica_channels_acceptable(incoming, existing)
         && incoming.channels.iter().all(|channel| {
             store
@@ -8041,6 +8297,15 @@ fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Optio
     Ok(Some(owner_l2_name.to_string()))
 }
 
+/// Migration v6 -- the virtual person (docs/digital-executive-v1-stage-1.md §1.1): a Digital
+/// Executive's ILK is a person's row with `is_virtual` set. Every row that exists is a person or a
+/// node, so false for all of them. The column takes the record's own name (`virtual` is a keyword
+/// in Rust, and in newer Postgres' generated columns). Every boot; idempotent.
+const MIGRATION_V6_VIRTUAL_PERSON: &str = "ALTER TABLE identity_ilks \
+     ADD COLUMN IF NOT EXISTS is_virtual BOOLEAN NOT NULL DEFAULT false;\n\
+     INSERT INTO identity_schema_migrations (version, name) \
+     VALUES (6, 'virtual_person') ON CONFLICT (version) DO NOTHING;";
+
 async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
     let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
@@ -8354,6 +8619,12 @@ RETURNING ilk_id::text
         .await?;
         tx.commit().await?;
     }
+    // v6 -- the virtual person, a Digital Executive's ILK (MIGRATION_V6_VIRTUAL_PERSON).
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(MIGRATION_V6_VIRTUAL_PERSON).await?;
+        tx.commit().await?;
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -8361,9 +8632,7 @@ RETURNING ilk_id::text
         )
         .await;
 
-    tracing::info!(
-        "identity primary schema ensured (migrations through v5, drop_vocabulary_and_approved_by)"
-    );
+    tracing::info!("identity primary schema ensured (migrations through v6, virtual_person)");
     Ok(())
 }
 
@@ -8550,6 +8819,7 @@ INSERT INTO identity_ilks (
     registered_by,
     deleted_at,
     deleted_reason,
+    is_virtual,
     updated_at
 )
 VALUES (
@@ -8565,6 +8835,7 @@ VALUES (
     $10::text::uuid,
     CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
     $12,
+    $13,
     NOW()
 )
 ON CONFLICT (ilk_id) DO UPDATE
@@ -8580,6 +8851,7 @@ SET
     registered_by = EXCLUDED.registered_by,
     deleted_at = EXCLUDED.deleted_at,
     deleted_reason = EXCLUDED.deleted_reason,
+    is_virtual = EXCLUDED.is_virtual,
     updated_at = NOW()
 "#,
         &[
@@ -8595,6 +8867,7 @@ SET
             &registered_by,
             &deleted_at_ms,
             &ilk.deleted_reason,
+            &ilk.is_virtual,
         ],
     )
     .await?;
@@ -8813,7 +9086,8 @@ SELECT
         WHEN deleted_at IS NULL THEN NULL
         ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
     END AS deleted_at_ms,
-    deleted_reason
+    deleted_reason,
+    is_virtual
 FROM identity_ilks
 ORDER BY created_at ASC
 "#,
@@ -8838,6 +9112,7 @@ ORDER BY created_at ASC
                 channels: Vec::new(),
                 deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
                 deleted_reason: row.get("deleted_reason"),
+                is_virtual: row.get("is_virtual"),
             },
         );
     }
@@ -9745,6 +10020,7 @@ mod tests {
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
         store.aliases.insert(
@@ -9969,6 +10245,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10427,6 +10704,7 @@ mod tests {
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10463,6 +10741,7 @@ mod tests {
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10517,6 +10796,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10585,6 +10865,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10632,6 +10913,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10664,6 +10946,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10699,6 +10982,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10736,6 +11020,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
         store.ich_lookup.insert(
@@ -10905,6 +11190,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -10972,6 +11258,7 @@ mod tests {
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
 
@@ -11014,6 +11301,7 @@ mod tests {
                     channels: Vec::new(),
                     deleted_at_ms: None,
                     deleted_reason: None,
+                    is_virtual: false,
                 },
             );
         }
@@ -11161,6 +11449,7 @@ mod tests {
             channels: vec![],
             deleted_at_ms: None,
             deleted_reason: None,
+            is_virtual: false,
         }
     }
 
@@ -11706,6 +11995,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: Some(7),
                 deleted_reason: Some(DELETED_REASON_DIRECT.to_string()),
+                is_virtual: false,
             },
         );
         let err = store
@@ -11784,6 +12074,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
         let err = store
@@ -12043,6 +12334,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
         let new_ilk = "ilk:77777777-7777-4777-8777-777777777777";
@@ -13935,6 +14227,7 @@ mod tests {
                 channels: Vec::new(),
                 deleted_at_ms: None,
                 deleted_reason: None,
+                is_virtual: false,
             },
         );
         let err = store
@@ -13986,6 +14279,7 @@ mod tests {
             }],
             deleted_at_ms: None,
             deleted_reason: None,
+            is_virtual: false,
         };
         let mut delta =
             serde_json::to_value(IdentityDelta::IlkUpsert { ilk: record }).expect("serialize");
@@ -14579,6 +14873,7 @@ mod tests {
             channels: Vec::new(),
             deleted_at_ms: None,
             deleted_reason: None,
+            is_virtual: false,
         }
     }
 
@@ -14618,6 +14913,7 @@ mod tests {
             channels: Vec::new(),
             deleted_at_ms: None,
             deleted_reason: None,
+            is_virtual: false,
         };
         store.ilks.insert(person.ilk_id.clone(), person);
         store
@@ -15792,5 +16088,633 @@ mod tests {
         let own = format!("ilk:{}", Uuid::new_v4());
         let page = list_page_ask(&json!({ "limit": 5, "cursor": own }), "ilk").expect("its own");
         assert_eq!(page.cursor.as_deref(), Some(own.as_str()));
+    }
+
+    // ---- The Digital Executive's stage 1: the virtual person (docs/digital-executive-v1-stage-1.md) ----
+
+    fn ed_create(
+        store: &mut IdentityStore,
+        tenant_id: &str,
+        display_name: &str,
+        company_name: Option<&str>,
+    ) -> Result<Value, String> {
+        store.create_virtual_person(IlkCreateVirtualRequest {
+            tenant_id: tenant_id.to_string(),
+            display_name: display_name.to_string(),
+            company_name: company_name.map(str::to_string),
+        })
+    }
+
+    /// Laura, a Digital Executive of Acme (LC_TENANT).
+    fn ed_laura(store: &mut IdentityStore) -> String {
+        let ok = ed_create(store, LC_TENANT, "Laura", Some("Acme")).expect("Laura is born");
+        ok["ilk_id"].as_str().expect("ilk_id").to_string()
+    }
+
+    /// A channel of a virtual person, as a later stage gives it through SY.admin: on its record and
+    /// in the lookup, which is what an IO's provision of that address would find.
+    fn ed_give_channel(
+        store: &mut IdentityStore,
+        ilk_id: &str,
+        channel_type: &str,
+        address: &str,
+        scope: &str,
+    ) {
+        let channel = sc_channel(
+            &format!("ich:{}", Uuid::new_v4()),
+            channel_type,
+            address,
+            scope,
+        );
+        store
+            .ich_lookup
+            .insert(channel_key(&channel), ilk_id.to_string());
+        store.ilks.get_mut(ilk_id).unwrap().channels.push(channel);
+    }
+
+    /// The code of a refusal and its detail, as the caller reads them.
+    fn ed_refusal(err: String) -> (String, String) {
+        let payload = op_error_payload(&err, "fallback");
+        (
+            payload["error_code"].as_str().unwrap_or("").to_string(),
+            payload["message"].as_str().unwrap_or("").to_string(),
+        )
+    }
+
+    fn ed_assert_virtual_refusal(err: String, action: &str) {
+        let (code, detail) = ed_refusal(err);
+        assert_eq!(code, ILK_VIRTUAL);
+        assert!(detail.contains(action), "{detail}");
+    }
+
+    #[test]
+    fn the_virtual_person_migration_adds_its_column_and_stamps_v6() {
+        let sql = MIGRATION_V6_VIRTUAL_PERSON;
+        assert!(sql.contains(
+            "ALTER TABLE identity_ilks ADD COLUMN IF NOT EXISTS is_virtual BOOLEAN NOT NULL DEFAULT false;"
+        ));
+        assert!(sql.contains(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (6, 'virtual_person') \
+             ON CONFLICT (version) DO NOTHING;"
+        ));
+        // The two statements, and nothing that rewrites a row.
+        assert_eq!(sql.matches(';').count(), 2);
+        assert!(!sql.contains("UPDATE"));
+    }
+
+    #[test]
+    fn create_virtual_person_makes_a_complete_person_with_the_flag_and_no_channel() {
+        let mut store = lc_store_with_tenant();
+        let ok = ed_create(&mut store, LC_TENANT, "  Laura  ", Some(" Acme ")).expect("created");
+        let laura = ok["ilk_id"].as_str().expect("ilk_id").to_string();
+        assert!(is_canonical_id(&laura, "ilk"));
+        assert_eq!(
+            ok,
+            json!({"status": "ok", "ilk_id": laura, "tenant_id": LC_TENANT, "virtual": true})
+        );
+        let record = &store.ilks[&laura];
+        assert_eq!(record.ilk_type, "human");
+        assert_eq!(record.registration_status, "complete");
+        assert_eq!(record.tenant_id, LC_TENANT);
+        assert!(record.is_virtual);
+        assert_eq!(
+            record.identification,
+            json!({"display_name": "Laura", "company_name": "Acme"})
+        );
+        assert!(record.channels.is_empty());
+        assert_eq!(record.definition, json!({}));
+        assert!(record.deleted_at_ms.is_none());
+        // It is one of the tenant's people.
+        assert!(store.tenant_people(LC_TENANT).contains(&laura));
+
+        // Without a company, the name alone; a blank company is no company.
+        for company in [None, Some("   ")] {
+            let ok = ed_create(&mut store, LC_TENANT, "Pablo", company).expect("created");
+            let pablo = ok["ilk_id"].as_str().unwrap();
+            assert_eq!(
+                store.ilks[pablo].identification,
+                json!({"display_name": "Pablo"})
+            );
+        }
+
+        // A blank name, or a tenant id in another spelling, creates nothing.
+        let before = store.ilks.clone();
+        let (code, _) =
+            ed_refusal(ed_create(&mut store, LC_TENANT, "  ", None).expect_err("blank"));
+        assert_eq!(code, "INVALID_REQUEST");
+        let err = ed_create(&mut store, &LC_TENANT.to_uppercase(), "Laura", None)
+            .expect_err("another spelling");
+        assert_eq!(err, "INVALID_REQUEST");
+        assert_eq!(store.ilks, before);
+    }
+
+    #[test]
+    fn a_virtual_person_is_never_born_in_the_root_or_a_deleted_or_unknown_tenant() {
+        let mut store = sc_store();
+        store.tenants.get_mut(SC_OTHER).unwrap().deleted_at_ms = Some(1);
+        let before = store.ilks.clone();
+        for (tenant_id, code) in [
+            (DEFAULT_ROOT_TENANT_ID, "TENANT_ROOT_NOT_REGISTRABLE"),
+            (SC_OTHER, "TENANT_DELETED"),
+            ("tnt:44444444-4444-4444-8444-444444444444", "INVALID_TENANT"),
+            (SC_SUSPENDED, "TENANT_SUSPENDED"),
+        ] {
+            let err = ed_create(&mut store, tenant_id, "Laura", Some("Acme")).expect_err(tenant_id);
+            assert_eq!(err, code, "{tenant_id}");
+        }
+        assert_eq!(store.ilks, before);
+    }
+
+    /// ILK_CREATE_VIRTUAL is the motherbee's SY.admin's alone, on the primary only: another hive's
+    /// SY.admin, Archi, the frontdesk, an orchestrator, an IO and identity itself are refused before
+    /// anything else, and a replica answers NOT_PRIMARY.
+    #[tokio::test]
+    async fn only_sy_admin_at_motherbee_creates_a_virtual_person_on_the_primary() {
+        let primary = IdentityRuntime::new(
+            &test_hive(Some("SY.frontdesk.gov@motherbee")),
+            PathBuf::from("/tmp"),
+            true,
+            None,
+        );
+        assert!(primary.is_authorized(MSG_ILK_CREATE_VIRTUAL, Some("SY.admin@motherbee")));
+        for caller in [
+            None,
+            Some("SY.admin@worker1"),
+            Some("SY.admin.relay@motherbee"),
+            Some("SY.architect@motherbee"),
+            Some("SY.frontdesk.gov@motherbee"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.identity@motherbee"),
+            Some("IO.cloud@motherbee"),
+            Some("IO.api@motherbee"),
+            Some("WF.ed@motherbee"),
+        ] {
+            assert!(
+                !primary.is_authorized(MSG_ILK_CREATE_VIRTUAL, caller),
+                "{caller:?}"
+            );
+        }
+        assert!(action_requires_primary(MSG_ILK_CREATE_VIRTUAL));
+        assert!(!is_lifecycle_action(MSG_ILK_CREATE_VIRTUAL));
+        assert_eq!(
+            response_name(MSG_ILK_CREATE_VIRTUAL),
+            MSG_ILK_CREATE_VIRTUAL_RESPONSE
+        );
+
+        let answer = |hive_id: &str, is_primary: bool, caller: &str| {
+            let hive = rt_hive(hive_id, if is_primary { "motherbee" } else { "worker" });
+            let caller = caller.to_string();
+            let identity = format!("SY.identity@{hive_id}");
+            async move {
+                let mut runtime =
+                    IdentityRuntime::new(&hive, PathBuf::from("/tmp"), is_primary, None);
+                let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+                    &identity,
+                    build_identity_rpc_profile().expect("profile"),
+                );
+                let request = Message {
+                    routing: Routing {
+                        src: Uuid::new_v4().to_string(),
+                        src_l2_name: Some(caller),
+                        dst: Destination::Unicast(identity.clone()),
+                        ttl: 16,
+                        trace_id: Uuid::new_v4().to_string(),
+                    },
+                    meta: Meta {
+                        msg_type: SYSTEM_KIND.to_string(),
+                        msg: Some(MSG_ILK_CREATE_VIRTUAL.to_string()),
+                        ..Meta::default()
+                    },
+                    payload: json!({"tenant_id": LC_TENANT, "display_name": "Laura",
+                                    "company_name": "Acme"}),
+                };
+                let mut control = IdentityControlState {
+                    schema_version: IDENTITY_CONFIG_SCHEMA_VERSION,
+                    config_version: 0,
+                    secret_source: IdentityDbSecretSource::Missing,
+                    db_ready: false,
+                    last_error: None,
+                };
+                let deltas = runtime
+                    .process_system_message(
+                        &client.sender_snapshot(),
+                        &request,
+                        None,
+                        &mut control,
+                        &identity,
+                    )
+                    .await
+                    .expect("handled");
+                assert!(deltas.is_empty());
+                assert!(!runtime.store.ilks.values().any(|ilk| ilk.is_virtual));
+                let reply = harness
+                    .next_outgoing_within(Duration::from_secs(1))
+                    .await
+                    .expect("an answer");
+                assert_eq!(
+                    reply.meta.msg.as_deref(),
+                    Some(MSG_ILK_CREATE_VIRTUAL_RESPONSE)
+                );
+                reply.payload["error_code"].clone()
+            }
+        };
+        for caller in [
+            "SY.admin@worker1",
+            "SY.architect@motherbee",
+            "SY.orchestrator@motherbee",
+        ] {
+            assert_eq!(
+                answer("motherbee", true, caller).await,
+                json!("UNAUTHORIZED_REGISTRAR"),
+                "{caller}"
+            );
+        }
+        assert_eq!(
+            answer("worker1", false, "SY.admin@motherbee").await,
+            json!("NOT_PRIMARY")
+        );
+        // Past both checks: a primary without its database writes nothing.
+        assert_eq!(
+            answer("motherbee", true, "SY.admin@motherbee").await,
+            json!("DB_NOT_READY")
+        );
+    }
+
+    #[test]
+    fn the_shm_entry_of_a_virtual_person_carries_the_flag_and_a_persons_does_not() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+
+        let entry = ilk_entry_from_record(&store.ilks[&laura]).expect("Laura's entry");
+        assert_eq!(entry.flags, FLAG_ACTIVE | ILK_FLAG_VIRTUAL);
+        assert_eq!(entry.ilk_type, SHM_ILK_TYPE_HUMAN);
+        let entry = ilk_entry_from_record(&store.ilks[&ana]).expect("Ana's entry");
+        assert_eq!(entry.flags, FLAG_ACTIVE);
+
+        // The full rebuild writes the same flags.
+        let entries = identity_shm_entries(&store).expect("region entries");
+        let flags_of = |ilk_id: &str| {
+            let uuid = *parse_prefixed_uuid(ilk_id, "ilk").unwrap().as_bytes();
+            entries
+                .ilks
+                .iter()
+                .find(|entry| entry.ilk_id == uuid)
+                .map(|entry| entry.flags)
+        };
+        assert_eq!(flags_of(&laura), Some(FLAG_ACTIVE | ILK_FLAG_VIRTUAL));
+        assert_eq!(flags_of(&ana), Some(FLAG_ACTIVE));
+        // Every other entry stays a plain active one.
+        assert_eq!(
+            entries
+                .ilks
+                .iter()
+                .filter(|entry| entry.flags & ILK_FLAG_VIRTUAL != 0)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn virtual_rides_the_wire_and_the_reads_only_when_true() {
+        let mut primary = rg_store();
+        let mut replica = primary.clone();
+        let laura = ed_laura(&mut primary);
+        let ana = rg_with_ana(&mut primary);
+
+        let record = serde_json::to_value(&primary.ilks[&laura]).expect("record");
+        assert_eq!(record["virtual"], json!(true));
+        assert!(record.get("is_virtual").is_none());
+        let person = serde_json::to_value(&primary.ilks[&ana]).expect("record");
+        assert!(person.get("virtual").is_none());
+
+        // ILK_GET carries the record, ILK_LIST its row.
+        let got = primary.get_ilk_payload(&laura, None).expect("get");
+        assert_eq!(got["ilk"]["virtual"], json!(true));
+        let got = primary.get_ilk_payload(&ana, None).expect("get");
+        assert!(got["ilk"].get("virtual").is_none());
+        let listed = primary.list_ilks_payload(false, false, &PageAsk::default());
+        let row = |ilk_id: &str| {
+            listed["ilks"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["ilk_id"] == ilk_id)
+                .cloned()
+                .expect("a row")
+        };
+        assert_eq!(row(&laura)["virtual"], json!(true));
+        assert!(row(&ana).get("virtual").is_none());
+
+        // A replica takes it from the primary's delta, as it goes over the wire.
+        let envelope = delta_envelope(IdentityDelta::IlkUpsert {
+            ilk: primary.ilks[&laura].clone(),
+        });
+        let line = serde_json::to_string(&envelope).expect("encode");
+        let received: IdentityDeltaEnvelope = serde_json::from_str(&line).expect("decode");
+        replica.apply_delta(received.delta);
+        assert!(replica.ilks[&laura].is_virtual);
+        assert_eq!(replica.ilks[&laura], primary.ilks[&laura]);
+    }
+
+    #[test]
+    fn a_record_without_virtual_reads_as_a_person() {
+        let old = json!({
+            "ilk_id": "ilk:55555555-5555-4555-8555-555555555555",
+            "ilk_type": "human",
+            "registration_status": "complete",
+            "tenant_id": LC_TENANT,
+            "identification": {"display_name": "Ana"},
+            "definition": {},
+            "channels": [],
+            "deleted_at_ms": null
+        });
+        let record: IlkRecord = serde_json::from_value(old.clone()).expect("an old record");
+        assert!(!record.is_virtual);
+        // A delta from a binary that predates the flag, too.
+        let delta: IdentityDelta =
+            serde_json::from_value(json!({"type": "ilk_upsert", "ilk": old}))
+                .expect("an old delta");
+        let IdentityDelta::IlkUpsert { ilk } = delta else {
+            panic!("an ilk upsert");
+        };
+        assert!(!ilk.is_virtual);
+    }
+
+    #[test]
+    fn no_email_proof_merges_anyone_into_a_virtual_person() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        // A later stage may give her an email; a stranger who got the code from her inbox, through
+        // her conscious, registers a temporary with it.
+        store.ilks.get_mut(&laura).unwrap().identification["email"] = json!("laura@acme.com");
+        let stranger = rg_provision(&mut store, LC_TENANT, "whatsapp", "+5491100000077");
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        let err = rg_register(
+            &mut store,
+            &stranger,
+            LC_TENANT,
+            json!({"display_name": "Laura", "email": "laura@acme.com"}),
+        )
+        .expect_err("no merge into Laura");
+        ed_assert_virtual_refusal(err, MSG_ILK_REGISTER);
+        // A new ILK with her email is refused the same way.
+        let err = rg_register(
+            &mut store,
+            "ilk:66666666-6666-4666-8666-666666666661",
+            LC_TENANT,
+            json!({"email": "laura@acme.com"}),
+        )
+        .expect_err("no new ILK with her email");
+        ed_assert_virtual_refusal(err, MSG_ILK_REGISTER);
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+
+        // The merge itself refuses her, whatever path reaches it.
+        let err = store
+            .merge_temporary_ilk(&stranger, &laura, MERGE_TTL_SECS)
+            .expect_err("the net under every merge");
+        let (code, _) = ed_refusal(err);
+        assert_eq!(code, ILK_VIRTUAL);
+        assert_eq!(store.ilks, ilks);
+    }
+
+    #[test]
+    fn a_virtual_person_is_never_registered_again() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let before = store.ilks[&laura].clone();
+        for ilk_type in ["human", "agent"] {
+            let err = store
+                .register_ilk(
+                    IlkRegisterRequest {
+                        ilk_id: laura.clone(),
+                        ilk_type: ilk_type.to_string(),
+                        tenant_id: LC_TENANT.to_string(),
+                        identification: json!({"display_name": "Not Laura",
+                                               "email": "x@acme.com"}),
+                    },
+                    MERGE_TTL_SECS,
+                )
+                .expect_err(ilk_type);
+            ed_assert_virtual_refusal(err, MSG_ILK_REGISTER);
+        }
+        assert_eq!(store.ilks[&laura], before);
+    }
+
+    #[test]
+    fn no_channel_is_added_to_a_virtual_person_from_any_caller_nor_any_merge() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U31");
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+        let request =
+            |target: &str, channel: ChannelInput, merge_from: Option<&str>| IlkAddChannelRequest {
+                ilk_id: target.to_string(),
+                channel,
+                merge_from_ilk_id: merge_from.map(str::to_string),
+                change_reason: None,
+            };
+        let account = ChannelInput {
+            ich_id: format!("ich:{}", Uuid::new_v4()),
+            channel_type: "cloud".to_string(),
+            address: "laura@acme.com".to_string(),
+            scope: Some(INSTALLATION_SCOPE.to_string()),
+        };
+
+        for (caller, channel) in [
+            (Some("IO.slack@motherbee"), sc_slack_channel("U77")),
+            (Some("SY.frontdesk.gov@motherbee"), sc_slack_channel("U78")),
+            (None, sc_slack_channel("U79")),
+            // Never a Fluxbee Cloud account, even from the relay.
+            (Some(TEST_CLOUD_RELAY), account.clone()),
+        ] {
+            let err = store
+                .add_channel(
+                    request(&laura, channel, None),
+                    caller,
+                    MERGE_TTL_SECS,
+                    TEST_CLOUD_RELAY,
+                )
+                .expect_err("no channel on Laura");
+            ed_assert_virtual_refusal(err, MSG_ILK_ADD_CHANNEL);
+        }
+        // A merge into her, and a merge of her into a person.
+        for (target, source) in [
+            (laura.as_str(), temp.as_str()),
+            (ana.as_str(), laura.as_str()),
+        ] {
+            let err = store
+                .add_channel(
+                    request(target, sc_slack_channel("U80"), Some(source)),
+                    Some("SY.frontdesk.gov@motherbee"),
+                    MERGE_TTL_SECS,
+                    TEST_CLOUD_RELAY,
+                )
+                .expect_err("no merge");
+            ed_assert_virtual_refusal(err, MSG_ILK_ADD_CHANNEL);
+        }
+        // ILK_UPDATE adds none either.
+        let err = store
+            .update_ilk(IlkUpdateRequest {
+                ilk_id: laura.clone(),
+                add_channels: vec![sc_slack_channel("U81")],
+                change_reason: None,
+            })
+            .expect_err("no channel through an update");
+        ed_assert_virtual_refusal(err, MSG_ILK_UPDATE);
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+
+        // A person still takes a channel.
+        store
+            .add_channel(
+                request(&ana, sc_slack_channel("U82"), None),
+                Some("IO.slack@motherbee"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect("Ana's channel");
+    }
+
+    #[test]
+    fn no_io_provisions_a_virtual_persons_address_nor_a_cloud_account_on_it() {
+        let mut store = sc_store();
+        let laura = ed_laura(&mut store);
+        ed_give_channel(&mut store, &laura, "whatsapp", "+5491100000088", LC_TENANT);
+        ed_give_channel(
+            &mut store,
+            &laura,
+            "cloud",
+            "laura@acme.com",
+            INSTALLATION_SCOPE,
+        );
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        // A stranger writing from her number would be stamped as her.
+        let err = sc_provision(
+            &mut store,
+            Some("IO.wapp@motherbee"),
+            "whatsapp",
+            "+5491100000088",
+            LC_TENANT,
+            None,
+        )
+        .expect_err("her number");
+        ed_assert_virtual_refusal(err, MSG_ILK_PROVISION);
+        // A Cloud signup of her email, from any tenant: no account lands on her.
+        for tenant_id in [LC_TENANT, SC_OTHER] {
+            let err = sc_account_provision(&mut store, tenant_id, "laura@acme.com")
+                .expect_err("her email");
+            ed_assert_virtual_refusal(err, MSG_ILK_PROVISION);
+        }
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+
+        // Anyone else's address provisions as before.
+        let (ok, _) = sc_provision(
+            &mut store,
+            Some("IO.wapp@motherbee"),
+            "whatsapp",
+            "+5491100000089",
+            LC_TENANT,
+            None,
+        )
+        .expect("a stranger's own number");
+        assert_eq!(ok["created"], json!(true));
+    }
+
+    /// Stage 1 leaves the operator's lifecycle of a virtual person as a person's: SY.admin refuses
+    /// Fluxbee Cloud's (docs/digital-executive-v1-stage-1.md §2.2), identity does not.
+    #[test]
+    fn the_operator_still_deletes_restores_and_recharges_a_virtual_person() {
+        let mut store = sc_store();
+        let laura = ed_laura(&mut store);
+        store.delete_ilk(lc_ilk(&laura), 5).expect("delete");
+        assert_eq!(store.ilks[&laura].deleted_at_ms, Some(5));
+        assert!(store.ilks[&laura].is_virtual);
+        store.restore_ilk(lc_ilk(&laura)).expect("restore");
+        assert!(store.ilks[&laura].deleted_at_ms.is_none());
+        store
+            .set_ilk_tenant(&sc_set_tenant(&laura, SC_OTHER), "operator")
+            .expect("recharge");
+        assert_eq!(store.ilks[&laura].tenant_id, SC_OTHER);
+        assert!(store.ilks[&laura].is_virtual);
+    }
+
+    #[test]
+    fn a_replica_never_sets_creates_or_clears_the_virtual_flag() {
+        let mut store = sc_store();
+        let mut node = ilk_for(
+            "IO.slack@worker1",
+            "ilk:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        assert_eq!(
+            store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .len(),
+            1
+        );
+
+        // Setting it on an ILK the primary holds without it: refused by both paths, and the
+        // record stays as it is.
+        let mut flagged = node.clone();
+        flagged.is_virtual = true;
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert {
+                ilk: flagged.clone()
+            },
+            "worker1",
+            &store
+        ));
+        assert!(store
+            .reconcile_hive_ilks("worker1", vec![flagged])
+            .is_empty());
+        assert_eq!(store.ilks[&node.ilk_id], node);
+
+        // Creating one with it.
+        let mut born = ilk_for(
+            "IO.mail@worker1",
+            "ilk:ffffffff-ffff-4fff-8fff-ffffffffffff",
+        );
+        born.tenant_id = LC_TENANT.to_string();
+        born.is_virtual = true;
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: born.clone() },
+            "worker1",
+            &store
+        ));
+        // A snapshot is the replica's whole set, so it carries the node as well.
+        assert!(store
+            .reconcile_hive_ilks("worker1", vec![node.clone(), born.clone()])
+            .is_empty());
+        assert!(!store.ilks.contains_key(&born.ilk_id));
+        assert_eq!(store.ilks[&node.ilk_id], node);
+
+        // Clearing it on one the primary holds with it; its echo with the flag passes.
+        store.ilks.get_mut(&node.ilk_id).unwrap().is_virtual = true;
+        let held = store.ilks[&node.ilk_id].clone();
+        let mut cleared = held.clone();
+        cleared.is_virtual = false;
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: cleared },
+            "worker1",
+            &store
+        ));
+        let mut echo = held.clone();
+        echo.definition = json!({"note": "changed on the worker"});
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: echo },
+            "worker1",
+            &store
+        ));
     }
 }
