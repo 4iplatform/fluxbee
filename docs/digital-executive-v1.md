@@ -644,7 +644,7 @@ Options (b), a label over several agents, and (c), one node that does everything
 - **The operator:** before any code, a complete document with everything talked, then a panel
   review to check it all, then choose what to touch. The design is
   [digital-executive-v1-design](digital-executive-v1-design.md); a panel of five reviewed it the
-  same day (its §16). The operator: the panel's problems are talked all together.
+  same day (its §17). The operator: the panel's problems are talked all together.
 
 ## 27. Notes, 2026-11-25 (later): its identity on the internet
 
@@ -679,7 +679,14 @@ Options (b), a label over several agents, and (c), one node that does everything
 - **Capacity:** about 150 EDs is fine now.
 - **8.x is not untouchable:** reinstall it if a change needs it.
 
-## 30. Later questions (not yet)
+## 30. Notes, 2026-11-25 (later): the order of the work
+
+- **The order, agreed** (design §15): the base of identity and security; a minimal SY.deploy and a
+  plain ED's birth; the profile; the identity on the internet's stage 1.
+- **The email IO:** to see whether it is needed now, to test with; maybe it goes with the IO
+  topics; talked about when needed.
+
+## 31. Later questions (not yet)
 
 - The ED's agents' tools: which ones, and what of the shared memory they read.
 

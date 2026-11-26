@@ -2,7 +2,7 @@
 
 **Status:** draft, reviewed by a panel of five on 2026-11-25. The panel's lenses were the code's
 facts, fidelity to the talk, identity and security, CD and operation, and messaging and cognition.
-Its findings are applied below, and the operator decided on them the same day (§16.6). Nothing is
+Its findings are applied below, and the operator decided on them the same day (§17.6). Nothing is
 built, and the order of the work is not decided: the operator and I choose what to touch first.
 
 **Where it comes from:** the talk of 2026-11-20 to 2026-11-25, recorded as it went in
@@ -544,7 +544,8 @@ hand that wrote.**
 
 An ED has an email, no matter what (notes §22). **No email IO exists.** The IO nodes are io.api,
 io.blob, io.cloud, io.linkedhelper, io.slack, io.wapp, io.web and the simulator io.sim. An email IO
-is part of the ED's native layer.
+is part of the ED's native layer. **When:** to see whether it is needed now, to test with; it may
+go with the IO topics, and is talked about when needed (the operator, 2026-11-25).
 
 **Today an email is an `identification` field, not a channel** (`src/bin/sy_identity.rs`). An email
 IO's sender ids must match the address registered on the person, or every message by email is a
@@ -1080,7 +1081,29 @@ the open-source install's question (FINDINGS A-363).
 
 ---
 
-## 15. The other large topics of 2026-11-20
+## 15. The order of the work
+
+**Decided** (the operator, 2026-11-25), from the bottom up:
+
+1. **The base of identity and security:**
+   - the `virtual` flag;
+   - refusing merges into an ED, and Cloud's person actions on it;
+   - the router binding a person's `src_ilk`.
+2. **A minimal SY.deploy and the birth of a plain ED:**
+   - its ILK with its company;
+   - its conscious;
+   - one channel (WhatsApp, which exists), with its IO assigned by configuration;
+   - the deployment's manifest;
+   - the retire mode.
+3. **The email IO:** to see whether it is needed now, or goes with the IO topics (§7.3).
+4. **The profile:** its field, its folder, its command and the people tool.
+5. **Its identity on the internet, stage 1:** the DID document and the company's credential.
+
+Each stage gets a build design of its own before any code.
+
+---
+
+## 16. The other large topics of 2026-11-20
 
 Each gets a talk of its own (notes §1):
 
@@ -1090,12 +1113,12 @@ Each gets a talk of its own (notes §1):
 
 ---
 
-## 16. The panel review (2026-11-25)
+## 17. The panel review (2026-11-25)
 
 Five reviewers read the first draft against the code and the notes, each through one lens. Each
 heading below names its lens.
 
-### 16.1 Facts
+### 17.1 Facts
 
 - **One blocker:** the profile's blob name. Blob names are flat and hashed, so the first draft's
   `people/<ilk>/<version>.json` could not exist (§10.4).
@@ -1109,7 +1132,7 @@ heading below names its lens.
   - the VC 2.0 link;
   - `did:webvh` still resolves through the domain.
 
-### 16.2 Fidelity
+### 17.2 Fidelity
 
 - **Proposals stated as decisions:** the pair's details, the profile's shape and its command.
 - **ED–ED analysis against cognition's rule.**
@@ -1118,7 +1141,7 @@ heading below names its lens.
   tenant. Now listed in §2.2.
 - **Open points missing from §13.**
 
-### 16.3 Identity and security
+### 17.3 Identity and security
 
 - **High:** an unbound `src_ilk` becomes something EDs act on (§7.2).
 - **High:** a stranger can merge into an ED through its LLM-read mailbox (§3.1).
@@ -1128,7 +1151,7 @@ heading below names its lens.
 - **Medium:** news across tenants (§8.3).
 - **Low:** Cloud's person actions, trust in the `IO.` prefix, and the flag's constant and OPA.
 
-### 16.4 CD and operation
+### 17.4 CD and operation
 
 - **Steps:** no deterministic step builder exists, and the executor's limits (§5.1).
 - **ILKs:** no removal keeps an ILK; recreate makes a new one (§4.3).
@@ -1139,7 +1162,7 @@ heading below names its lens.
 - **Shared things:** routes, VPN rules, runtimes and node names (§5.6).
 - **Capacity** (§5.7).
 
-### 16.5 Messaging and cognition
+### 17.5 Messaging and cognition
 
 - **The source of the reply's ED** (§7.2).
 - **Per-IO naming breaks the pair across EDs** (§8.1).
@@ -1148,7 +1171,7 @@ heading below names its lens.
 - **Episodes name the conscious** (§8.2).
 - **Minors:** the writer, the force rule, `handler_node`, and cognition's numbers.
 
-### 16.6 The operator's calls (2026-11-25)
+### 17.6 The operator's calls (2026-11-25)
 
 The recommendations went to the operator one by one. The operator answered *"sí a todo"*, with two
 notes:
