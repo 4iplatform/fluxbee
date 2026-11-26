@@ -442,6 +442,15 @@ pub struct IlkKind {
     pub flags: u16,
 }
 
+/// What `IdentityRegionReader::read_ilk_kinds` reads in one pass: each ILK's kind and the aliases,
+/// as they were at `seq`.
+#[derive(Clone, Debug)]
+pub struct IlkKinds {
+    pub seq: u64,
+    pub ilks: Vec<IlkKind>,
+    pub aliases: Vec<IlkAliasEntry>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IchEntry {
@@ -2135,11 +2144,14 @@ impl IdentityRegionReader {
         Some(self.header_ref()?.seq.load(Ordering::Acquire))
     }
 
-    /// Each ILK's id, type and flags, with the sequence they were read at. A reader that keeps a
-    /// view of them reads them again only when `seq` moves, and copies 19 bytes of each entry,
-    /// not the whole entry (over 1 KiB) as `try_read_snapshot` does: the router's binding of a
-    /// person's `src_ilk` looks one up on every message (docs/digital-executive-v1-stage-1.md §3).
-    pub fn read_ilk_kinds(&self) -> Result<(u64, Vec<IlkKind>), ShmError> {
+    /// Each ILK's id, type and flags, and the aliases, with the sequence they were read at. A
+    /// reader that keeps a view of them reads them again only when `seq` moves, and copies 19
+    /// bytes of each ILK's entry, not the whole entry (over 1 KiB) as `try_read_snapshot` does:
+    /// the router's view for its binding of a person's `src_ilk`
+    /// (docs/digital-executive-v1-stage-1.md §3). Like every read here, it waits out a write for
+    /// up to `SEQLOCK_READ_TIMEOUT_MS`: a reader that must not wait checks that `seq` is even first,
+    /// and the router reads it off its messages' path.
+    pub fn read_ilk_kinds(&self) -> Result<IlkKinds, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
         read_ilk_kinds_from_region(header, self.mmap.as_ref(), &self.layout)
     }
@@ -3280,12 +3292,16 @@ fn read_ilk_kinds_from_region(
     header: &IdentityHeader,
     mmap: &[u8],
     layout: &IdentityRegionLayout,
-) -> Result<(u64, Vec<IlkKind>), ShmError> {
+) -> Result<IlkKinds, ShmError> {
     let max_ilks = layout.limits.max_ilks as usize;
+    let max_ilk_aliases = layout.limits.max_ilk_aliases as usize;
     let ilks =
         read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks).ok_or(ShmError::InvalidHeader)?;
+    let aliases = read_slice::<IlkAliasEntry>(mmap, layout.ilk_alias_offset, max_ilk_aliases)
+        .ok_or(ShmError::InvalidHeader)?;
     let start = Instant::now();
     let mut kinds = Vec::new();
+    let mut alias_entries = Vec::new();
     loop {
         if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
             return Err(ShmError::SeqLockTimeout);
@@ -3297,7 +3313,8 @@ fn read_ilk_kinds_from_region(
         }
         atomic::fence(Ordering::Acquire);
         let ilk_count = header.ilk_count as usize;
-        if ilk_count > max_ilks {
+        let ilk_alias_count = header.ilk_alias_count as usize;
+        if ilk_count > max_ilks || ilk_alias_count > max_ilk_aliases {
             return Err(ShmError::InvalidHeader);
         }
         kinds.clear();
@@ -3306,10 +3323,16 @@ fn read_ilk_kinds_from_region(
             ilk_type: entry.ilk_type,
             flags: entry.flags,
         }));
+        alias_entries.clear();
+        alias_entries.extend_from_slice(&aliases[..ilk_alias_count]);
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return Ok((s1, kinds));
+            return Ok(IlkKinds {
+                seq: s1,
+                ilks: kinds,
+                aliases: alias_entries,
+            });
         }
     }
 }
@@ -4755,8 +4778,8 @@ mod tests {
     }
 
     /// The router's binding of a person's `src_ilk` keeps a view of each ILK's kind: it reads the
-    /// ids, types and flags as the writer left them, and the sequence they were read at, which a
-    /// later write moves.
+    /// ids, types and flags and the aliases as the writer left them, and the sequence they were
+    /// read at, which a later write moves.
     #[test]
     fn identity_reader_reads_each_ilks_kind_at_a_sequence() {
         let name = format!("/jsid-k-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -4782,12 +4805,26 @@ mod tests {
         writer
             .upsert_ilk_entry(entry(2, 0, FLAG_ACTIVE | ILK_FLAG_VIRTUAL))
             .expect("a virtual person");
+        writer
+            .upsert_ilk_alias_entry(IlkAliasEntry {
+                old_ilk_id: [9; 16],
+                canonical_ilk_id: [1; 16],
+                expires_at: 77,
+                flags: FLAG_ACTIVE,
+                _reserved: [0u8; 22],
+            })
+            .expect("an alias");
         let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open auto reader");
 
-        let (seq, kinds) = reader.read_ilk_kinds().expect("the kinds");
+        let read = reader.read_ilk_kinds().expect("the kinds");
+        let seq = read.seq;
         assert_eq!(Some(seq), reader.seq());
+        assert_eq!(read.aliases.len(), 1);
+        assert_eq!(read.aliases[0].old_ilk_id, [9; 16]);
+        assert_eq!(read.aliases[0].canonical_ilk_id, [1; 16]);
+        assert_eq!(read.aliases[0].expires_at, 77);
         assert_eq!(
-            kinds,
+            read.ilks,
             vec![
                 IlkKind {
                     ilk_id: [1; 16],
@@ -4805,10 +4842,10 @@ mod tests {
         writer
             .upsert_ilk_entry(entry(3, 1, FLAG_ACTIVE))
             .expect("an agent");
-        let (moved, kinds) = reader.read_ilk_kinds().expect("the kinds again");
-        assert_ne!(moved, seq, "a write moves the sequence");
-        assert_eq!(kinds.len(), 3);
-        assert_eq!(kinds[2].ilk_type, 1);
+        let read = reader.read_ilk_kinds().expect("the kinds again");
+        assert_ne!(read.seq, seq, "a write moves the sequence");
+        assert_eq!(read.ilks.len(), 3);
+        assert_eq!(read.ilks[2].ilk_type, 1);
 
         cleanup_shm(&name);
     }
