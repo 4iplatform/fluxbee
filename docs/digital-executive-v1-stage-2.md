@@ -1,8 +1,9 @@
 # The Digital Executive v1, stage 2: SY.deploy and a plain ED's birth
 
-**Status:** the build design, draft of 2026-11-26, revised the same day with the operator's first
-answers (§11): calls 1, 2 and 4 are decided; calls 3 and 5 are explained again and wait. Nothing is
-built.
+**Status:** the build design, draft of 2026-11-26, revised the same day with the operator's answers
+(§11): calls 1, 2 and 4 are decided, with a catalog for Cloud still to agree; call 5 is rejected (no
+`enforce`); call 3 is reopened from the bottom, together with stage 1's direction on the router. §7.1,
+§8 and the router's part of §12 wait for that talk. Nothing is built.
 
 **What it builds:** stage 2 of [digital-executive-v1-design](digital-executive-v1-design.md) §15:
 
@@ -572,7 +573,7 @@ tenant at most.
 - **Still reported:** a WF that forwards the conscious's reply keeps its `src_ilk`, and the rule
   does not take it. No WF stands in an ED's path in this stage; it comes with the responsibilities.
   A responsibility's agent that speaks as the ED is one more hand, added by its deployment.
-- **Release C:** proposed right after this stage's gate (§11, call 5).
+- **No release C** (§11, call 5).
 
 ---
 
@@ -668,8 +669,10 @@ The operator's answers of 2026-11-26:
 2. **Decided: the conscious is born with its definition** (§7.2): the native role and handbook and
    the ED's personality, written by SY.deploy as agent assets, with Archi's checks shared. The texts
    are the operator's to approve, with no line on whether the ED is an AI.
-3. **Pending: the hand, a `hand` channel on the ED's ILK** that the router reads (§8, explained again
-   with an example). The other way: a new SHM field, with every binary in lockstep.
+3. **Reopened: the hand** (§8). The operator does not want a permission in identity's channel
+   table (*"esto de canal no me gusta para nada"*), and asks to review from the bottom what a channel
+   is, why messages carry `dst_ilk`, and whether stage 1's direction on the router is right. To be
+   talked before any more of §7.1 and §8.
 4. **Decided: Cloud's four operations come in this stage** (§1). The operator: SY.deploy will deploy
    every solution, not only EDs, so it must not be made so narrow that the next solutions mean a lot
    of new code. Applied:
@@ -681,26 +684,14 @@ The operator's answers of 2026-11-26:
    - the admission's namespace is any grouping's, and its clause admits whole classes of actions:
      a node's whole life, a deployment's people, its tenant's keys. Only purges and what the whole
      installation shares stay out (§5).
-5. **Pending: release C, `enforce`, right after this stage's gate** (§8). Explained again:
-   - **What changes:** the router's binding of `src_ilk` (stage 1 §3) runs today in report mode. It
-     reads every message, and when the sender may not speak for that person it writes a
-     `would_refuse` line and delivers anyway. In enforce it does not deliver: the sender gets
-     `UNREACHABLE` with `SRC_ILK_NOT_BOUND`. Enforce is built and tested; the mode is a constant in
-     the code, so turning it on is a release of the router alone.
-   - **What it would refuse:** an agent sending with a real person's ILK; an agent other than her
-     hand sending as an ED; an IO sending as an ED. **What it takes:** an IO with the person it
-     identified; a `SY.*`; an ED's hand as its ED.
-   - **Why not before this stage:** until now nothing legitimate sends as an ED. The first is its
-     conscious, in this stage, and it is taken only with the hand (call 3). Enforcing before 2C
-     would refuse every ED reply.
-   - **Why right after it:** from 2C on, a company's people write to an ED, and the ED acts on who
-     wrote. That was the panel's high hole (design §17.3): in report mode, a wrong or broken node
-     speaking as a person or as an ED is only a log line. 2C's gate reads the report with a real
-     ED's traffic, and the report since 0.1.154 holds no line outside the gate's probe.
-   - **The other way:** wait longer, for more of the installation's own traffic, or for the first
-     responsibility with a WF in an ED's path (§8, still reported). The cost: EDs live with a hole
-     the router already knows how to close.
-   - Recommended: right after 2C's gate, as one more release with its own gate.
+5. **Rejected: no release C.** The operator: no enforcement while the flow is not built (*"basta de
+   enforcement cuando ni siquiera tenemos el flujo armado"*). A panel's requirements are talked one
+   by one, in detail, before they shape a design.
+6. **To agree, from call 4: a catalog and a tree for Cloud.** The operator: Cloud must read which
+   packages are ready to deploy (the ED, infra, custom ones Archi makes), and see a tree: the
+   tenant's general infra, its EDs, each ED's solutions, and in each its assets, IO credentials and
+   nodes. Either Cloud reads Archi's catalog, or Archi tells SY.deploy which packages it has, and
+   SY.deploy checks and keeps them. SY.deploy runs everything and records what happened.
 
 Decided by the earlier talk, and applied here without a new call:
 
@@ -751,7 +742,7 @@ Shared code goes alone, then items on different binaries, a gate each.
   - **the packaging** (§12.1).
 
   Its gate is §13.
-- **Release C:** `enforce`, after 2C's gate, with its own gate.
+- **No release C** (§11, call 5).
 
 ### 12.1 Where a new SY node is registered
 
