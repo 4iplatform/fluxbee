@@ -433,6 +433,15 @@ pub struct IlkEntry {
     pub _reserved: [u8; 8],
 }
 
+/// One ILK's id, type and flags, as `IdentityRegionReader::read_ilk_kinds` reads them: what a reader
+/// that only asks what kind of ILK a message names needs, without the rest of the entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IlkKind {
+    pub ilk_id: [u8; 16],
+    pub ilk_type: u8,
+    pub flags: u16,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IchEntry {
@@ -2120,6 +2129,21 @@ impl IdentityRegionReader {
         )
     }
 
+    /// The region's seqlock sequence. Every write moves it, a heartbeat's too: what was read at one
+    /// sequence is current while it has not moved.
+    pub fn seq(&self) -> Option<u64> {
+        Some(self.header_ref()?.seq.load(Ordering::Acquire))
+    }
+
+    /// Each ILK's id, type and flags, with the sequence they were read at. A reader that keeps a
+    /// view of them reads them again only when `seq` moves, and copies 19 bytes of each entry,
+    /// not the whole entry (over 1 KiB) as `try_read_snapshot` does: the router's binding of a
+    /// person's `src_ilk` looks one up on every message (docs/digital-executive-v1-stage-1.md §3).
+    pub fn read_ilk_kinds(&self) -> Result<(u64, Vec<IlkKind>), ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
+        read_ilk_kinds_from_region(header, self.mmap.as_ref(), &self.layout)
+    }
+
     fn header_ref(&self) -> Option<&IdentityHeader> {
         header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
@@ -3248,6 +3272,44 @@ fn resolve_ich_mapping_from_region(
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
             return resolved;
+        }
+    }
+}
+
+fn read_ilk_kinds_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+) -> Result<(u64, Vec<IlkKind>), ShmError> {
+    let max_ilks = layout.limits.max_ilks as usize;
+    let ilks =
+        read_slice::<IlkEntry>(mmap, layout.ilk_offset, max_ilks).ok_or(ShmError::InvalidHeader)?;
+    let start = Instant::now();
+    let mut kinds = Vec::new();
+    loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(ShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let ilk_count = header.ilk_count as usize;
+        if ilk_count > max_ilks {
+            return Err(ShmError::InvalidHeader);
+        }
+        kinds.clear();
+        kinds.extend(ilks[..ilk_count].iter().map(|entry| IlkKind {
+            ilk_id: entry.ilk_id,
+            ilk_type: entry.ilk_type,
+            flags: entry.flags,
+        }));
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok((s1, kinds));
         }
     }
 }
@@ -4688,6 +4750,65 @@ mod tests {
             reader.resolve_ich_mapping("whatsapp", "+549111111", tenant_id),
             Some(([6u8; 16], ilk_id))
         );
+
+        cleanup_shm(&name);
+    }
+
+    /// The router's binding of a person's `src_ilk` keeps a view of each ILK's kind: it reads the
+    /// ids, types and flags as the writer left them, and the sequence they were read at, which a
+    /// later write moves.
+    #[test]
+    fn identity_reader_reads_each_ilks_kind_at_a_sequence() {
+        let name = format!("/jsid-k-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let limits = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 1,
+            max_vocabulary: 1,
+            max_ilk_aliases: 1,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("open identity region");
+        let entry = |id: u8, ilk_type: u8, flags: u16| IlkEntry {
+            ilk_id: [id; 16],
+            ilk_type,
+            flags,
+            ..empty_ilk_entry()
+        };
+        writer
+            .upsert_ilk_entry(entry(1, 0, FLAG_ACTIVE))
+            .expect("a person");
+        writer
+            .upsert_ilk_entry(entry(2, 0, FLAG_ACTIVE | ILK_FLAG_VIRTUAL))
+            .expect("a virtual person");
+        let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open auto reader");
+
+        let (seq, kinds) = reader.read_ilk_kinds().expect("the kinds");
+        assert_eq!(Some(seq), reader.seq());
+        assert_eq!(
+            kinds,
+            vec![
+                IlkKind {
+                    ilk_id: [1; 16],
+                    ilk_type: 0,
+                    flags: FLAG_ACTIVE,
+                },
+                IlkKind {
+                    ilk_id: [2; 16],
+                    ilk_type: 0,
+                    flags: FLAG_ACTIVE | ILK_FLAG_VIRTUAL,
+                },
+            ]
+        );
+
+        writer
+            .upsert_ilk_entry(entry(3, 1, FLAG_ACTIVE))
+            .expect("an agent");
+        let (moved, kinds) = reader.read_ilk_kinds().expect("the kinds again");
+        assert_ne!(moved, seq, "a write moves the sequence");
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds[2].ilk_type, 1);
 
         cleanup_shm(&name);
     }
