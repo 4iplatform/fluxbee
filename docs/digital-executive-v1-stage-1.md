@@ -19,11 +19,11 @@ has no channel and no conscious yet, so nothing legitimate speaks as one.
 
 ### 1.1 Stored, replicated, projected
 
-- **SY.identity's database:** migration v6 adds `virtual BOOLEAN NOT NULL DEFAULT false` to
+- **SY.identity's database:** migration v6 (`virtual_person`) adds `is_virtual BOOLEAN NOT NULL DEFAULT false` to
   `identity_ilks` (`src/bin/sy_identity.rs`; the last migration is v5,
   `drop_vocabulary_and_approved_by`).
-- **The record:** `IlkRecord` gains `virtual: bool`, with `#[serde(default)]`, so records and
-  replication deltas without it read as false.
+- **The record:** `IlkRecord` gains `is_virtual: bool`, `virtual` on the wire, with
+  `#[serde(default)]`, so records and replication deltas without it read as false.
 - **The shared memory:** the projection sets a new bit in the entry's `flags` when the record is
   virtual.
   - **Its constant:** `ILK_FLAG_VIRTUAL`, for ILK entries only, chosen apart from the generic
@@ -32,8 +32,8 @@ has no channel and no conscious yet, so nothing legitimate speaks as one.
     the Go SDK's `go/fluxbee-go-sdk/identity_shm.go`, each with an `is_virtual` accessor.
   - **What does not change:** the layout and `IDENTITY_VERSION` 6. Every reader masks
     `FLAG_ACTIVE`, so an old reader ignores the new bit.
-- **A replica:** a replica-pushed record may not set `virtual` on an ILK the primary holds without
-  it (the same guard `system` has, `src/bin/sy_identity.rs`).
+- **A replica:** a replica-pushed record may neither set nor clear `virtual`, nor create a virtual
+  ILK (the same guard `system` has, `src/bin/sy_identity.rs`).
 
 ### 1.2 Born only one way
 
@@ -60,8 +60,8 @@ Each refusal answers a new code, **`ILK_VIRTUAL`**, with the action's name in it
     the frontdesk, which is also Cloud's `register_human` path;
   - `ILK_ADD_CHANNEL` with `merge_from_ilk_id` whose target is virtual;
   - the provision of a `cloud` account channel, when its key would land on a virtual ILK.
-- **No channel added to a virtual ILK** by any `IO.*` caller. Its channels arrive in stage 2,
-  through SY.deploy and SY.admin.
+- **No channel added to a virtual ILK** by any caller, by `ILK_ADD_CHANNEL` or `ILK_UPDATE`. Its
+  channels arrive in stage 2, through SY.deploy and SY.admin.
 - **No `cloud` channel on a virtual ILK,** ever: an ED holds no Fluxbee Cloud account.
 - **No `set_ilk_tenant` of a virtual ILK** from Cloud's relay (§2.2).
 
