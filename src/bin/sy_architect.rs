@@ -29358,6 +29358,7 @@ mod tests {
                 skill_hashes: skills.iter().map(|skill| skill.to_string()).collect(),
                 handbook_hashes: vec![],
                 personality_hash: None,
+                is_virtual: false,
             };
         let other = "cd".repeat(32);
         let ilks = [

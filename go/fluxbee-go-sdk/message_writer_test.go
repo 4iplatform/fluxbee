@@ -110,6 +110,24 @@ func TestLookupIlkReadsTypeAndNameFromTheIdentityMemory(t *testing.T) {
 	}
 }
 
+// A virtual person reads as a person with Virtual set; the bit changes no type.
+func TestLookupIlkReadsTheVirtualFlag(t *testing.T) {
+	laura, ana := uuid.New(), uuid.New()
+	path := writeIdentityRegion(t, []testIlk{
+		{id: laura, kind: 0, name: "Laura", active: true, virtual: true},
+		{id: ana, kind: 0, name: "Ana", active: true},
+	})
+	if facts, ok, err := lookupIlkAt(path, "ilk:"+laura.String()); err != nil || !ok || facts != (IlkFacts{Type: "human", Name: "Laura", Virtual: true}) {
+		t.Fatalf("laura: %+v %v %v", facts, ok, err)
+	}
+	if facts, ok, err := lookupIlkAt(path, "ilk:"+ana.String()); err != nil || !ok || facts != (IlkFacts{Type: "human", Name: "Ana"}) {
+		t.Fatalf("ana: %+v %v %v", facts, ok, err)
+	}
+	if ilkFlagVirtual&0x001f != 0 {
+		t.Fatalf("the virtual bit collides with the generic flags: %#x", ilkFlagVirtual)
+	}
+}
+
 func TestReadSelfIlkFromEnv(t *testing.T) {
 	t.Setenv(envSelfIlkID, " ilk:wf ")
 	if got := ReadSelfIlkFromEnv(); got != "ilk:wf" {
@@ -125,10 +143,11 @@ func TestReadSelfIlkFromEnv(t *testing.T) {
 }
 
 type testIlk struct {
-	id     uuid.UUID
-	kind   byte
-	name   string
-	active bool
+	id      uuid.UUID
+	kind    byte
+	name    string
+	active  bool
+	virtual bool
 }
 
 // writeIdentityRegion writes an identity region of this SDK's version with one tenant slot and
@@ -148,7 +167,11 @@ func writeIdentityRegion(t *testing.T, ilks []testIlk) string {
 		copy(entry[ilkOffIlkID:], ilk.id[:])
 		entry[ilkOffType] = ilk.kind
 		if ilk.active {
-			binary.LittleEndian.PutUint16(entry[ilkOffFlags:], ilkFlagActive)
+			flags := ilkFlagActive
+			if ilk.virtual {
+				flags |= ilkFlagVirtual
+			}
+			binary.LittleEndian.PutUint16(entry[ilkOffFlags:], flags)
 		}
 		copy(entry[ilkOffDisplayName:ilkOffDisplayName+128], ilk.name)
 	}

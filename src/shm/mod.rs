@@ -82,6 +82,12 @@ pub const FLAG_STALE: u16 = 0x0004;
 /// authority rules inspectable in SHM without affecting routing.
 pub const FLAG_FROZEN: u16 = 0x0008;
 pub const HIVE_FLAG_SELF: u16 = 0x0010;
+/// An identity ILK entry that is a virtual person: a Digital Executive (docs/digital-executive-v1-design.md §3).
+/// For ILK entries only, and apart from the generic `FLAG_*` bits the node, route and hive tables use.
+/// The entry's layout and `IDENTITY_VERSION` do not change: every reader masks `FLAG_ACTIVE`, so a
+/// reader that does not know this bit ignores it. Its copies: `crates/fluxbee_sdk/src/identity.rs`
+/// and `go/fluxbee-go-sdk/identity_shm.go`.
+pub const ILK_FLAG_VIRTUAL: u16 = 0x0100;
 pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 

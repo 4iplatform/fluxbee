@@ -49,6 +49,8 @@ const (
 
 	// IlkEntry flags.
 	ilkFlagActive uint16 = 0x0001
+	// ilkFlagVirtual marks a virtual person, a Digital Executive (src/shm/mod.rs ILK_FLAG_VIRTUAL).
+	ilkFlagVirtual uint16 = 0x0100
 
 	// Field offsets within IdentityHeader.
 	hdrOffMagic          = 0
@@ -421,8 +423,9 @@ func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
 			continue
 		}
 		return IlkFacts{
-			Type: ilkTypeName(entry[ilkOffType]),
-			Name: identityFixedStr(entry[ilkOffDisplayName : ilkOffDisplayName+128]),
+			Type:    ilkTypeName(entry[ilkOffType]),
+			Name:    identityFixedStr(entry[ilkOffDisplayName : ilkOffDisplayName+128]),
+			Virtual: binary.LittleEndian.Uint16(entry[ilkOffFlags:])&ilkFlagVirtual != 0,
 		}, true
 	}
 	return IlkFacts{}, false

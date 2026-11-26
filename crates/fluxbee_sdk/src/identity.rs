@@ -40,6 +40,8 @@ const ICH_ADDRESS_MAX_LEN: usize = 256;
 const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 const FLAG_ACTIVE: u16 = 0x0001;
+/// A virtual person's ILK entry, a Digital Executive (`src/shm/mod.rs` `ILK_FLAG_VIRTUAL`).
+const ILK_FLAG_VIRTUAL: u16 = 0x0100;
 const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 const SHM_ILK_TYPE_HUMAN: u8 = 0;
 const SHM_ILK_TYPE_AGENT: u8 = 1;
@@ -122,6 +124,14 @@ pub struct IdentityIlkOption {
     pub handbook_hashes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personality_hash: Option<String>,
+    /// A virtual person: a Digital Executive, a `human` ILK marked so in the identity SHM
+    /// (docs/digital-executive-v1-design.md §3).
+    #[serde(
+        default,
+        rename = "virtual",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub is_virtual: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1469,6 +1479,7 @@ fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
         skill_hashes,
         handbook_hashes,
         personality_hash,
+        is_virtual: ilk.flags & ILK_FLAG_VIRTUAL != 0,
     }
 }
 
@@ -1749,6 +1760,49 @@ mod tests {
             }
             .expect("permission denied should degrade to lookup unavailable");
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn the_virtual_bit_reads_as_a_virtual_person_and_nothing_else() {
+        let entry = |flags: u16| IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440009")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_HUMAN,
+            registration_status: SHM_REG_STATUS_COMPLETE,
+            flags,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Laura"),
+            handler_node: [0; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
+            created_at: 0,
+            updated_at: 0,
+            personality_hash: [0; 32],
+            _reserved: [0; 8],
+        };
+        let person = identity_ilk_option_from_entry(&entry(FLAG_ACTIVE));
+        let virtual_person = identity_ilk_option_from_entry(&entry(FLAG_ACTIVE | ILK_FLAG_VIRTUAL));
+        assert!(!person.is_virtual);
+        assert!(virtual_person.is_virtual);
+        // Both stay people: the flag changes no type.
+        assert_eq!(person.ilk_type, "human");
+        assert_eq!(virtual_person.ilk_type, "human");
+        // The field is `virtual` on the wire, and absent when false.
+        let json = serde_json::to_value(&virtual_person).unwrap();
+        assert_eq!(json["virtual"], serde_json::json!(true));
+        assert!(serde_json::to_value(&person)
+            .unwrap()
+            .get("virtual")
+            .is_none());
+        // The bit is not one the node, route and hive tables use.
+        assert_eq!(ILK_FLAG_VIRTUAL & 0x001f, 0);
     }
 
     #[test]

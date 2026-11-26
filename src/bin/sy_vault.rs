@@ -3449,6 +3449,7 @@ mod tests {
             skill_hashes: Vec::new(),
             handbook_hashes: Vec::new(),
             personality_hash: None,
+            is_virtual: false,
         };
         let admin = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
         // A system node proves its derived ILK by its name alone: no SHM at boot.

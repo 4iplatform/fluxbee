@@ -85,6 +85,8 @@ func WithWriter(context json.RawMessage, writer Writer) (json.RawMessage, bool) 
 type IlkFacts struct {
 	Type string
 	Name string
+	// Virtual is a virtual person, a Digital Executive: a human ILK with the virtual flag.
+	Virtual bool
 }
 
 // fillWriterName fills the name of msg's writer, when it names an ILK and no name, with what facts
