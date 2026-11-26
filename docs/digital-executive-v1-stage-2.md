@@ -1,11 +1,15 @@
 # The Digital Executive v1, stage 2: SY.deploy and a plain ED's birth
 
-**Status:** the build design, draft of 2026-11-26. It waits for the operator's calls (§11). Nothing
-is built.
+**Status:** the build design, draft of 2026-11-26, revised the same day with the operator's first
+answers (§11): calls 1, 2 and 4 are decided; calls 3 and 5 are explained again and wait. Nothing is
+built.
 
 **What it builds:** stage 2 of [digital-executive-v1-design](digital-executive-v1-design.md) §15:
 
-- **A minimal SY.deploy,** the CD node (design §5).
+- **A minimal SY.deploy,** the CD node (design §5). It will deploy every user solution, not only
+  EDs (the operator, §11 call 4). So its model is general from the first line: groupings and
+  deployments, sources with blanks, one step builder. The plain ED is its first source, and an ED is
+  one kind of grouping.
 - **A plain ED's birth:**
   - its ILK with its company;
   - its conscious;
@@ -110,13 +114,19 @@ The facts this design stands on, read in the code for it:
 
 ## 1. The orders: four actions in SY.admin
 
+SY.deploy deploys every user solution (design §5), so its orders are about deployments, not about
+EDs. An ED's birth is the first deployment of a new ED grouping, from the source `plain-ed`.
+
 | Action | HTTP (operator) | Cloud op | Archi | What it does |
 | --- | --- | --- | --- | --- |
-| `create_ed` | `POST /eds` | `create_ed` | SCMD | Births a plain ED. Answers *accepted* with its id. |
-| `get_ed` | `GET /eds/{ed_id}` | `get_ed` | SCMD | One ED's record and state. |
-| `list_eds` | `GET /eds` | `list_eds` | SCMD | The EDs, by tenant. |
-| `retire_ed` | `POST /eds/{ed_id}/retire` | `retire_ed` | SCMD | Ends an ED (§10). Answers *accepted*. |
+| `cd_deploy` | `POST /cd/deployments` | `cd_deploy` | SCMD | Deploys a source, with its blanks, into a grouping. A grouping of kind `ed` with no id is a new ED. Answers *accepted*. |
+| `cd_get` | `GET /cd/deployments/{id}`, `GET /cd/groupings/{id}` | `cd_get` | SCMD | One deployment, or one grouping with its deployments, and its state. |
+| `cd_list` | `GET /cd/deployments` | `cd_list` | SCMD | The deployments, by tenant, grouping kind or grouping. |
+| `cd_remove` | `POST /cd/deployments/{id}/remove`, `POST /cd/groupings/{id}/remove` | `cd_remove` | SCMD | Removes a deployment, or a whole grouping (§10). Answers *accepted*. |
 
+- **The names:** `list_deployments` and `get_deployments`, and the HTTP path `/deployments`, are
+  taken by the orchestrator's software history (design §5.1). The prefix `cd_` follows SY.wf-rules'
+  `wf_rules_*`.
 - **SY.admin forwards each one to `SY.deploy@motherbee`,** as it does a WF's to SY.wf-rules: a write
   as a `command`, a read as a `query`. It waits at most 10 s, since SY.deploy answers before it
   starts any step.
@@ -124,53 +134,77 @@ The facts this design stands on, read in the code for it:
 - **Cloud.** Four rows join `CLOUD_OP_ACTIONS` (`crates/fluxbee_sdk/src/cloud.rs`), the one table
   from which IO.cloud's translation and SY.admin's allowlist both come.
   - IO.cloud puts the tenant Cloud claims in each.
-  - SY.deploy answers *not found* for an ED of another tenant.
+  - SY.deploy answers *not found* for a deployment or grouping of another tenant.
   - The contract goes in [io-cloud-api](io-cloud-api.md), for Fluxbee Cloud's team.
-- **Cloud's flow:**
+- **Cloud's flow for a new ED:**
   1. `put_token` with `resource_type` `whatsapp`, in the ED's tenant;
-  2. `create_ed`, naming that key;
-  3. `get_ed`, until the state is `active` or `failed`.
+  2. `cd_deploy` of `plain-ed` into a new ED grouping, naming that key;
+  3. `cd_get` of the deployment, until its state is `active` or `failed`.
 
-### 1.1 `create_ed`
+  A responsibility, later, is the same order: another source, into the ED's grouping by its id.
+
+### 1.1 `cd_deploy`
+
+A new ED:
 
 ```json
 {
   "tenant_id": "tnt:…",
   "request_key": "cloud-ed-7f3a…",
-  "display_name": "Laura Gómez",
-  "company_name": "Acme",
-  "personality": {
-    "timezone": "America/Argentina/Buenos_Aires",
-    "country_code": "AR",
-    "primary_language": "es",
-    "additional_languages": ["en"],
-    "description": "…", "biographical": {…}, "narrative": {…}
+  "source": {"id": "plain-ed", "version": "1"},
+  "grouping": {"kind": "ed"},
+  "blanks": {
+    "display_name": "Laura Gómez",
+    "company_name": "Acme",
+    "personality": {
+      "timezone": "America/Argentina/Buenos_Aires",
+      "country_code": "AR",
+      "primary_language": "es",
+      "additional_languages": ["en"],
+      "description": "…", "biographical": {…}, "narrative": {…}
+    },
+    "whatsapp": {"phone_number_id": "1234567890", "waba_id": "…", "credential_key": "acme-laura-wapp"}
   },
-  "whatsapp": {"phone_number_id": "1234567890", "waba_id": "…", "credential_key": "acme-laura-wapp"},
   "hive": "worker1"
 }
 ```
 
-- **`request_key` is the idempotency key** (stage 1 §7): Cloud's own id for the ED, at most 64
-  characters of `[A-Za-z0-9._:-]`.
-  - The same key in the same tenant gives back the same ED.
+A responsibility, later: `"source": {"id": "collections", "version": "3"}`, `"grouping": {"kind":
+"ed", "id": "ed4qm7k2xa"}`, and that source's blanks.
+
+- **`request_key` is the idempotency key** (stage 1 §7): the caller's own id for the order, at most
+  64 characters of `[A-Za-z0-9._:-]`.
+  - The same key in the same tenant gives back the same deployment.
   - The same key with other content answers `REQUEST_KEY_REUSED`.
-- **`personality`** takes the fields of Archi's personality asset (`build_personality_asset_value`,
-  `src/bin/sy_architect.rs`): its system fields, and its optional texts. Its name is the ED's.
-- **`hive`** is optional. Without it, SY.deploy picks the worker with the most room.
-- **No secret travels in the order:** the WhatsApp credential is a key name, put before by Cloud or
-  the operator.
-- **The answer:** HTTP 202, `{"ed_id": "edq4m7k2xa", "ed_ilk": "ilk:…", "state": "deploying"}`.
+- **`source`** names a released version (design §6.1). In this stage the only source is `plain-ed`
+  (§3), and the order may leave its version out for the newest one SY.deploy carries. The answer and
+  the record always name the exact version and hash.
+- **`grouping`:** its kind and, for an existing one, its id. In this stage the only kind is `ed`, and
+  a source of the native layer is the only one that founds it (§3).
+- **`blanks`:** exactly the ones the source declares, each checked by its type (§4.1). For
+  `plain-ed`:
+  - `display_name` and `company_name`, the ED's names;
+  - `personality`, the fields of Archi's personality asset (`build_personality_asset_value`,
+    `src/bin/sy_architect.rs`): its system fields, and its optional texts. Its name is the ED's;
+  - `whatsapp`, its number and the name of its credential's key.
+- **`hive`** is optional for a new grouping. Without it, SY.deploy picks the worker with the most
+  room. A grouping's later deployments go to its hive (design §5.7).
+- **No secret travels in the order:** a credential is a key name, put before by Cloud or the
+  operator.
+- **The answer:** HTTP 202, `{"deployment_id": "dp7xk3m2qa", "grouping": {"kind": "ed", "id":
+  "ed4qm7k2xa", "ed_ilk": "ilk:…"}, "state": "deploying"}`.
 
-### 1.2 An ED's states
+### 1.2 States
 
-`deploying` → `active`; `deploying` → `failed`; `active` or `failed` → `retiring` → `retired`.
+A deployment: `deploying` → `active`; `deploying` → `failed`; `active` or `failed` → `removing` →
+`removed`. A grouping is `active` while it has deployments, and `removed` after the last one goes.
+An ED grouping's state is its ED's.
 
-- **A failed birth stays `failed`,** with the step, its code and its detail, and nothing is undone
-  by itself (*no magic automation*).
+- **A failed deployment stays `failed`,** with the step, its code and its detail, and nothing is
+  undone by itself (*no magic automation*).
 - **From `failed` there are two ways out:**
-  - `create_ed` again with the same `request_key` resumes where it stopped (§4.2);
-  - `retire_ed` ends what was made.
+  - `cd_deploy` again with the same `request_key` resumes where it stopped (§4.2);
+  - `cd_remove` ends what was made.
 
 ---
 
@@ -181,54 +215,93 @@ The facts this design stands on, read in the code for it:
   - It shares Archi's agent-asset code, moved to the core library (§7.2).
   - Its admin calls use the SDK's admin RPC, as ai.generic's `publish_html_page` does.
 - **On the motherbee only,** as SY.admin, behind the same role gate in its unit.
+- **General, not the ED's** (§11 call 4). Its parts know nothing of an ED, except what an ED
+  grouping founds:
+  - **a source reader:** the native sources it carries now (§3), Archi's sources with blanks later.
+    Both give the same desired state;
+  - **the desired state:** the source plus its blanks' values, with every name and id made concrete;
+  - **one step builder:** from the desired state and what runs, the SY.admin actions still missing,
+    in order, with their exact arguments (design §5.1);
+  - **one runner:** the steps one by one, journaled (§4.2).
+
+  A new source is data. A new kind of part in a source (a WF, a route, a policy) is one more section
+  in the desired state and in the step builder, and one more row in its admission (§5). Nothing else
+  changes.
 - **Its state is files,** as SY.wf-rules':
   - **Where:** `/var/lib/fluxbee/state/sy-deploy/`.
-  - **The records:** `eds/<ed_id>.json`, written to a temporary file and renamed.
-  - **The journals:** `journal/<ed_id>.jsonl`, appended.
-  - **No secret** goes in either, only key names.
+  - **The records:** `groupings/<grouping_id>.json` and `deployments/<deployment_id>.json`, each
+    written to a temporary file and renamed.
+  - **The journals:** `journal/<deployment_id>.jsonl`, appended.
+  - **No secret** goes in any, only key names.
   - **The backup** is the motherbee's snapshot, which keeps SY.admin's state the same way.
 - **One deployment at a time,** in order, as the orchestrator runs node actions one at a time
-  anyway. A lock per ED keeps a `retire_ed` from crossing a birth still under way.
+  anyway. A lock per grouping (design §5.3) keeps a removal from crossing a deployment still under
+  way.
 - **Its own system ILK,** seeded from the release's lists like every SY node's.
 
-### 2.1 A deployment's record
+### 2.1 Its records
 
-The design's manifest, which is its record (design §5.3), for a plain ED:
+The design's manifest, which is its record (design §5.3), split in two: the grouping, which is the
+why, and each deployment in it.
+
+A grouping, for an ED:
 
 ```json
 {
-  "ed_id": "edq4m7k2xa",
-  "grouping": {"kind": "ed", "ed_ilk": "ilk:…", "name": "Laura Gómez"},
+  "grouping_id": "ed4qm7k2xa",
+  "kind": "ed",
+  "tenant_id": "tnt:…",
+  "hive": "worker1",
+  "ed": {"ilk_id": "ilk:…", "display_name": "Laura Gómez", "company_name": "Acme"},
+  "deployments": ["dp7xk3m2qa"],
+  "state": "active",
+  "history": [{"at_ms": 0, "what": "founded", "by": "cloud", "deployment_id": "dp7xk3m2qa"}]
+}
+```
+
+A deployment, the plain ED:
+
+```json
+{
+  "deployment_id": "dp7xk3m2qa",
+  "grouping_id": "ed4qm7k2xa",
   "tenant_id": "tnt:…",
   "request_key": "cloud-ed-7f3a…",
   "source": {"id": "plain-ed", "version": "1", "hash": "sha256:…"},
   "blanks": {"display_name": "…", "company_name": "…", "personality": {…},
              "whatsapp": {"phone_number_id": "…", "waba_id": "…", "credential_key": "…"}},
-  "hive": "worker1",
   "nodes": [
-    {"role": "conscious", "node_name": "AI.edq4m7k2xa@worker1", "ilk_id": "ilk:…",
+    {"role": "conscious", "node_name": "AI.ed4qm7k2xa@worker1", "ilk_id": "ilk:…",
      "runtime": "ai.generic", "runtime_version": "…"},
-    {"role": "whatsapp", "node_name": "IO.wapp.edq4m7k2xa@worker1", "ilk_id": "ilk:…",
+    {"role": "whatsapp", "node_name": "IO.wapp.ed4qm7k2xa@worker1", "ilk_id": "ilk:…",
      "runtime": "io.wapp", "runtime_version": "…"}
   ],
-  "assets": {"role": "…", "handbooks": ["…"], "personality": "…"},
+  "assets": {"conscious": {"role": "…", "handbooks": ["…"], "personality": "…"}},
+  "vault": [{"key": "…", "assigned_to": "IO.wapp.ed4qm7k2xa@worker1"}],
   "state": "active",
-  "history": [{"at_ms": 0, "what": "created", "by": "cloud"}]
+  "history": [{"at_ms": 0, "what": "deployed", "by": "cloud"}]
 }
 ```
 
-- **The ED's id** is `ed` plus 8 characters of `[a-z2-7]`. Its node names come from it (design
-  §5.5): `AI.<ed_id>@<hive>` for the conscious, and `IO.wapp.<ed_id>@<hive>` for its WhatsApp. The
-  second matches io.wapp's fan-out pattern `IO.wapp.*@<hive>`.
-- **Runtime versions are pinned:** the hive's `current` at the birth is written as the exact
+- **The ids:**
+  - a grouping's: its kind's two letters (`ed` for an ED; `in` and `ts` kept for infra and test,
+    design §5.4), a digit from 2 to 7, and 7 characters of `[a-z2-7]`. The digit keeps an ordinary
+    word, such as `inventory2`, from reading as one;
+  - a deployment's: `dp` and the same 8 characters' form.
+- **Node names come from the grouping's id** (design §5.5): the source gives each node its kind and
+  an optional middle part, and SY.deploy writes `<KIND>.<middle.>?<grouping_id>@<hive>`. For the
+  plain ED: `AI.ed4qm7k2xa@worker1` for the conscious, and `IO.wapp.ed4qm7k2xa@worker1` for its
+  WhatsApp, which matches io.wapp's fan-out pattern `IO.wapp.*@<hive>`. A responsibility's, later:
+  `AI.collections.ed4qm7k2xa@worker1`.
+- **Runtime versions are pinned:** the hive's `current` at the deployment is written as the exact
   version, in the record and in each `run_node` (design §5.6).
-- **`get_ed` adds each node's status,** read with `get_node_status`, as the first reading of drift.
+- **`cd_get` adds each node's status,** read with `get_node_status`, as the first reading of drift.
 
 ---
 
 ## 3. The plain ED's source
 
-**Proposed** (§11, call 1): the plain ED's source ships with Fluxbee, inside SY.deploy. It is not
+**Decided** (§11, call 1): the plain ED's source ships with Fluxbee, inside SY.deploy. It is not
 one of Archi's.
 
 - **Why:**
@@ -238,57 +311,80 @@ one of Archi's.
 - **What it is:** a JSON file in the repository, built into SY.deploy, with its version and its
   content's hash. A new version of it is a Fluxbee release. Moving existing EDs to it is an upgrade,
   which comes later, in waves (design §6.1).
-- **What it declares:**
-  - **its blanks** (§1.1);
+- **Its format is the one every source will compile to,** not one made for the ED (§2). A source
+  declares:
+  - **`blanks`:** each with a name and a type that carries its check: a name, a personality, a key
+    in SY.vault of a given `resource_type` in the deployment's tenant, a WhatsApp number, an ILK of
+    the tenant, a business value;
+  - **`founds`** (the native layer only): the grouping it founds. For `plain-ed`: an ED, its virtual
+    person with its names from the blanks, and its channels: `whatsapp` from its blank, and the
+    hand, the node of role `conscious` (§8);
+  - **`nodes`:** each with its role, its kind (`AI` or `IO` in this stage), its middle name part,
+    its runtime, its config with the blanks in place, and, for an agent, its definition's assets.
+    Two keys name the grouping's person: `speaks_as` for its conscious (§7.1) and `io.person_ilk`
+    for an IO assigned to it (§9);
+  - **`vault`:** which blank's key goes to which node.
+- **For `plain-ed`:**
   - **the conscious:**
     - runtime `ai.generic`;
     - `behavior` `{kind: "ai_chat", model: "claude-sonnet-5-5"}`, the installation's model today;
-    - the native role and handbook, as asset contents;
-  - **the WhatsApp channel:** runtime `io.wapp`, and its config with the blanks in place.
-- **Its format** is SY.deploy's own, and minimal. Archi's sources with blanks get theirs with the
-  standard layer, which may grow from this one.
+    - the native role and handbook, as asset contents, with the personality from its blank;
+  - **the WhatsApp channel:** runtime `io.wapp`, middle part `wapp`, and its config with the blanks
+    in place.
+- **A source with a section SY.deploy cannot build yet** (a WF, a route, a VPN rule, the user
+  policy) is refused before any step, with its name. Each comes with the first source that needs it.
+- **Archi's sources with blanks** come with the standard layer, read into the same desired state.
 
 ---
 
-## 4. The birth, step by step
+## 4. A deployment, step by step: the plain ED's
 
 ### 4.1 Checks first, before any step
 
-All are fixed checks, with no AI (design §5.5):
+All are fixed checks, with no AI (design §5.5). The general ones run for every deployment; the
+blanks' ones come from each blank's type (§3).
 
-- **The tenant:** a user tenant, active (not root, deleted, pending or suspended), in the identity
-  SHM.
-- **The names:** `display_name` and `company_name` at most 128 bytes, as stage 1's.
-- **The request key:** new in this tenant, or the same content as before (§1.1).
-- **WhatsApp:**
-  - `phone_number_id` is digits, and no ED of the records holds it;
-  - the credential key exists in the ED's tenant with `resource_type` `whatsapp` (`vault_list`,
-    metadata only).
-- **The AI key:** the tenant has a usable key of the conscious's provider, `anthropic` (its own
-  general one; `vault_list`). Otherwise `AI_KEY_MISSING`, before anything is made.
-- **The hive:** a worker that is alive, with room for the ED's two nodes and a margin under the
-  router's 1024 (design §5.7).
-- **Ids and names:** SY.deploy mints the ED's id and the three ILK ids (the ED's, the conscious's,
-  the IO's), and checks that no SHM entry holds them or the node names.
+- **General:**
+  - **the tenant:** a user tenant, active (not root, deleted, pending or suspended), in the identity
+    SHM;
+  - **the request key:** new in this tenant, or the same content as before (§1.1);
+  - **the source:** one SY.deploy carries, at a released version, with no section it cannot build
+    (§3);
+  - **the grouping:** of the tenant, and of a kind the source fits. A new one only from a source
+    that founds it;
+  - **every blank** the source declares is filled, and nothing more;
+  - **the AI key:** for each agent the source declares, the tenant has a usable key of its provider,
+    `anthropic` for `plain-ed` (its own general one; `vault_list`). Otherwise `AI_KEY_MISSING`,
+    before anything is made;
+  - **the hive:** a worker that is alive, with room for the deployment's nodes and a margin under
+    the router's 1024 (design §5.7);
+  - **ids and names:** SY.deploy mints the ids it needs (a new grouping's, the deployment's, and
+    one ILK id for each node and for a person it founds), and checks that no SHM entry holds them or
+    the node names.
+- **The blanks of `plain-ed`:**
+  - `display_name` and `company_name` at most 128 bytes, as stage 1's;
+  - `whatsapp`: `phone_number_id` is digits, and no other grouping's record holds it; the credential
+    key exists in the tenant with `resource_type` `whatsapp` (`vault_list`, metadata only).
 
-Only then does it write the record (`deploying`) and the journal, and answer *accepted*.
+Only then does it write the records (`deploying`) and the journal, and answer *accepted*.
 
 ### 4.2 The steps
 
-Each step is written to the journal before it is sent and after its answer. All are SY.admin
-actions, called one by one over the mesh.
+The step builder makes them from the desired state (§2). For `plain-ed`, these. Each step is
+written to the journal before it is sent and after its answer. All are SY.admin actions, called one
+by one over the mesh.
 
 | # | Step | Arguments |
 | --- | --- | --- |
 | 1 | `create_virtual_person` | `tenant_id`, `display_name`, `company_name`, **`ilk_id`** (the ED's, minted) |
 | 2 | `add_virtual_person_channel` | the ED, `whatsapp`, the `phone_number_id` (§6.2) |
-| 3 | `add_virtual_person_channel` | the ED, `hand`, `AI.<ed_id>@<hive>` (§8) |
+| 3 | `add_virtual_person_channel` | the ED, `hand`, `AI.<grouping_id>@<hive>` (§8) |
 | 4 | the assets | the native role and handbook, and the ED's personality, written by SY.deploy (§7.2) |
-| 5 | `run_node`, the conscious | `AI.<ed_id>@<hive>`, `ai.generic`, the pinned version, `tenant_id`, **`ilk_id`**, `config`: `{behavior, speaks_as: <the ED>}` (§7.1) |
+| 5 | `run_node`, the conscious | `AI.<grouping_id>@<hive>`, `ai.generic`, the pinned version, `tenant_id`, **`ilk_id`**, `config`: `{behavior, speaks_as: <the ED>}` (§7.1) |
 | 6 | `set_ilk_definition` | the conscious's ILK: `role_hash`, `handbook_hashes`, `personality_hash` |
-| 7 | `run_node`, the IO | `IO.wapp.<ed_id>@<hive>`, `io.wapp`, the pinned version, `tenant_id`, **`ilk_id`**, `config`: `{wapp.auth: {type: vault_ref, resource_type: whatsapp, key}, io: {phone_number_id, waba_id, dst_node: AI.<ed_id>@<hive>, person_ilk: <the ED>}}` (§9) |
+| 7 | `run_node`, the IO | `IO.wapp.<grouping_id>@<hive>`, `io.wapp`, the pinned version, `tenant_id`, **`ilk_id`**, `config`: `{wapp.auth: {type: vault_ref, resource_type: whatsapp, key}, io: {phone_number_id, waba_id, dst_node: AI.<grouping_id>@<hive>, person_ilk: <the ED>}}` (§9) |
 | 8 | `vault_assign` | the credential key, to the IO only |
-| 9 | the record | `active` |
+| 9 | the records | the deployment and the grouping `active` |
 
 - **The order** follows the design (§4.1): the ED and its channels first, the conscious before its
   IO, so that no message reaches a node that does not exist yet. The hand is written before the
@@ -298,51 +394,55 @@ actions, called one by one over the mesh.
 - **Each step's wait** is longer than SY.admin's own wait on the orchestrator, 40 s for a
   `run_node`, so SY.deploy never gives up while SY.admin's call still runs (SY.wf-rules' gap, §15).
 - **A retry converges; it does not replay** (design §5.3).
-  - **When:** after a restart of SY.deploy or of the motherbee, after a timeout, or on a `create_ed`
-    that resumes a failed birth.
+  - **When:** after a restart of SY.deploy or of the motherbee, after a timeout, or on a `cd_deploy`
+    that resumes a failed deployment.
   - **How:** SY.deploy reads what each step makes: the ILK and its channels in the SHM, the asset
     files, the node through `get_node_status`, the definition's hashes in the SHM, the assignment
     through `vault_list`. It sends only the steps whose result is missing.
   - **The ids:** they are in the journal before step 1, so a retry never mints a second ED or a
     second node ILK.
-- **A step that fails for good** leaves the ED `failed` (§1.2), with the step and its error.
+- **A step that fails for good** leaves the deployment `failed` (§1.2), with the step and its error.
 
 ---
 
 ## 5. SY.deploy's admission in SY.admin
 
 Decided (design §4.1): SY.deploy's row is bounded, or it would be a second Archi with no operator's
-CONFIRM.
+CONFIRM. Decided too (§11 call 4): it is not bounded to what an ED needs, since SY.deploy will
+deploy every user solution. The bound is **where** it acts, not **which** solution it deploys.
 
-**Proposed bound: a namespace of names, the launcher's stamp, and the SHM.** SY.admin does not read
+**The bound: a namespace of names, the launcher's stamp, and the SHM.** SY.admin does not read
 SY.deploy's records, which would make each depend on the other.
 
-- **The namespace:** a node whose local name ends in `.<ed_id>` or is `<KIND>.<ed_id>`, with an
-  `ed_id` of §2.1's form.
+- **The namespace:** a node whose local name is `<KIND>.<grouping_id>` or ends in
+  `.<grouping_id>`, with a grouping id of §2.1's form, of any kind. SY.admin checks the form only,
+  so a new kind of grouping needs no change in it.
   - SY.deploy may launch only names in it.
   - Nobody else may launch one: Archi, Cloud, WF and the operator's HTTP alike get
-    `NAME_RESERVED`. No one squats an ED's name, and Archi's solutions cannot take an ED's node as
-    their own (design §5.6).
+    `NAME_RESERVED`. No one squats a deployment's name, and Archi's solutions cannot take a
+    deployment's node as their own (design §5.6).
 - **A clause of its own, for `SY.deploy@motherbee` exactly,** next to Archi's and IO.cloud's in
-  `authorize_mesh_caller`:
+  `authorize_mesh_caller`. It admits whole classes of actions, so that the next solutions need no
+  new row:
 
-  | Action | Admitted when |
-  | --- | --- |
-  | `create_virtual_person`, `add_virtual_person_channel` | a user tenant |
-  | `run_node` | a name in the namespace, `AI.*` or `IO.*`, a user tenant, with `ilk_id` |
-  | `kill_node` | `retire_instance` only (§10), in the namespace |
-  | `get_node_status` | in the namespace |
-  | `set_ilk_definition` | an agent ILK whose node is in the namespace (the SHM's `handler_node`) |
-  | `delete_ilk` | a virtual ILK, or an agent ILK whose node is in the namespace |
-  | `vault_list`, `vault_assign` | the deployment's tenant; nodes assigned only in the namespace |
+  | Class | Actions | Admitted when |
+  | --- | --- | --- |
+  | A node's whole life | `run_node`, `start_node`, `restart_node`, `kill_node` (plain or with `retire_instance`, §10), `get_node_status`, `get_node_config`, `set_node_config`, `node_control_config_set` | a name in the namespace, of kind `AI`, `IO` or `WF`, in a user tenant |
+  | A deployment's people | `create_virtual_person`, `add_virtual_person_channel`, `set_ilk_definition`, `delete_ilk`, `restore_ilk` | a user tenant; a virtual person, or an agent ILK whose node is in the namespace (the SHM's `handler_node`) |
+  | Its tenant's keys | `vault_list`, `vault_assign` | the deployment's tenant; nodes assigned only in the namespace |
 
-  Nothing else: no config writes, no purge, no restore, no route or VPN rule, no policy. Those come
-  with upgrades and responsibilities, each with its row.
+- **What stays out:**
+  - **purges,** of a node or of an ILK: the operator's, one at a time (design §2.1);
+  - **what is shared by the whole installation** (design §5.6): routes, VPN rules, the user OPA
+    policy, hives, runtimes and their versions. Two deployments write over each other there. Each
+    gets its row, and its section in the step builder (§2), with the first source that needs it.
 - **The SHM checks** run after the admission, next to `refuse_cloud_action_on_a_virtual_ilk`, as
   reads of memory.
 - **The stamp:** SY.admin stamps `launched_by` `SY.deploy@motherbee` on its launches, and adds
-  `require_launched_by` to its `kill_node` and `get_node_status`, as it does for Cloud's. So
-  SY.deploy reaches only the nodes it launched.
+  `require_launched_by` to every node action of its clause but `run_node`, as it does for Cloud's.
+  So SY.deploy reaches only the nodes it launched. The orchestrator checks it today on `kill_node`,
+  `start_node`, `restart_node` and `get_node_status` only (§0), and gets it on the config actions
+  too.
 
 ---
 
@@ -401,48 +501,78 @@ from the incoming message.
 
 ### 7.2 It is born with its definition
 
-**Proposed** (§11, call 2):
+**Decided** (§11, call 2):
 
 - SY.deploy writes the conscious's assets on the motherbee, into `<blob>/agent-assets/`, where Archi
   writes them:
   - the native role and handbook, from the source;
-  - the ED's personality, from the order.
+  - the ED's personality, from its blank.
 
   Syncthing carries them to the worker. ai.generic takes the definition once every asset is on its
   hive.
 - Archi's asset checks and hashing move to the core library, so both write the same files. They are
-  `validate_agent_asset_value` and its builders in `src/bin/sy_architect.rs`.
-- **The native texts are the operator's,** to approve before the build. One line they carry: asked
-  sincerely, the ED says it is a digital executive, an AI, and never claims to be human.
-- **The other way:** the conscious is born with no definition, answering "unconfigured", and the
-  operator gives it one with Archi (notes §6: *"dejando el esqueleto vacío para que archi le asigne
-  las herramientas"*). An ED born from Cloud would then wait for the operator.
+  `validate_agent_asset_value` and its builders in `src/bin/sy_architect.rs`. Any source's agent
+  uses the same code (§3).
+- **The native texts are the operator's,** to approve before the build. They say nothing on whether
+  the ED is an AI: the operator left that line out.
+- **Born with it,** a deployment from Cloud needs no one.
 
 ---
 
 ## 8. The router: the hand
 
-**Proposed** (§11, call 3): the conscious is named as the ED's hand by a channel of type `hand` on
-the ED's ILK, whose address is the conscious's node name (§6.2).
+**Proposed** (§11, call 3, explained again to the operator on 2026-11-26).
 
-- **No layout change:**
-  - the SHM keeps the channel like any other;
-  - the router's watcher reads the channel table in the same seqlock loop as its ILK kinds;
-  - the router's view keeps, for each virtual person, the names of its hands.
-- **The rule:** a virtual person's `src_ilk` is accepted from a `SY.*` sender (stage 1) or from one
-  of its hands. Everything else is reported, as in stage 1.
-- **Why identity and not the node's config:** the router must know it without reading any node, and
-  identity owns a person's data (*the datum's owner decides*). Identity's uniqueness of a channel's
-  key makes a node the hand of one ED at most.
+**The problem.** Since stage 1, the router reads each message's `src_ilk`, the person it says it
+speaks for. A virtual person's is taken only from a `SY.*` sender; anything else is reported now and
+refused after release C. In this stage the conscious speaks as the ED (§7.1):
+
+| Sender | `src_ilk` | What the router does today |
+| --- | --- | --- |
+| `AI.ed4qm7k2xa@worker1`, Laura's conscious | Laura, the ED | reports it: not a `SY.*` |
+| `AI.support@worker1`, any other agent | Laura | reports it: not a `SY.*` |
+
+The router must take the first and keep reporting the second. So it has to know, by itself and on
+every message, which node may speak as Laura.
+
+**The proposal: Laura's ILK names her hand.** At the birth, SY.deploy adds to Laura's ILK a channel of
+type `hand` whose address is her conscious's name (§4.2, step 3):
+
+| ILK | Channel type | Address |
+| --- | --- | --- |
+| Laura | `whatsapp` | `1234567890`, her number |
+| Laura | `hand` | `AI.ed4qm7k2xa@worker1` |
+
+- **Where it lives:** SY.identity writes it into the identity SHM's channel table, like any channel.
+  Every node already reads that memory, the router among them.
+- **What the router does with it:** its watcher, which reads the SHM every 200 ms for who is virtual,
+  also reads the channel table, and keeps "Laura: hands `AI.ed4qm7k2xa@worker1`". On each message,
+  one more lookup:
+  - a `SY.*` sender, or a hand of that person: taken;
+  - any other sender: reported, as in stage 1.
+- **Who writes a hand:** only SY.identity, on SY.admin's `add_virtual_person_channel`, which only
+  SY.deploy, the operator and Archi may call. No node can name itself a hand.
+- **Who else reads it:** the conscious, before it speaks as Laura (§7.1). One datum, two readers.
+- **What it is not:** a way to reach Laura. An IO looks a sender up by its own channel type, such as
+  `whatsapp` with the sender's id, so no IO ever finds a `hand`.
+
+**Why not the conscious's config, `speaks_as`:** a node's config is written by whoever launches it.
+If the router believed it, any node launched with `speaks_as: Laura` would speak as her. The
+permission belongs to Laura's record, which identity owns (*the datum's owner decides*). The router
+never reads a node's config anyway.
+
+**Why a channel, not a new field:** a field in the ILK's entry changes the SHM's layout
+(`IDENTITY_VERSION` 7). Every binary that reads it must then change at once: the router, the SY
+nodes, the Rust and Go SDKs and their nodes. The channel table already exists, with room for a node's
+name, and identity already keeps one channel key per tenant, so a node is the hand of one ED of its
+tenant at most.
+
 - **Stage 1's extension to the owners of its channels** (stage 1 §3.2) is not needed. An ED's IO
   stamps it as `dst_ilk`, never as `src_ilk` (§9).
-- **The other way:** a hand field in the identity SHM's `IlkEntry`. That is a layout change, with
-  `IDENTITY_VERSION` 7 and every reader in lockstep: the router, the SY nodes, the Rust and Go SDKs
-  and their nodes.
 - **Still reported:** a WF that forwards the conscious's reply keeps its `src_ilk`, and the rule
   does not take it. No WF stands in an ED's path in this stage; it comes with the responsibilities.
-- **Release C:** proposed right after this stage's gate (§11, call 5). By then the conscious is a
-  real sender of a virtual ILK, and the gate has read the report with it.
+  A responsibility's agent that speaks as the ED is one more hand, added by its deployment.
+- **Release C:** proposed right after this stage's gate (§11, call 5).
 
 ---
 
@@ -512,11 +642,15 @@ Decided (design §4.3).
 - **A recreate that keeps the ILK:** SY.admin's `restore_ilk`, then `run_node` with that `ilk_id`.
   Both exist; `run_node`'s help names `ilk_id`. In this stage only a converge uses it, for a node
   whose files are gone while its ILK is active.
-- **`retire_ed`'s steps:**
-  1. `kill_node` with `retire_instance` on the IO, so nothing more comes in;
-  2. the same on the conscious;
+- **Removing an ED: `cd_remove` of its grouping.** It removes the grouping's deployments, the
+  newest first, each node by `kill_node` with `retire_instance`, and then the person it founded:
+  1. for `plain-ed`, the IO first, so nothing more comes in;
+  2. then the conscious;
   3. `delete_ilk` on the ED, which marks it. Its channels leave the lookups, its hand with them;
-  4. the record goes to `retired`, with its history.
+  4. the records go to `removed`, with their history.
+
+  A `cd_remove` of the deployment that founded a grouping, alone, is refused while the grouping has
+  others: the grouping is removed as a whole (design §5.4).
 - **What stays:**
   - the ILKs, marked, with their history;
   - the WhatsApp credential, assigned to a node that no longer runs, for Cloud to delete;
@@ -526,25 +660,47 @@ Decided (design §4.3).
 
 ---
 
-## 11. The operator's calls (pending)
+## 11. The operator's calls
 
-1. **The plain ED's source ships with Fluxbee, inside SY.deploy,** not in Archi (§3).
-   - Recommended: yes. Archi's sources cannot carry it today.
-2. **The conscious is born with its definition** (§7.2).
-   - SY.deploy writes the native role and handbook and the ED's personality as agent assets, with
-     Archi's checks shared. The texts are the operator's to approve, with the line on saying it is
-     an AI when asked sincerely.
-   - The other way: born empty, configured later with Archi.
-   - Recommended: born with it, so that a birth from Cloud needs no one.
-3. **The ED's channels in identity, its hand among them** (§6.2, §8).
-   - A `hand` channel names the conscious, and the router reads it, with no layout change.
-   - The other way: a new SHM field, with every binary in lockstep.
-   - Recommended: the channel.
-4. **Cloud's four operations come in this stage** (§1).
-   - The contract goes to Cloud's team; their screens are theirs.
-   - Recommended: yes; the gate drives them through Cloud's door.
-5. **Release C (`enforce`) right after this stage's gate** (§8).
-   - Recommended: yes, as one more release with its own gate.
+The operator's answers of 2026-11-26:
+
+1. **Decided: the plain ED's source ships with Fluxbee, inside SY.deploy,** not in Archi (§3).
+2. **Decided: the conscious is born with its definition** (§7.2): the native role and handbook and
+   the ED's personality, written by SY.deploy as agent assets, with Archi's checks shared. The texts
+   are the operator's to approve, with no line on whether the ED is an AI.
+3. **Pending: the hand, a `hand` channel on the ED's ILK** that the router reads (§8, explained again
+   with an example). The other way: a new SHM field, with every binary in lockstep.
+4. **Decided: Cloud's four operations come in this stage** (§1). The operator: SY.deploy will deploy
+   every solution, not only EDs, so it must not be made so narrow that the next solutions mean a lot
+   of new code. Applied:
+   - the orders are about deployments (`cd_*`), and an ED's birth is a deployment of `plain-ed`
+     into a new ED grouping (§1);
+   - the records are groupings and deployments (§2.1);
+   - the source format is the one every source compiles to, and one step builder serves them all
+     (§2, §3);
+   - the admission's namespace is any grouping's, and its clause admits whole classes of actions:
+     a node's whole life, a deployment's people, its tenant's keys. Only purges and what the whole
+     installation shares stay out (§5).
+5. **Pending: release C, `enforce`, right after this stage's gate** (§8). Explained again:
+   - **What changes:** the router's binding of `src_ilk` (stage 1 §3) runs today in report mode. It
+     reads every message, and when the sender may not speak for that person it writes a
+     `would_refuse` line and delivers anyway. In enforce it does not deliver: the sender gets
+     `UNREACHABLE` with `SRC_ILK_NOT_BOUND`. Enforce is built and tested; the mode is a constant in
+     the code, so turning it on is a release of the router alone.
+   - **What it would refuse:** an agent sending with a real person's ILK; an agent other than her
+     hand sending as an ED; an IO sending as an ED. **What it takes:** an IO with the person it
+     identified; a `SY.*`; an ED's hand as its ED.
+   - **Why not before this stage:** until now nothing legitimate sends as an ED. The first is its
+     conscious, in this stage, and it is taken only with the hand (call 3). Enforcing before 2C
+     would refuse every ED reply.
+   - **Why right after it:** from 2C on, a company's people write to an ED, and the ED acts on who
+     wrote. That was the panel's high hole (design §17.3): in report mode, a wrong or broken node
+     speaking as a person or as an ED is only a log line. 2C's gate reads the report with a real
+     ED's traffic, and the report since 0.1.154 holds no line outside the gate's probe.
+   - **The other way:** wait longer, for more of the installation's own traffic, or for the first
+     responsibility with a WF in an ED's path (§8, still reported). The cost: EDs live with a hole
+     the router already knows how to close.
+   - Recommended: right after 2C's gate, as one more release with its own gate.
 
 Decided by the earlier talk, and applied here without a new call:
 
@@ -576,7 +732,8 @@ Shared code goes alone, then items on different binaries, a gate each.
 - **Release 2B, identity, the orchestrator and the router:**
   - **Identity:** `ILK_CREATE_VIRTUAL` with `ilk_id`, and `ILK_ADD_VIRTUAL_CHANNEL`.
   - **SY.admin:** `add_virtual_person_channel`.
-  - **The orchestrator:** `retire_instance`, and `ilk_id` in `run_node`'s help.
+  - **The orchestrator:** `retire_instance`; `require_launched_by` checked on the config actions
+    too (§5); `ilk_id` in `run_node`'s help.
   - **The router:** the hands in its view and in its rule (report).
   - **Its gate:**
     - a virtual person created twice with one id is one;
@@ -642,8 +799,8 @@ It runs in the tenant `pruebas`, with no real Meta traffic.
     `app_secret` and a fake `access_token`.
 - **The smoke:** a new throwaway node, and a stopped one read.
 - **The birth, through Cloud's door:**
-  - `create_ed` answers 202 well under IO.cloud's wait;
-  - `get_ed` reaches `active`;
+  - `cd_deploy` of `plain-ed` into a new ED grouping answers 202 well under IO.cloud's wait;
+  - `cd_get` reaches `active`;
   - each step is timed from the journal.
 - **Read back:**
   - the ED's ILK is virtual, in `pruebas`, with its `whatsapp` and `hand` channels;
@@ -661,19 +818,19 @@ It runs in the tenant `pruebas`, with no real Meta traffic.
   - no `would_refuse` for the conscious;
   - a probe under another `AI.*` name, sending as the ED, is reported.
 - **The edges:**
-  - `create_ed` again with the same key gives the same ED;
+  - `cd_deploy` again with the same key gives the same deployment and ED;
   - another key with the same number is refused;
-  - an ED of another tenant reads as not found;
+  - a deployment or grouping of another tenant reads as not found;
   - Cloud's `delete_ilk` on the ED still answers `ILK_VIRTUAL`;
   - a `run_node` from the operator into the namespace answers `NAME_RESERVED`.
 - **A restart of SY.deploy in the middle of a second birth:** the birth converges, with one ED and
   one ILK per node.
-- **The end:** `retire_ed`, and then:
+- **The end:** `cd_remove` of the ED's grouping, and then:
   - the nodes are gone;
   - the three ILKs are marked;
   - the names are held;
   - the credential is kept;
-  - the record is `retired`.
+  - the records are `removed`.
 - **Cleanup:** the operator purges the gate's ILKs and its credential.
 - **The timings:** the answer, each step, the time to `active`, and from the webhook to the Graph
   call.
@@ -688,8 +845,9 @@ operator's call, and the gate does not need it.
 | What | Where it goes |
 | --- | --- |
 | Responsibilities: Archi's sources with blanks, standard and particular | A stage of its own, with Cloud's hiring flow (design §13, 18) |
-| Upgrades of EDs, waves, rollback | With the first new version of the plain ED (design §6.1) |
-| Config writes, routes, VPN rules and policy in SY.deploy's row | With the responsibilities that need them (§5) |
+| Upgrades of deployments, waves, rollback | With the first new version of a source, the plain ED's or another (design §6.1) |
+| WFs, routes, VPN rules, the user policy, hives and runtimes: their sections in a source and their rows | With the first source that needs each (§3, §5) |
+| Groupings of kind infra and test | When the first is deployed (design §5.4) |
 | The profile | Stage 4 (design §10) |
 | The email IO | To see (design §7.3) |
 | ED–ED talk, a WF in an ED's path | Design §8.5 |
