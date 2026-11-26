@@ -119,8 +119,9 @@ The rule touches every message, so it comes in two steps:
 2. **Enforce:** once a run of the gates on 8.x shows no refusal that matters, a release turns the
    refusals on.
 
-The mode is a router setting (`src_ilk_bind: report | enforce`), `report` by default in this stage.
-Each change of mode is a release, explicit and recorded.
+The mode is the router's code, not a setting: release B ships `report`, and release C switches it
+to `enforce`. Each change of mode is a release, explicit and recorded, with no new key in
+`hive.yaml` or in the installation file.
 
 ### 3.4 What stays open after stage 1
 
