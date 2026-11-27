@@ -221,9 +221,9 @@ gone, and the summary says both. A log that cannot be read leaves it open. The l
 recorded mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a
 node's run, start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN
 rule, a tap, an ILK's or a tenant's change (a purge included, since 0.1.152), a node's config, a
-message to a node, the storage, a WF instance's cancel. `update`, `sync_hint` and the OPA,
-wf-rules and deployment writes (`opa_clear` among them; `cd_deploy` and `cd_remove`, which SY.admin
-forwards to SY.deploy as it forwards the wf-rules ones) go another way in SY.admin
+message to a node, the storage, a WF instance's cancel, a deployment and its removal (`cd_deploy`,
+`cd_remove`, which SY.admin runs as commands before it forwards them to SY.deploy). `update`,
+`sync_hint` and the OPA and wf-rules writes (`opa_clear` among them) go another way in SY.admin
 and are not in it, so a timed-out one stays open in that chat, as before: Archi waits for each as
 long as SY.admin does, or longer. An identical request there is refused with a text that says so
 (`operation_error_message`, `open_operation_is_read`): the record cannot be settled in that chat;

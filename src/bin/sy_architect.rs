@@ -12115,19 +12115,17 @@ const COMMAND_LOG_PAGE_ROWS: u64 = 200;
 const COMMAND_LOG_MAX_PAGES: usize = 5;
 
 /// Whether SY.admin's command log keeps a tracked mutation of `action` (FINDINGS A-320): the ones
-/// SY.admin runs as commands (`handle_admin_command`), each with its outcome once it ends. Of the
-/// actions an SCMD records, `update`, `sync_hint` and the OPA, wf-rules and deployment (`cd_*`)
-/// writes go another way in SY.admin and are not in it, so a timed-out one stays open, as before:
-/// Archi waits for each of them as long as SY.admin does, or longer. SY.admin forwards a `cd_*`
-/// order to SY.deploy as it forwards a wf-rules one to SY.wf-rules, and waits 10 s for its answer
-/// (a deployment's steps run after it); `cd_get` reads where one stands. `add_hive` is read in the
-/// hive registry instead.
+/// SY.admin runs as commands (`handle_admin_command`), each with its outcome once it ends: the
+/// deployment writes among them (`cd_deploy`, `cd_remove`, which SY.admin runs as commands before
+/// it forwards them to SY.deploy; the `cd_*` reads are reads, never recorded). Of the actions an
+/// SCMD records, `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin
+/// and are not in it, so a timed-out one stays open, as before: Archi waits for each of them as
+/// long as SY.admin does, or longer. `add_hive` is read in the hive registry instead.
 fn action_in_command_log(action: &str) -> bool {
     is_mutating_admin_action(action)
         && !matches!(action, "add_hive" | "update" | "sync_hint")
         && !action.starts_with("opa_")
         && !action.starts_with("wf_rules_")
-        && !action.starts_with("cd_")
 }
 
 /// Whether a read can settle an open record of `action` (`settle_open_operation`): an `add_hive`'s
@@ -35566,9 +35564,14 @@ mod tests {
             assert!(open_operation_is_read(action), "{action}");
         }
         assert!(!action_in_command_log("opa_clear"));
-        // A deployment's order goes to SY.deploy as a wf-rules one goes to SY.wf-rules, outside
-        // SY.admin's command log.
+        // A deployment's order is a command SY.admin runs and logs before it forwards it to
+        // SY.deploy: a timed-out one is settled by the log. The deployments' reads are reads,
+        // never recorded.
         for action in ["cd_deploy", "cd_remove"] {
+            assert!(action_in_command_log(action), "{action}");
+            assert!(open_operation_is_read(action), "{action}");
+        }
+        for action in ["cd_get", "cd_list", "cd_catalog", "cd_tree"] {
             assert!(!action_in_command_log(action), "{action}");
             assert!(!open_operation_is_read(action), "{action}");
         }
