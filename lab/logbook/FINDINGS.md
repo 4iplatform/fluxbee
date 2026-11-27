@@ -588,6 +588,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-365 🔵 io.wapp's contract lists `identity.*`, `io.blob.*`, `node.*` and `runtime.*` as optional fields it never reads (low; io.wapp; found 2026-11-26 reading the code for the ED's stage 2).
 - A-366 🔵 Archi's designer is told a resource without `ownership` defaults to `external`; the code defaults a node to `solution`, and the reconciler never reads a node's ownership (low; Archi; found 2026-11-26 reading the code for the ED's stage 2).
 - A-367 ✅ The Go SDK's `TestTheQueueHandsOverItsSystemMessagesFirst` raced the queue's forwarder: it read the lanes' depths right after the last message, before the forwarder's pop, and failed on GitHub's runner with `[0 1]`; the test waits for the pop now (low; Go SDK; found 2026-11-27 in the identity SHM v7 branch's CI; fixed in 0.1.157).
+- A-368 🔵 A spoke's old orchestrator moves its managed nodes onto the runtimes an update brings as soon as Syncthing delivers them, before the spoke's core is updated: for a lockstep SHM layout change the new readers face the old writer (0.1.157: AI.pruebas on worker1 could not read identity for one minute); healed by itself (low; General/update; found 2026-11-27 in gate0257).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1664,6 +1665,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-368 [General/update] 🔵 low (found 2026-11-27 in gate0257, 0.1.157; seen in worker1's journal) — a spoke's nodes move onto the update's runtimes before the spoke's core does
+
+- **What:** the update's runtimes reach a spoke by Syncthing before its core update. The spoke's
+  orchestrator, still the old one, runs its reconcile pass (A-109) and relaunches each managed node
+  on what its runtime names now. Only later does the spoke's core update restart SY.identity and the
+  rest.
+- **Seen in 0.1.157,** the identity SHM's version 7: AI.pruebas on worker1, relaunched on ai.generic
+  0.1.157 at 20:37:37Z, logged `identity SHM unavailable: invalid identity SHM header/layout` every
+  10 s until worker1's new SY.identity recreated the region at 20:38:25Z, and read its definition at
+  20:38:37Z. WF.gate0206 moved at the same second.
+- **Effect:** for a change of a shared region's layout, a spoke's new readers cannot read it for
+  about a minute; the reverse case, old readers against a new region, is the same minute on the
+  motherbee. Harmless for other changes. Nothing was lost: the nodes read again at the next poll.
+- **Status:** recorded. Worth knowing before the next layout change; an orchestrator that holds the
+  relaunch of nodes until its own core is on the update's version would close it.
 
 ### A-367 [Go SDK] 🔵 low ✅ fixed in 0.1.157 (found 2026-11-27 in CI of `coa/shm-v7`, the identity SHM's version 7; a test's race, not the code's) — `TestTheQueueHandsOverItsSystemMessagesFirst` read the depths before the forwarder's last pop
 

@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.156** | 2026-11-26 | `0a5be3fb` | motherbee + spokes (core), the router alone: the Digital Executive's stage 1 cleanup, release two. The router's binding of a person's `src_ilk` comes out whole (its rule, its watcher, its report lines, and the identity reader's ILK kinds it read): the router and `src/shm` are 0.1.153's again | ✅ live, gate0256 14 PASS, no FAIL | snapshot `pre-edclean2-0-1-156` · `apt install fluxbee=0.1.155` (nothing one-way) |
+| **0.1.157** | 2026-11-27 | `105ee2f0` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2A ([stage 2](../docs/digital-executive-v1-stage-2.md) §1.1, §10): the identity SHM's version 7, every `IlkEntry` naming whom its ILK works for (`works_for`) and its role (`work_role`), 1184 bytes, in its three copies with one shared layout fixture; SY.identity's migration v7, record, replication and projection, the primary's relation standing on every replica push; nothing sets it yet. With A-367 (a Go SDK test's race) | ✅ live, gate0257 18 PASS, no FAIL | snapshot `pre-shm7-0-1-157` · `apt install fluxbee=0.1.156` (migration v7 only adds two columns; SY.identity recreates its region at the version it runs) |
+| **0.1.156** | 2026-11-26 | `0a5be3fb` | motherbee + spokes (core), the router alone: the Digital Executive's stage 1 cleanup, release two. The router's binding of a person's `src_ilk` comes out whole (its rule, its watcher, its report lines, and the identity reader's ILK kinds it read): the router and `src/shm` are 0.1.153's again | ✅ replaced by 0.1.157 | snapshot `pre-edclean2-0-1-156` (deleted 2026-11-27) · `apt install fluxbee=0.1.155` (nothing one-way) |
 | **0.1.155** | 2026-11-26 | `4cb16973` | motherbee + spokes (core), two binaries, one branch each: the Digital Executive's stage 1 cleanup, release one (the operator, 2026-11-26: the security path went ahead of the flow and bent the next stage's design). SY.identity: a virtual person takes channels as any person does, and an IO's provision of its address resolves to it (merges, in or out, still refused); io.api: `by_ilk` names a virtual person again | ✅ replaced by 0.1.156 | snapshot `pre-edclean-0-1-155` (deleted 2026-11-26) · `apt install fluxbee=0.1.154` (nothing one-way) |
 | **0.1.154** | 2026-11-25 | `ba6d0d9a` | motherbee + spokes (core), the router alone, the Digital Executive's stage 1, release B ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §3): the router binds a person's `src_ilk` to its sender (IO, WF, SY; a virtual person's to SY) on its three paths, in REPORT mode (a would-be refusal only logs `src_ilk_bind would_refuse`, throttled); a background watcher publishes the view of the hive's persons and aliases, the message path never reads the region | ✅ replaced by 0.1.155; its binding taken out in 0.1.156 | snapshot `pre-router-ed1-0-1-154` (deleted 2026-11-26) · `apt install fluxbee=0.1.153` |
 | **0.1.153** | 2026-11-25 | `93a4024a` | motherbee + spokes (core), the Digital Executive's stage 1, release A ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md)): the identity SHM's virtual-person bit (`ILK_FLAG_VIRTUAL`, its three copies), SY.identity's virtual person (migration v6, `ILK_CREATE_VIRTUAL` from SY.admin@motherbee only, the `ILK_VIRTUAL` refusals of merges, re-registration, channels and provisions), SY.admin's `create_virtual_person` and Cloud's person actions refused on an ED, io.api's `by_ilk` refusing one, Archi's SCMD route | ✅ live, gate0253 31/31 PASS (one tool FAIL re-run PASS) | snapshot `pre-ed1-0-1-153` · `apt install fluxbee=0.1.152` (migration v6 only adds a column) |
@@ -165,6 +166,64 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.157 — the identity SHM's version 7: whom an ILK works for (the Digital Executive's stage 2, release 2A)
+
+- **Date:** 2026-11-27 (ART) · **Previous version:** 0.1.156 · **Commit:** `105ee2f0`.
+- **Scope:** motherbee and the three spokes, through the installation's update. Shared code alone
+  (METHOD §9): a layout change of the identity SHM, its writer and every reader together.
+- **Why:** the ED's identity lives in identity (the operator, 2026-11-27; design §3.0): every ILK
+  names the person it works for and its role, and every node reads it in memory.
+- **What changed (`coa/shm-v7`, a builder's two commits and two of mine, rebased and fast-forwarded):**
+  - **The layout:** `IDENTITY_VERSION` 7; `IlkEntry` gains `works_for` (16 bytes, at 1152) and
+    `work_role` (1 byte, at 1168: 0 none, 1 conscious, 2 channel, 3 agent) and 7 bytes of padding,
+    before the 8 reserved bytes kept for the person's document: 1184 bytes. In its three copies
+    (`src/shm`, the Rust SDK's `IdentityIlkOption.works_for` and `work_role`, the Go SDK's
+    `IlkFacts.WorksFor` and `WorkRole`), each with compile-time or test checks against one shared
+    fixture (`go/fluxbee-go-sdk/testdata/identity_layout/ilk_entry.json`).
+  - **SY.identity:** migration v7 adds `identity_ilks.works_for` and `work_role`; the record, the
+    database, the replication and the projection carry them; nothing sets them yet (2C's
+    `ILK_SET_WORKS_FOR`). The primary's relation stands on every replica push, by delta or by
+    snapshot (mine, from the builder's report: a worker's reconcile with its older view would have
+    cleared a relation set on the primary right after the node's birth).
+  - **A-367:** the Go SDK's `TestTheQueueHandsOverItsSystemMessagesFirst` waits for the forwarder's
+    last pop (it raced it on GitHub's runner).
+  - **Docs:** the shared-memory and identity references and SY.identity's node doc at version 7.
+- **Review:** the builder's report and mine on its two flagged points (the replica push, fixed; the
+  router's OPA input left without the fields, by design). Clippy denying warnings in both Rust
+  workspaces; the Go modules' vet and build; the Go SDK's tests.
+- **Build:** CI green on the branch and on the integrated head `105ee2f0`. A first build failed to
+  start: the Mac's VPN to 8.x had dropped. Build on fb-build 20:04:58–20:33:05Z (28.1 min).
+- **The deploy:** the mark at 20:33:55Z; `ops deploy 0.1.157 --snapshot pre-shm7-0-1-157 --drop
+  pre-edclean2-0-1-156` in 303 s:
+  - **Phases:** snapshots 29.6 s, the motherbee's apt 161.8 s, its admin on the version 40.4 s, the
+    spokes answering 9.1 s, the update's call 27.5 s, the hives on the target 20.9 s, health 5.6 s.
+  - **On the target after the update's call:** the motherbee 4.2 s, egress1 and ingress1 34.6 s,
+    worker1 46.0 s.
+  - **Health:** clean.
+- **Checked on 8.x (the gate, gate0257, 20:39–20:47Z; `scratchpad/gate-tools/r157_gate.py`,
+  `r157_region.py`, with 0.1.155's and 0.1.154's probes, git-ignored; 18 PASS, no FAIL, no model
+  call):**
+  - **The smoke:** a new node RUNNING in 4.7 s on 0.1.157; a stopped one reads STOPPED.
+  - **The regions:** the motherbee's and worker1's identity regions read magic `JSID`, version 7,
+    41 ILKs, 52,658,368 bytes.
+  - **Every hive on 0.1.157,** health clean, and every managed node moved: IO.blob, IO.cloud,
+    IO.web and IO.slack.gate0192 on the motherbee, AI.pruebas on worker1 on their runtimes' 0.1.157,
+    and WF.gate0206 on `wf.engine` 0.1.157 (relaunched at 20:37:37–38Z).
+  - **Identity's writer on v7** (0.1.155's probe): a stranger provisioned, a channel added to a
+    virtual person, its address resolving to it, a merge into it refused.
+  - **The router on v7** (0.1.154's probe): four messages delivered.
+  - **No relation set:** a virtual person's record carries neither field.
+  - **Seen, A-368:** AI.pruebas, relaunched on the new runtime by worker1's old orchestrator at
+    20:37:37Z, could not read worker1's identity region (still version 6) until worker1's new
+    SY.identity recreated it at 20:38:25Z; it read its definition at 20:38:37Z. One minute, healed
+    by itself.
+  - **Cleaned:** the virtual person, the stranger, the smoke node.
+- **Next:** 2B, the SDKs: the conscious's `speaks_as` and the IO's `io.person_ilk`, each confirmed
+  by identity, and Cloud's six rows.
+- **Rollback:** snapshot `pre-shm7-0-1-157`, or `apt install fluxbee=0.1.156` and 0.1.156's
+  `update_installation`: SY.identity 0.1.156 recreates its region at version 6, and migration v7's
+  two columns stay, unread.
 
 ## 0.1.156 — the Digital Executive's stage 1 cleanup, release two: the router's binding out
 
