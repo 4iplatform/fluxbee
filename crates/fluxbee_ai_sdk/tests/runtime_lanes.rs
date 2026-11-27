@@ -3,7 +3,9 @@
 //! frontdesk handoff are answered at once, and a turn past the queue is answered `ai_runtime_busy`
 //! while the ones that wait keep their order. Through the SDK's own sender: an answer over the
 //! frame limit fails its message alone (FINDINGS A-294), and the node's status reads the load of
-//! the runtime it was given (`NodeRuntime::with_load`, FINDINGS A-290).
+//! the runtime it was given (`NodeRuntime::with_load`, FINDINGS A-290). A person the config says
+//! the agent speaks as, which identity does not confirm, changes no reply, and the status says why
+//! (docs/digital-executive-v1-stage-2.md §6.1).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -412,4 +414,56 @@ async fn the_status_reads_the_saturated_runtime_it_was_given() {
 
     router.let_turns_go(1);
     assert_eq!(router.answer().await.routing.trace_id, "turn-1");
+}
+
+/// docs/digital-executive-v1-stage-2.md §6.1: a person in the config that identity does not
+/// confirm changes no reply. Here the hive's identity SHM does not hold the agent's ILK (on a test
+/// machine there is no region at all), so its reply carries its own ILK, and its status says that
+/// the person is not confirmed and why, without degrading its health. With no person in the
+/// config, its status says nothing of one.
+#[tokio::test]
+async fn a_person_identity_does_not_confirm_changes_no_reply_and_the_status_says_why() {
+    const AGENT: &str = "ilk:5b0e3c1d-0000-4a1b-8c2d-000000000001";
+    const ED: &str = "ilk:5b0e3c1d-0000-4a1b-8c2d-000000000002";
+
+    let mut router = Router::start(RuntimeConfig {
+        self_ilk_id: Some(AGENT.to_string()),
+        speaks_as: Some(ED.to_string()),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    router.send(status_request("status")).await;
+    let status = router.answer().await;
+    assert_eq!(status.payload["health_state"], json!("HEALTHY"));
+    let speaks_as = &status.payload["extensions"]["speaks_as"];
+    assert_eq!(speaks_as["ilk"], json!(ED));
+    assert_eq!(speaks_as["confirmed"], json!(false));
+    assert!(
+        speaks_as["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{speaks_as}"
+    );
+
+    let mut person_turn = turn("turn-1");
+    person_turn.meta.src_ilk = Some("ilk:5b0e3c1d-0000-4a1b-8c2d-000000000003".to_string());
+    person_turn.meta.dst_ilk = Some(ED.to_string());
+    router.send(person_turn).await;
+    router.let_turns_go(1);
+    let reply = router.answer().await;
+    assert_eq!(reply.routing.trace_id, "turn-1");
+    assert_eq!(reply.meta.src_ilk.as_deref(), Some(AGENT));
+    assert_eq!(
+        reply.meta.dst_ilk.as_deref(),
+        Some("ilk:5b0e3c1d-0000-4a1b-8c2d-000000000003")
+    );
+
+    let mut unset = Router::start(RuntimeConfig {
+        self_ilk_id: Some(AGENT.to_string()),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    unset.send(status_request("status")).await;
+    let status = unset.answer().await;
+    assert_eq!(status.payload["extensions"].get("speaks_as"), None);
 }

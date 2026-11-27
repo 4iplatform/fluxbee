@@ -10,6 +10,7 @@ pub mod node_trait;
 pub mod output;
 mod refusal_log;
 pub mod runtime;
+pub mod speaks_as;
 pub mod summary_refresh;
 pub mod text_payload;
 pub mod thread_state;
@@ -67,6 +68,10 @@ pub use runtime::{
     RuntimeLoadState, AI_RUNTIME_CHANNEL, AI_RUNTIME_REPLY_TOO_LARGE, AI_RUNTIME_SATURATED,
     DEFAULT_DIRECT_CAPACITY, DEFAULT_DIRECT_HANDLER_TIMEOUT, DEFAULT_DIRECT_USER_CAPACITY,
     DEFAULT_HANDLER_TIMEOUT,
+};
+pub use speaks_as::{
+    confirm_speaks_as, SpeaksAsStatus, SPEAKS_AS_CHECK_INTERVAL, SPEAKS_AS_STATUS_KEY,
+    SPEAKS_AS_WORK_ROLE,
 };
 pub use summary_refresh::{
     refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,

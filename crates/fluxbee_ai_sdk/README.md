@@ -652,6 +652,24 @@ registered case ends saved as `completed` and is never deleted by the model.
       `last_error` and `extensions` on.
     - `RuntimeLoad::snapshot()` is `None` until the runtime runs, and `add_to_status` then adds
       nothing.
+    - `extensions.speaks_as`, only when the config names a person the agent speaks as (below):
+      `{ilk, confirmed, reason}`, `reason` while not confirmed. `RuntimeLoad::add_to_status` adds
+      it; a node that builds its status from `snapshot()` adds `RuntimeLoad::speaks_as()` with
+      `SpeaksAsStatus::add_to_status`. It never changes `health_state`: a conscious just born is
+      not confirmed until its relation is set in identity.
+  - **The person it speaks as** (docs/digital-executive-v1-stage-2.md §6.1, `src/speaks_as.rs`):
+    `RuntimeConfig::speaks_as`, an `ilk:<uuid>`, which the node sets at boot from its config (a
+    Digital Executive's ILK, for its conscious). The SDK reads no config key for it.
+    - **Confirmed by identity, never by the config alone:** the agent's own ILK's entry
+      (`self_ilk_id`) in its hive's identity SHM has `works_for` equal to `speaks_as` and
+      `work_role` `conscious` (`confirm_speaks_as`). The runtime reads that entry once before it
+      takes its first message and again every 10 s (`SPEAKS_AS_CHECK_INTERVAL`, ai.generic's
+      definition poll's default), and keeps the outcome where each reply reads it.
+    - **While confirmed,** a solution reply with no `src_ilk` carries the person (below).
+    - **While not,** every reply is as without a person; a WARN names the node, the person and why
+      (`the agent does not speak as the person its config names`), at most once a minute, and the
+      status says why. An INFO line names the moment it is confirmed.
+    - **With no person** (unset or blank), the runtime reads nothing and nothing changes.
   - A handler runs once. When it returns an error or runs out of time (its lane's) it may already
     have called a model (billed) or a tool that acts, so the runtime never runs it again: a
     conversational message or a handoff gets an error reply (`ai_runtime_error` or
@@ -677,7 +695,10 @@ registered case ends saved as `completed` and is never deleted by the model.
 - **A reply goes from the agent to whoever spoke:**
   - its `dst_ilk` is the incoming `src_ilk`;
   - its `src_ilk` is the agent's own ILK (`RuntimeConfig::self_ilk_id`, read from
-    `FLUXBEE_NODE_ILK_ID` by default), never the human's;
+    `FLUXBEE_NODE_ILK_ID` by default), or, on a solution reply, the person its config names
+    (`RuntimeConfig::speaks_as`) while identity confirms it; never one copied from the message,
+    so never the human's. A control reply keeps the agent's own ILK, a reply whose node set its
+    `src_ilk` keeps it, and the writer (`meta.context.writer`) stays the agent;
   - it keeps `thread_id` and drops `memory_package`;
   - it never carries `via_tap`, which only the router sets, on its copies;
   - its `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`, a WF's

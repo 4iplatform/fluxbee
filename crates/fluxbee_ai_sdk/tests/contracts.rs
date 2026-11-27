@@ -99,8 +99,10 @@ fn contract_reply_message_reuses_meta_and_sets_payload() {
     let reply = build_reply_message(&message, "node-ai-999", payload.clone());
     assert_eq!(reply.meta.msg_type, "user");
     assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
-    // A reply goes to whoever spoke; the agent's own ILK is stamped by the runtime when it sends
-    // it, never the human's (docs/router-stream-v1.md §6.2).
+    // A reply goes to whoever spoke; the runtime stamps its `src_ilk` when it sends it: the
+    // agent's own ILK, or the person its config names and identity confirms, never one copied
+    // from the message (docs/router-stream-v1.md §6.2, docs/digital-executive-v1-stage-2.md §6.1;
+    // runtime.rs `a_reply_carries_its_agents_own_ilk_or_the_person_identity_confirms_never_the_messages`).
     assert_eq!(reply.meta.src_ilk, None);
     assert_eq!(
         reply.meta.dst_ilk.as_deref(),

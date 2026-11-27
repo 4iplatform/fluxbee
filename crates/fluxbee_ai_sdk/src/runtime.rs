@@ -27,6 +27,10 @@ use crate::message::{
 };
 use crate::node_trait::AiNode;
 use crate::refusal_log::RefusalLog;
+use crate::speaks_as::{
+    configured_person, confirm_speaks_as, own_entry_in_shm, SpeaksAsCheck, SpeaksAsStatus,
+    SPEAKS_AS_CHECK_INTERVAL,
+};
 
 /// The code of the error that goes in place of a reply over the frame limit (FINDINGS A-294,
 /// `reply_too_large_stand_in`), and the word its trace entry adds.
@@ -119,6 +123,12 @@ pub struct RuntimeConfig {
     /// The agent's own ILK, stamped as the sender of its replies (docs/router-stream-v1.md §6.2:
     /// cognition reads who says what). None leaves a reply without `src_ilk`, never the human's.
     pub self_ilk_id: Option<String>,
+    /// The person this agent speaks as, an `ilk:<uuid>`: a Digital Executive, for its conscious
+    /// (docs/digital-executive-v1-stage-2.md §6.1). The node sets it at boot from its config. While
+    /// identity confirms it (the agent's own ILK works for that person, as its `conscious`), a
+    /// solution reply with no `src_ilk` carries it in place of `self_ilk_id`; otherwise nothing
+    /// changes (`crate::speaks_as`). None, or blank, reads nothing and changes nothing.
+    pub speaks_as: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +152,7 @@ impl Default for RuntimeConfig {
             write_retry: RetryPolicy::default(),
             metrics_log_interval: Duration::from_secs(30),
             self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
+            speaks_as: None,
         }
     }
 }
@@ -204,10 +215,21 @@ impl RuntimeLoad {
         self.metrics.load_snapshot(Instant::now())
     }
 
-    /// `RuntimeLoadSnapshot::add_to_status` with the load now; nothing until the runtime runs.
+    /// What the runtime knows now of the person its config says it speaks as
+    /// (`RuntimeConfig::speaks_as`): whether identity confirms it, and why not. None while its
+    /// config names no person, and until the runtime runs.
+    pub fn speaks_as(&self) -> Option<SpeaksAsStatus> {
+        self.metrics.speaks_as.status()
+    }
+
+    /// `RuntimeLoadSnapshot::add_to_status` with the load now, and, when the config names a person
+    /// the agent speaks as, `SpeaksAsStatus::add_to_status`; nothing until the runtime runs.
     pub fn add_to_status(&self, payload: &mut Value) {
         if let Some(load) = self.snapshot() {
             load.add_to_status(payload);
+        }
+        if let Some(speaks_as) = self.speaks_as() {
+            speaks_as.add_to_status(payload);
         }
     }
 }
@@ -363,6 +385,9 @@ struct RuntimeMetrics {
     /// The bounds the runtime runs on, set as it starts: its load is read against them
     /// (`load_snapshot`).
     bounds: Mutex<Option<LoadBounds>>,
+    /// The person the runtime speaks as, while identity confirms it, which each reply reads
+    /// (`send_reply`), and its status (`crate::speaks_as`). Empty while the config names none.
+    speaks_as: SpeaksAsCheck,
 }
 
 /// What the lanes turn away, by kind (FINDINGS A-257), and the replies too large to send
@@ -617,6 +642,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             metrics.clone(),
         ));
         let metrics_task = tokio::spawn(metrics_loop(metrics.clone(), config.metrics_log_interval));
+        let speaks_as_task = start_speaks_as_check(&config, writer.full_name(), metrics.clone());
         let mut lanes = Lanes::new(Arc::new(self.node), writer, config, metrics.clone());
 
         let ended = match dispatch(&mut lanes, &mut rx, &mut reader_task).await {
@@ -624,6 +650,9 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             Err(err) => Err(err),
         };
         metrics_task.abort();
+        if let Some(task) = speaks_as_task {
+            task.abort();
+        }
         if let Err(err) = ended {
             metrics.fatal_errors.fetch_add(1, Ordering::Relaxed);
             return Err(err);
@@ -1279,6 +1308,7 @@ async fn send_reply<W: ReplyWriter>(
         writer.uuid(),
         &writer.full_name(),
         config.self_ilk_id.as_deref(),
+        metrics.speaks_as.confirmed().as_deref(),
     );
     let note = reply_trace_note(requester.as_deref(), &mut response);
     match write_reply(&writer, &response, &note, &config, &metrics).await {
@@ -1438,18 +1468,64 @@ fn reply_too_large_stand_in(reply: &Message, size: usize, max: usize) -> Option<
     Some(stand_in)
 }
 
-/// What the runtime stamps on an answer as it sends it: this node as its sender, its ILK when the
-/// answer names no `src_ilk`, and itself as the writer of a solution answer, its ILK and its node
-/// name (docs/cognition-hands-v1.md §5), in place of the request's writer, which the reply's context
-/// brought along.
-fn stamp_reply(response: &mut Message, node_uuid: &str, node_name: &str, self_ilk: Option<&str>) {
+/// What the runtime stamps on an answer as it sends it (docs/digital-executive-v1-stage-2.md §6.1):
+///
+/// - this node as its sender;
+/// - when the answer names no `src_ilk`: on a solution answer, `speaks_as`, the person the config
+///   names while identity confirms it, or else the node's own ILK; on a control answer, the node's
+///   own ILK. Never an ILK of the request's: a reply's builder clears `src_ilk` and puts the
+///   request's `src_ilk` in `dst_ilk`, and none of the request's ILKs reaches this function;
+/// - itself as the writer of a solution answer, its own ILK and its node name
+///   (docs/cognition-hands-v1.md §5), in place of the request's writer, which the reply's context
+///   brought along. The writer stays the node when it speaks as a person.
+fn stamp_reply(
+    response: &mut Message,
+    node_uuid: &str,
+    node_name: &str,
+    self_ilk: Option<&str>,
+    speaks_as: Option<&str>,
+) {
     response.routing.src = node_uuid.to_string();
+    let solution = is_solution_kind(&response.meta.msg_type);
     if response.meta.src_ilk.is_none() {
-        response.meta.src_ilk = self_ilk.map(ToString::to_string);
+        let speaker = if solution {
+            speaks_as.or(self_ilk)
+        } else {
+            self_ilk
+        };
+        response.meta.src_ilk = speaker.map(ToString::to_string);
     }
-    if is_solution_kind(&response.meta.msg_type) {
+    if solution {
         message_writer::set_writer(&mut response.meta, Writer::new(self_ilk, Some(node_name)));
     }
+}
+
+/// Starts the check of the person the config says the agent speaks as (`crate::speaks_as`): once
+/// now, before the first message is taken, and then every `SPEAKS_AS_CHECK_INTERVAL`, reading the
+/// agent's own ILK's entry in the identity SHM of its hive. None, and nothing read, while the
+/// config names no person.
+fn start_speaks_as_check(
+    config: &RuntimeConfig,
+    node_name: Arc<str>,
+    metrics: Arc<RuntimeMetrics>,
+) -> Option<JoinHandle<()>> {
+    let person = configured_person(config.speaks_as.as_deref())?.to_string();
+    let self_ilk = config.self_ilk_id.clone();
+    let check = move || {
+        let outcome = confirm_speaks_as(&person, self_ilk.as_deref(), |ilk| {
+            own_entry_in_shm(&node_name, ilk)
+        });
+        metrics
+            .speaks_as
+            .record(&node_name, &person, outcome, Instant::now());
+    };
+    check();
+    Some(tokio::spawn(async move {
+        loop {
+            sleep(SPEAKS_AS_CHECK_INTERVAL).await;
+            check();
+        }
+    }))
 }
 
 /// The agent's entry in its reply's trace (docs/message-trace-v1.md §5): to whoever asked, with what
@@ -1788,6 +1864,7 @@ mod tests {
             "uuid-sales",
             "AI.sales@worker1",
             Some("ilk:sales"),
+            None,
         );
         assert_eq!(response.routing.src, "uuid-sales");
         assert_eq!(response.meta.src_ilk.as_deref(), Some("ilk:sales"));
@@ -1799,7 +1876,7 @@ mod tests {
 
         // With no ILK of its own, the agent names its node.
         let mut response = message("user");
-        stamp_reply(&mut response, "uuid-sales", "AI.sales@worker1", None);
+        stamp_reply(&mut response, "uuid-sales", "AI.sales@worker1", None, None);
         assert_eq!(
             message_writer::writer_of(response.meta.context.as_ref()),
             Some(Writer::new(None, Some("AI.sales@worker1")))
@@ -1811,8 +1888,177 @@ mod tests {
             "uuid-sales",
             "AI.sales@worker1",
             Some("ilk:sales"),
+            None,
         );
         assert_eq!(control.meta.context, None);
+    }
+
+    /// The contract, changed on purpose (docs/digital-executive-v1-stage-2.md §6.1): a reply
+    /// carries its agent's own ILK, or the person its config names and identity confirms, never
+    /// one copied from the message. A person stamps only a solution reply with no `src_ilk`; the
+    /// writer stays the agent, and a control reply keeps the agent's own ILK.
+    #[test]
+    fn a_reply_carries_its_agents_own_ilk_or_the_person_identity_confirms_never_the_messages() {
+        // A person's turn to Laura's conscious, through her IO: the person wrote it, and the IO
+        // stamped Laura as its `dst_ilk`.
+        let mut turn = message("user");
+        turn.meta.src_ilk = Some("ilk:writer".to_string());
+        turn.meta.dst_ilk = Some("ilk:laura".to_string());
+        let reply_to = |turn: &Message| {
+            build_reply_message_runtime_src(turn, json!({"type": "text", "content": "hi"}))
+        };
+        let stamp = |reply: &mut Message, speaks_as: Option<&str>| {
+            stamp_reply(
+                reply,
+                "uuid-conscious",
+                "AI.laura@worker1",
+                Some("ilk:conscious"),
+                speaks_as,
+            );
+        };
+
+        // No person in the config, or one identity does not confirm: the agent's own ILK, as
+        // before, and never the `dst_ilk` the message brought.
+        let mut reply = reply_to(&turn);
+        stamp(&mut reply, None);
+        assert_eq!(reply.meta.src_ilk.as_deref(), Some("ilk:conscious"));
+        assert_eq!(reply.meta.dst_ilk.as_deref(), Some("ilk:writer"));
+
+        // Confirmed: the person, with the agent as the writer.
+        let mut reply = reply_to(&turn);
+        stamp(&mut reply, Some("ilk:laura"));
+        assert_eq!(reply.meta.src_ilk.as_deref(), Some("ilk:laura"));
+        assert_eq!(reply.meta.dst_ilk.as_deref(), Some("ilk:writer"));
+        assert_eq!(
+            message_writer::writer_of(reply.meta.context.as_ref()),
+            Some(Writer::new(Some("ilk:conscious"), Some("AI.laura@worker1")))
+        );
+
+        // A message that names another person as its `dst_ilk` chooses nothing: the reply carries
+        // the person identity confirms, or the agent.
+        let mut forged = turn.clone();
+        forged.meta.dst_ilk = Some("ilk:the-boss".to_string());
+        for speaks_as in [None, Some("ilk:laura")] {
+            let mut reply = reply_to(&forged);
+            stamp(&mut reply, speaks_as);
+            assert_ne!(reply.meta.src_ilk.as_deref(), Some("ilk:the-boss"));
+            assert_eq!(
+                reply.meta.src_ilk.as_deref(),
+                Some(speaks_as.unwrap_or("ilk:conscious"))
+            );
+        }
+
+        // A reply whose node set its `src_ilk` keeps it.
+        let mut reply = reply_to(&turn);
+        reply.meta.src_ilk = Some("ilk:set-by-the-node".to_string());
+        stamp(&mut reply, Some("ilk:laura"));
+        assert_eq!(reply.meta.src_ilk.as_deref(), Some("ilk:set-by-the-node"));
+
+        // A control reply keeps the agent's own ILK, and names no writer.
+        let mut control = message("system");
+        stamp(&mut control, Some("ilk:laura"));
+        assert_eq!(control.meta.src_ilk.as_deref(), Some("ilk:conscious"));
+        assert_eq!(control.meta.context, None);
+    }
+
+    /// What a reply carries follows the runtime's last check (`SpeaksAsCheck`): the person while
+    /// identity confirms it, the agent's own ILK before any check (no person in the config) and
+    /// once identity stops confirming it.
+    #[tokio::test]
+    async fn the_reply_reads_the_last_check_of_the_person() {
+        let (sent, mut replies) = mpsc::unbounded_channel();
+        let writer = TestWriter::new(sent);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let config = RuntimeConfig {
+            self_ilk_id: Some("ilk:conscious".to_string()),
+            speaks_as: Some("ilk:laura".to_string()),
+            ..RuntimeConfig::default()
+        };
+        let mut turn = message("user");
+        turn.meta.src_ilk = Some("ilk:writer".to_string());
+        async fn reply_src_ilk(
+            writer: &TestWriter,
+            replies: &mut mpsc::UnboundedReceiver<Message>,
+            config: &RuntimeConfig,
+            metrics: &Arc<RuntimeMetrics>,
+            turn: &Message,
+        ) -> Option<String> {
+            let reply =
+                build_reply_message_runtime_src(turn, json!({"type": "text", "content": "hi"}));
+            send_reply(
+                writer.clone(),
+                Some("IO.wapp.laura@worker1".to_string()),
+                reply,
+                config.clone(),
+                metrics.clone(),
+            )
+            .await
+            .expect("sent");
+            replies.recv().await.expect("a reply").meta.src_ilk
+        }
+        assert_eq!(
+            reply_src_ilk(&writer, &mut replies, &config, &metrics, &turn)
+                .await
+                .as_deref(),
+            Some("ilk:conscious")
+        );
+        let now = Instant::now();
+        metrics.speaks_as.record(
+            "AI.laura@worker1",
+            "ilk:laura",
+            Ok("ilk:laura".to_string()),
+            now,
+        );
+        assert_eq!(
+            reply_src_ilk(&writer, &mut replies, &config, &metrics, &turn)
+                .await
+                .as_deref(),
+            Some("ilk:laura")
+        );
+        metrics.speaks_as.record(
+            "AI.laura@worker1",
+            "ilk:laura",
+            Err("the relation was cleared".to_string()),
+            now,
+        );
+        assert_eq!(
+            reply_src_ilk(&writer, &mut replies, &config, &metrics, &turn)
+                .await
+                .as_deref(),
+            Some("ilk:conscious")
+        );
+
+        // The node's status says why, beside the load.
+        let load = RuntimeLoad {
+            metrics: metrics.clone(),
+        };
+        let mut status = json!({"status": "ok", "health_state": "HEALTHY"});
+        load.add_to_status(&mut status);
+        assert_eq!(status["health_state"], json!("HEALTHY"));
+        assert_eq!(
+            status["extensions"]["speaks_as"],
+            json!({"ilk": "ilk:laura", "confirmed": false, "reason": "the relation was cleared"})
+        );
+    }
+
+    /// With no person in the config, the runtime reads nothing and starts no check.
+    #[tokio::test]
+    async fn no_person_in_the_config_starts_no_check() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        for speaks_as in [None, Some("  ".to_string())] {
+            let config = RuntimeConfig {
+                self_ilk_id: Some("ilk:conscious".to_string()),
+                speaks_as,
+                ..RuntimeConfig::default()
+            };
+            assert!(
+                start_speaks_as_check(&config, Arc::from("AI.laura@worker1"), metrics.clone())
+                    .is_none()
+            );
+        }
+        assert_eq!(metrics.speaks_as.status(), None);
+        let load = RuntimeLoad { metrics };
+        assert_eq!(load.speaks_as(), None);
     }
 
     #[tokio::test]
