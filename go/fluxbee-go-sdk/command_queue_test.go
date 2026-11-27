@@ -233,8 +233,14 @@ func TestTheQueueHandsOverItsSystemMessagesFirst(t *testing.T) {
 			t.Fatalf("got %s, want %s", got, want)
 		}
 	}
-	if depths := queue.depths(); depths != [laneCount]int{} {
-		t.Fatalf("the queue is empty once handed over, got %v", depths)
+	// The forwarder takes a message out of its lane right after the consumer took it, so the last
+	// pop can come a moment after the last read (FINDINGS A-367).
+	deadline := time.Now().Add(2 * time.Second)
+	for depths := queue.depths(); depths != [laneCount]int{}; depths = queue.depths() {
+		if time.Now().After(deadline) {
+			t.Fatalf("the queue is empty once handed over, got %v", depths)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
