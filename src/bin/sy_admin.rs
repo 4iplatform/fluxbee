@@ -5497,7 +5497,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "28";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "29";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -5878,6 +5878,20 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "create_virtual_person",
         route: InternalActionRoute::Command("create_virtual_person"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    // Whom an ILK works for, and a person's document (docs/digital-executive-v1-stage-2.md §1.1,
+    // §1.2).
+    InternalActionSpec {
+        action: "set_ilk_works_for",
+        route: InternalActionRoute::Command("set_ilk_works_for"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_person_document",
+        route: InternalActionRoute::Command("set_person_document"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -6413,6 +6427,11 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         // Fluxbee Cloud, whose create of a Digital Executive comes with SY.deploy
         // (docs/digital-executive-v1-stage-1.md §1.2).
         | "create_virtual_person"
+        // Whom an ILK works for and a person's document (docs/digital-executive-v1-stage-2.md
+        // §1.1, §1.2): Archi and the operator in this stage, never Fluxbee Cloud, which reaches an
+        // ED only through SY.deploy (§8).
+        | "set_ilk_works_for"
+        | "set_person_document"
         | "delete_tenant"
         | "restore_tenant"
         | "purge_tenant"
@@ -14283,6 +14302,45 @@ async fn handle_hive_paths(
                     .await?;
             Ok(Some((status, resp)))
         }
+        // Whom an ILK works for (docs/digital-executive-v1-stage-2.md §1.1): the body is
+        // {works_for, work_role}, the ILK the path's.
+        ("PUT", ["identity", "ilks", ilk_id, "works-for"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some(admin_invalid_request_response(
+                    "set_ilk_works_for",
+                    "request body must be a JSON object",
+                )));
+            }
+            payload["ilk_id"] = serde_json::Value::String(decode_percent(ilk_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_ilk_works_for", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        // A person's document (docs/digital-executive-v1-stage-2.md §1.2): the body is
+        // {document}, the person the path's.
+        ("PUT", ["identity", "ilks", ilk_id, "document"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some(admin_invalid_request_response(
+                    "set_person_document",
+                    "request body must be a JSON object",
+                )));
+            }
+            payload["ilk_id"] = serde_json::Value::String(decode_percent(ilk_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_person_document", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
         ("DELETE", ["identity", "tenants", tenant_id]) => {
             let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
             let (status, resp) =
@@ -15357,6 +15415,15 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
+        // set_ilk_works_for and set_person_document: an ILK of the wrong type for the relation or
+        // the document (docs/digital-executive-v1-stage-2.md §1.1, §1.2).
+        "INVALID_ILK_TYPE" => 400,
+        // SY.identity refused the registrar: its verbs are SY.admin@motherbee's alone.
+        "UNAUTHORIZED_REGISTRAR" => 403,
+        // SY.identity's database is not ready yet, or a person's document's file could not be
+        // written: nothing changed, and the same request may pass when asked again
+        // (`with_identity_retryable` marks payload.retryable on the ED's writes).
+        "DB_NOT_READY" | "DOCUMENT_WRITE_FAILED" => 503,
         // A cursor its listing did not give (FINDINGS A-198): another listing's, or none at all.
         "INVALID_CURSOR" => 400,
         "UNAUTHORIZED"
@@ -15375,6 +15442,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // person's creation is the first SY.admin action it reaches (create_virtual_person).
         | "INVALID_TENANT"
         | "NODE_NOT_FOUND"
+        // set_ilk_works_for: the person named is no active person SY.identity holds.
+        | "PERSON_NOT_FOUND"
         | "BLOB_NOT_FOUND"
         | "KEY_NOT_FOUND"
         | "RUNTIME_NOT_AVAILABLE"
@@ -15412,6 +15481,11 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "KEY_TAKEN"
         | "TENANT_NAME_TAKEN"
         | "TENANT_DOMAIN_TAKEN"
+        // create_virtual_person with an ilk_id another ILK holds, or a person of other names or
+        // another tenant (docs/digital-executive-v1-stage-2.md §1.3).
+        | "ILK_ID_TAKEN"
+        // set_ilk_works_for: the person is not of the ILK's tenant (§1.1).
+        | "TENANT_MISMATCH"
         // An identity lifecycle step the current state refuses: what blocks it is in the detail.
         | "TENANT_HAS_NODES"
         | "TENANT_HAS_CHILDREN"
@@ -17121,6 +17195,8 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "set_ilk_tenant"
             | "purge_ilk"
             | "create_virtual_person"
+            | "set_ilk_works_for"
+            | "set_person_document"
             | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
@@ -17209,6 +17285,9 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "purge_ilk"
             // A person the operator then deletes and purges by hand.
             | "create_virtual_person"
+            // What an ILK is for an ED, and what the ED is: the operator says so first.
+            | "set_ilk_works_for"
+            | "set_person_document"
             | "delete_tenant"
             | "restore_tenant"
             | "purge_tenant"
@@ -17312,6 +17391,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         "create_virtual_person" => {
             "Create a virtual person: a human ILK marked virtual (a Digital Executive), created only this way, with no channels. In this stage for the operator's tests: the operator and Archi, never Fluxbee Cloud."
         }
+        "set_ilk_works_for" => {
+            "Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel or agent). Null and null clear it. The identity SHM carries it."
+        }
+        "set_person_document" => {
+            "Write a new version of a person's document: SY.identity keeps it on the person, writes it once as blob/people/person-<uuid>_<hash16>.json on the motherbee, and the identity SHM names its hash."
+        }
         "delete_tenant" => {
             "Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable."
         }
@@ -17392,7 +17477,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "run_node" => "Create and start a new managed node instance in a hive.",
         "start_node" => "Start an existing persisted managed node instance in a hive.",
         "restart_node" => "Restart an existing managed node instance in a hive.",
-        "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory.",
+        "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory and tears its identity and secrets down; optional retire_instance removes the instance and keeps its identity, its ILK marked and never purged.",
         "remove_node_instance" => "Delete a node instance from disk/runtime state.",
         "teardown_node" => "Remove what a torn-down node leaves in the stores: the secrets dedicated to its ILK, then the ILK itself (marked, then purged). The ILK must be the node's; every step is reported.",
         "send_node_message" => "Send a system message to a node.",
@@ -17588,6 +17673,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "set_ilk_tenant" => vec!["PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant"],
         "purge_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/purge"],
         "create_virtual_person" => vec!["POST /hives/{hive}/identity/virtual-people"],
+        "set_ilk_works_for" => vec!["PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for"],
+        "set_person_document" => vec!["PUT /hives/{hive}/identity/ilks/{ilk_id}/document"],
         "delete_tenant" => vec!["DELETE /hives/{hive}/identity/tenants/{tenant_id}"],
         "restore_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/restore"],
         "purge_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/purge"],
@@ -17985,7 +18072,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             ),
         ],
         "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "set_ilk_tenant"
-        | "purge_ilk" => vec![
+        | "purge_ilk" | "set_ilk_works_for" | "set_person_document" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -18097,6 +18184,8 @@ fn admin_action_body_required(action: &str) -> bool {
             | "set_installation_ai"
             | "set_ilk_definition"
             | "create_virtual_person"
+            | "set_ilk_works_for"
+            | "set_person_document"
             | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
@@ -18342,6 +18431,23 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             ),
             admin_action_body_field("display_name", "string", "The person's name."),
         ],
+        "set_ilk_works_for" => vec![
+            admin_action_body_field(
+                "works_for",
+                "string|null",
+                "The person the ILK works for, ilk:<uuid>: a person (human, real or virtual), active, in the ILK's own tenant. null, with a null work_role, clears the relation.",
+            ),
+            admin_action_body_field(
+                "work_role",
+                "string|null",
+                "The ILK's role for that person: conscious, channel or agent. null, with a null works_for, clears the relation.",
+            ),
+        ],
+        "set_person_document" => vec![admin_action_body_field(
+            "document",
+            "object",
+            "The person's document, whole: an object with \"schema\": 1, at most 64 KiB, its keys among schema, display_name, company_name, short_id, personality, channels, position, reports_to, responsibilities and public (docs/digital-executive-v1-stage-2.md §1.2).",
+        )],
         "vault_put" => vec![
             admin_action_body_field("key", "string", "Vault key to write."),
             admin_action_body_field(
@@ -18540,10 +18646,22 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional hive override when using internal admin dispatch.",
             ),
         ],
-        "create_virtual_person" => vec![admin_action_body_field(
-            "company_name",
+        "create_virtual_person" => vec![
+            admin_action_body_field(
+                "company_name",
+                "string",
+                "Optional. The name of the company the person works for.",
+            ),
+            admin_action_body_field(
+                "ilk_id",
+                "string",
+                "Optional. The person's ILK, ilk:<uuid>, minted by the caller: with it the creation is idempotent, an active virtual person with this id, the same tenant and the same names answering ok with it; any other holder of the id answers ILK_ID_TAKEN (409).",
+            ),
+        ],
+        "set_ilk_works_for" => vec![admin_action_body_field(
+            "change_reason",
             "string",
-            "Optional. The name of the company the person works for.",
+            "Optional. Why the relation changes, kept in the ILK's history.",
         )],
         "update_tenant" => vec![
             admin_action_body_field(
@@ -18614,6 +18732,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "object",
                 "Optional runtime/node config passed during spawn.",
             ),
+            admin_action_body_field(
+                "ilk_id",
+                "string",
+                "Optional. The node's ILK, ilk:<uuid>: the orchestrator registers the node on it instead of minting a new one (resolve_node_ilk_id). A retired node comes back on its ILK this way, once restore_ilk has undone the mark.",
+            ),
         ],
         "kill_node" => vec![
             admin_action_body_field(
@@ -18625,6 +18748,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "purge_instance",
                 "bool",
                 "Also remove the node persisted instance directory after stop. Useful before reinstall/recreate.",
+            ),
+            admin_action_body_field(
+                "retire_instance",
+                "bool",
+                "Remove the node from its hive as a purge does, and keep its identity: its ILK is marked (reversible), never purged, its secrets stay, and it keeps holding the node's name. Exclusive with purge_instance (docs/digital-executive-v1-stage-2.md §9).",
             ),
         ],
         "add_route" => vec![
@@ -19253,6 +19381,17 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "display_name": "Laura",
             "company_name": "Client Co"
         }),
+        "set_ilk_works_for" => serde_json::json!({
+            "works_for": "ilk:550e8400-e29b-41d4-a716-446655440001",
+            "work_role": "conscious"
+        }),
+        "set_person_document" => serde_json::json!({
+            "document": {
+                "schema": 1,
+                "display_name": "Laura",
+                "company_name": "Client Co"
+            }
+        }),
         "create_tenant" => serde_json::json!({
             "name": "Client Co",
             "domain": "client.example",
@@ -19480,6 +19619,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "create_virtual_person" => {
             r#"curl -X POST /hives/motherbee/identity/virtual-people -d '{"tenant_id":"tnt:11111111-1111-1111-1111-111111111111","display_name":"Laura","company_name":"Client Co"}'"#
         }
+        "set_ilk_works_for" => {
+            r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/works-for -d '{"works_for":"ilk:550e8400-e29b-41d4-a716-446655440001","work_role":"conscious"}'"#
+        }
+        "set_person_document" => {
+            r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440001/document -d '{"document":{"schema":1,"display_name":"Laura","company_name":"Client Co"}}'"#
+        }
         "delete_tenant" => {
             "curl -X DELETE /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
         }
@@ -19675,7 +19820,7 @@ const VIRTUAL_PERSON_CLOUD_NOTE: &str = "Fluxbee Cloud's call on a virtual perso
 /// What every removal says of the public pages it leaves up (`pages_left_up`, FINDINGS A-242).
 const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDINGS A-242): a page outlives its publisher, its tenant and its hive, and stays up until its expires_at (24 h after its publish by default, 30 days at most, never renewed; the edge then serves it no more and SY.admin's sweep retires it) or until it is taken down. The ok answer names the pages it leaves up in payload.pages_left_up: {count, pages: [{publication_id, expires_at (epoch seconds), status, filename_original, publisher_l2_name, tenant_id, edge_node}], more}, soonest to expire first, at most 20 of them in 8 KiB (more counts the rest), never a link's key. A ledger SY.admin cannot read gives {count: null, error}, and refuses nothing. GET /artifacts lists every page that is up; POST /artifacts/unpublish takes one down by its publication_id.";
 /// Which pages a node's purge names, and the publish it does not wait for.
-const NODE_PAGES_LEFT_UP_NOTE: &str = "A node's purge names the pages the node published (publisher_l2_name); a stop names none. A publish of the node in flight at its purge is not waited for: its page may still go up within 110 s, unnamed, and stays up until it expires like the rest.";
+const NODE_PAGES_LEFT_UP_NOTE: &str = "A node's purge or retire names the pages the node published (publisher_l2_name); a stop names none. A publish of the node in flight at its purge is not waited for: its page may still go up within 110 s, unnamed, and stays up until it expires like the rest.";
 
 /// What the node actions that check the node's unit answer while systemd does not (FINDINGS
 /// A-271).
@@ -19922,6 +20067,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
             "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
             "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+            "With retire_instance (docs/digital-executive-v1-stage-2.md §9) the node leaves its hive as with a purge (its timers, its instance directory, its uuid file and its identity-map entry) and keeps its identity: its hive's orchestrator marks its ILK (ILK_DELETE to the primary's SY.identity, reversible) and never purges it, and teardown_node does not run, so the secrets dedicated to the ILK stay and the marked ILK keeps holding the node's name. The answer names the mark in ilk_retired and ilk_retire, and says vault_secrets_kept. To bring it back on its ILK: restore_ilk, then run_node with that ilk_id.",
+            "purge_instance and retire_instance are exclusive: a request with both is refused with INVALID_REQUEST, and so is a retire_instance that is not a boolean, before anything is stopped. Fluxbee Cloud's kill_node may not carry retire_instance.",
             NODE_UNIT_UNANSWERED_NOTE,
             PAGES_LEFT_UP_NOTE,
             NODE_PAGES_LEFT_UP_NOTE,
@@ -20066,11 +20213,29 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "A person comes back even while their tenant is marked, still charged to it; any other ILK answers TENANT_DELETED until its tenant is restored. ILK_NOT_DELETED if it is not marked.",
             VIRTUAL_PERSON_CLOUD_NOTE,
         ],
+        "set_ilk_works_for" => vec![
+            "Whom an ILK works for (docs/digital-executive-v1-stage-2.md §1.1): sent to the primary's SY.identity as ILK_SET_WORKS_FOR, which takes it from SY.admin@motherbee alone.",
+            "Body: {\"works_for\": \"ilk:<uuid>\" | null, \"work_role\": \"conscious\" | \"channel\" | \"agent\" | null}, both named: null and null clear the relation. An optional change_reason goes to the ILK's history. A field beyond these is refused with INVALID_REQUEST.",
+            "The ILK must be an agent's, a node's (INVALID_ILK_TYPE, 400, otherwise), and SY.identity must hold it (ILK_NOT_FOUND, 404). The person must be a person, real or virtual, active (PERSON_NOT_FOUND, 404), and of the ILK's own tenant (TENANT_MISMATCH, 409). A request SY.identity cannot take answers INVALID_REQUEST (400).",
+            "503 DB_NOT_READY changed nothing and carries payload.retryable true: ask again.",
+            "The answer is {status, ilk_id, works_for, work_role}. The identity SHM carries the relation: the conscious (speaks_as) and the IO (io.person_ilk) read it there to confirm what their config says, and a person's parts are the ILKs whose works_for names it.",
+            "Callers: the operator's HTTP API and Archi. Fluxbee Cloud never: an ED's parts are set by SY.deploy, which comes with its own row.",
+        ],
+        "set_person_document" => vec![
+            "A person's document (docs/digital-executive-v1-stage-2.md §1.2): sent to the primary's SY.identity as ILK_SET_DOCUMENT, which takes it from SY.admin@motherbee alone.",
+            "Body: {\"document\": {...}}: an object with \"schema\": 1, at most 64 KiB, its keys among schema, display_name, company_name, short_id, personality, channels, position, reports_to, responsibilities and public. SY.identity checks it, and answers INVALID_REQUEST (400) otherwise.",
+            "A person only: INVALID_ILK_TYPE (400) for any other ILK, ILK_NOT_FOUND (404) for one SY.identity does not hold.",
+            "Each write is a new version: SY.identity keeps it on the person and writes it once as blob/people/person-<uuid>_<hash16>.json on the motherbee, which the people folder (fluxbee-dist-people) sends to the workers; the identity SHM's document_hash, its hash's first 16 hex, names it. Another hive's SHM may name a file that has not arrived yet.",
+            "The answer is {status, ilk_id, document_hash (the full SHA-256, 64 hex), file}. The document is never read through read_blob.",
+            "503 DOCUMENT_WRITE_FAILED (the file could not be written) and 503 DB_NOT_READY (SY.identity's database not ready) changed nothing and carry payload.retryable true: ask again.",
+            "Callers: the operator's HTTP API and Archi. Fluxbee Cloud never: an ED's document is written by SY.deploy, which comes with its own row.",
+        ],
         "create_virtual_person" => vec![
             "A virtual person is a human ILK marked virtual: a Digital Executive (docs/digital-executive-v1-design.md §3). It is created only this way, by the primary's SY.identity (ILK_CREATE_VIRTUAL, which takes it from SY.admin alone), never by a registration or a provision.",
             "It is born with its registration complete, charged to tenant_id, with display_name and an optional company_name, and with no channels. The tenant must exist, be active, and never be the root one: INVALID_TENANT (404) for one SY.identity does not hold, TENANT_DELETED, TENANT_PENDING or TENANT_SUSPENDED (409), or TENANT_ROOT_NOT_REGISTRABLE (403) otherwise; a display_name or company_name over 128 bytes answers INVALID_REQUEST.",
             "The answer is {status, ilk_id, tenant_id, virtual: true}; get_ilk and list_ilks show virtual.",
             "In this stage for the operator's tests: the operator's HTTP API and Archi, never Fluxbee Cloud. Remove one with delete_ilk, then purge_ilk.",
+            "An optional ilk_id (ilk:<uuid>) names the person's ILK, minted by the caller (docs/digital-executive-v1-stage-2.md §1.3): with it the creation is idempotent, an active virtual person with that id, the same tenant and the same names answering ok with it, and any other holder of the id answers ILK_ID_TAKEN (409). The answer is the same whether SY.identity created the person or found it.",
             "A virtual person refuses Fluxbee Cloud's delete_ilk, restore_ilk and set_ilk_tenant, any merge into it, and a channel from an IO node: each answers ILK_VIRTUAL. Cloud's register_human with an email a virtual person holds answers ILK_VIRTUAL from SY.identity, and nothing is merged.",
         ],
         "purge_ilk" => vec![
@@ -23259,6 +23424,8 @@ async fn handle_admin_command_inner(
             | "set_ilk_tenant"
             | "purge_ilk"
             | "create_virtual_person"
+            | "set_ilk_works_for"
+            | "set_person_document"
             | "get_tenant"
             | "create_tenant"
             | "update_tenant"
@@ -24476,14 +24643,19 @@ fn removal_pages_of(
 /// The node a purging node action names, `<name>@<hive>` as the orchestrator reads it
 /// (`target_hive_from_payload`, `normalize_node_name_for_target`): the hive a qualified name
 /// carries, else the payload's `target` or `hive_id`, else this admin's, whose orchestrator takes
-/// it. `kill_node` purges with `purge_instance` true, `remove_node_instance` always; any other
-/// action, a stop, or a request that names no node (the orchestrator refuses it) is `None`.
+/// it. `kill_node` removes the node with `purge_instance` or `retire_instance` true (a retire
+/// keeps its identity, and its pages stay up all the same: docs/digital-executive-v1-stage-2.md
+/// §9), `remove_node_instance` always; any other action, a stop, or a request that names no node
+/// (the orchestrator refuses it) is `None`.
 fn purged_node_name(action: &str, payload: &serde_json::Value, admin_hive: &str) -> Option<String> {
-    let purges = match action {
-        "kill_node" => payload
-            .get("purge_instance")
+    let flag = |key: &str| {
+        payload
+            .get(key)
             .and_then(|value| value.as_bool())
-            .unwrap_or(false),
+            .unwrap_or(false)
+    };
+    let purges = match action {
+        "kill_node" => flag("purge_instance") || flag("retire_instance"),
         "remove_node_instance" => true,
         _ => false,
     };
@@ -24576,11 +24748,13 @@ fn identity_command_hive(admin_hive: &str) -> String {
 }
 
 /// The ILK_CREATE_VIRTUAL request of a `create_virtual_person` (docs/digital-executive-v1-stage-1.md
-/// §1.2): the tenant the person is charged to, its display name and its company's, if any. A
-/// virtual person takes no channel, so a field beyond these three is refused, never dropped.
-/// SY.identity decides the rest: the tenant (never the root one), its state, the names' limits.
+/// §1.2): the tenant the person is charged to, its display name and its company's, if any, and the
+/// ILK it is born with, if the caller minted one (docs/digital-executive-v1-stage-2.md §1.3). A
+/// virtual person takes no channel, so a field beyond these four is refused, never dropped.
+/// SY.identity decides the rest: the tenant (never the root one), its state, the names' limits,
+/// the id's form, and whether another ILK holds it (ILK_ID_TAKEN).
 fn virtual_person_request(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
-    const FIELDS: [&str; 3] = ["tenant_id", "display_name", "company_name"];
+    const FIELDS: [&str; 4] = ["tenant_id", "display_name", "company_name", "ilk_id"];
     let Some(object) = payload.as_object() else {
         return Err("the request must be a JSON object".to_string());
     };
@@ -24612,7 +24786,125 @@ fn virtual_person_request(payload: &serde_json::Value) -> Result<serde_json::Val
         }
         Some(_) => return Err("company_name must be a string".to_string()),
     }
+    match object.get("ilk_id") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(_)) => {
+            let ilk_id =
+                text("ilk_id").ok_or("ilk_id must name an ILK, ilk:<uuid>, or be left out")?;
+            request["ilk_id"] = serde_json::json!(ilk_id);
+        }
+        Some(_) => return Err("ilk_id must be a string, ilk:<uuid>".to_string()),
+    }
     Ok(request)
+}
+
+/// SY.identity's answers to the Digital Executive's writes that changed nothing and may pass when
+/// asked again (docs/digital-executive-v1-stage-2.md §1): its database not ready yet, and a person's
+/// document whose file could not be written.
+const IDENTITY_RETRYABLE_CODES: [&str; 2] = ["DB_NOT_READY", "DOCUMENT_WRITE_FAILED"];
+
+/// An identity answer whose error is one of `IDENTITY_RETRYABLE_CODES` says so in
+/// `payload.retryable`, as the other answers that changed nothing do; any other answer is as it
+/// came.
+fn with_identity_retryable(answer: (u16, String)) -> (u16, String) {
+    let (status, body) = answer;
+    let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return (status, body);
+    };
+    let retryable = envelope
+        .get("error_code")
+        .and_then(|code| code.as_str())
+        .is_some_and(|code| IDENTITY_RETRYABLE_CODES.contains(&code));
+    if !retryable {
+        return (status, body);
+    }
+    if !envelope["payload"].is_object() {
+        envelope["payload"] = serde_json::json!({});
+    }
+    envelope["payload"]["retryable"] = serde_json::json!(true);
+    (status, envelope.to_string())
+}
+
+/// The ILK named by an identity request: a non-empty string, trimmed. SY.identity checks its form.
+fn identity_request_ilk_id<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    what: &str,
+) -> Result<&'a str, String> {
+    object
+        .get("ilk_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("ilk_id is required: {what}, ilk:<uuid>"))
+}
+
+/// The ILK_SET_WORKS_FOR request of a `set_ilk_works_for` (docs/digital-executive-v1-stage-2.md
+/// §1.1): the ILK, the person it works for and its role, both named and both null to clear them,
+/// and an optional reason for its history. A field beyond these is refused, never dropped.
+/// SY.identity decides the rest: the ILK is a node's, the person an active person of the ILK's
+/// tenant, the role one of `conscious`, `channel` and `agent`, and a relation set or cleared whole.
+fn works_for_request(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    const FIELDS: [&str; 4] = ["ilk_id", "works_for", "work_role", "change_reason"];
+    let Some(object) = payload.as_object() else {
+        return Err("the request must be a JSON object".to_string());
+    };
+    if let Some(extra) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(format!(
+            "set_ilk_works_for takes only {FIELDS:?}, not '{extra}'"
+        ));
+    }
+    let ilk_id = identity_request_ilk_id(object, "the ILK whose relation is set")?;
+    let named = |field: &str| -> Result<serde_json::Value, String> {
+        match object.get(field) {
+            None => Err(format!(
+                "{field} is required: name it, or send null to clear the relation"
+            )),
+            Some(serde_json::Value::Null) => Ok(serde_json::Value::Null),
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Ok(serde_json::json!(value.trim()))
+            }
+            Some(_) => Err(format!("{field} must be a non-empty string, or null")),
+        }
+    };
+    let mut request = serde_json::json!({
+        "ilk_id": ilk_id,
+        "works_for": named("works_for")?,
+        "work_role": named("work_role")?,
+    });
+    match object.get("change_reason") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(reason)) => {
+            if !reason.trim().is_empty() {
+                request["change_reason"] = serde_json::json!(reason.trim());
+            }
+        }
+        Some(_) => return Err("change_reason must be a string".to_string()),
+    }
+    Ok(request)
+}
+
+/// The ILK_SET_DOCUMENT request of a `set_person_document` (docs/digital-executive-v1-stage-2.md
+/// §1.2): the person and its document, an object. A field beyond these two is refused, never
+/// dropped. SY.identity decides the rest: the ILK is a person's, the document's schema, keys and
+/// size.
+fn person_document_request(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    const FIELDS: [&str; 2] = ["ilk_id", "document"];
+    let Some(object) = payload.as_object() else {
+        return Err("the request must be a JSON object".to_string());
+    };
+    if let Some(extra) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(format!(
+            "set_person_document takes only {FIELDS:?}, not '{extra}'"
+        ));
+    }
+    let ilk_id = identity_request_ilk_id(object, "the person whose document it is")?;
+    let Some(document) = object.get("document").filter(|value| value.is_object()) else {
+        return Err(
+            "document is required: the person's document, a JSON object with \"schema\": 1"
+                .to_string(),
+        );
+    };
+    Ok(serde_json::json!({ "ilk_id": ilk_id, "document": document }))
 }
 
 async fn handle_identity_command(
@@ -24648,7 +24940,23 @@ async fn handle_identity_command(
         // Only the fields ILK_CREATE_VIRTUAL takes, checked here so a misspelt one is refused
         // rather than dropped; SY.identity decides the rest.
         "create_virtual_person" => match virtual_person_request(&payload) {
-            Ok(request) => send_identity_command(ctx, client, action, request).await,
+            Ok(request) => send_identity_command(ctx, client, action, request)
+                .await
+                .map(with_identity_retryable),
+            Err(detail) => Ok(admin_invalid_request_response(action, &detail)),
+        },
+        // The same for whom an ILK works for and a person's document
+        // (docs/digital-executive-v1-stage-2.md §1.1, §1.2).
+        "set_ilk_works_for" => match works_for_request(&payload) {
+            Ok(request) => send_identity_command(ctx, client, action, request)
+                .await
+                .map(with_identity_retryable),
+            Err(detail) => Ok(admin_invalid_request_response(action, &detail)),
+        },
+        "set_person_document" => match person_document_request(&payload) {
+            Ok(request) => send_identity_command(ctx, client, action, request)
+                .await
+                .map(with_identity_retryable),
             Err(detail) => Ok(admin_invalid_request_response(action, &detail)),
         },
         "purge_ilk" => {
@@ -24848,6 +25156,9 @@ async fn send_identity_command(
         // SY.identity takes it from SY.admin@motherbee alone (docs/digital-executive-v1-stage-1.md
         // §1.2).
         "create_virtual_person" => ("ILK_CREATE_VIRTUAL", "ILK_CREATE_VIRTUAL_RESPONSE"),
+        // Both from SY.admin@motherbee alone (docs/digital-executive-v1-stage-2.md §1.1, §1.2).
+        "set_ilk_works_for" => ("ILK_SET_WORKS_FOR", "ILK_SET_WORKS_FOR_RESPONSE"),
+        "set_person_document" => ("ILK_SET_DOCUMENT", "ILK_SET_DOCUMENT_RESPONSE"),
         "delete_tenant" => ("TNT_DELETE", "TNT_DELETE_RESPONSE"),
         "restore_tenant" => ("TNT_RESTORE", "TNT_RESTORE_RESPONSE"),
         "purge_tenant" => ("TNT_PURGE", "TNT_PURGE_RESPONSE"),
@@ -28491,6 +28802,29 @@ fn node_name_hive_from_payload<'a>(
     Some(hive)
 }
 
+/// docs/digital-executive-v1-stage-2.md §9: `kill_node` takes a purge or a retire, never both, and
+/// a `retire_instance` that is not a boolean is refused, so that a retire is never read as a plain
+/// stop. The orchestrator refuses both too, on every hive.
+fn kill_node_removal_error(payload: &serde_json::Value) -> Option<String> {
+    if !matches!(
+        payload.get("retire_instance"),
+        None | Some(serde_json::Value::Null | serde_json::Value::Bool(_))
+    ) {
+        return Some("retire_instance must be a boolean".to_string());
+    }
+    let asked = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    };
+    (asked("purge_instance") && asked("retire_instance")).then(|| {
+        "purge_instance and retire_instance are exclusive: a purge tears the node's identity and \
+         secrets down, a retire marks its ILK and keeps them; ask for one"
+            .to_string()
+    })
+}
+
 fn is_node_scoped_action(action: &str) -> bool {
     matches!(
         action,
@@ -28517,6 +28851,11 @@ fn is_node_scoped_action(action: &str) -> bool {
 fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {
     if action == "add_hive" {
         return add_hive_ssh_allow_from_error(payload);
+    }
+    if action == "kill_node" {
+        if let Some(refusal) = kill_node_removal_error(payload) {
+            return Some(refusal);
+        }
     }
     let legacy = match action {
         "run_node" => {
@@ -40692,7 +41031,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "28");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "29");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -49958,6 +50297,12 @@ mod tests {
                 json!({ "node_name": "AI.sales", "purge_instance": true, "force": true }),
                 "AI.sales",
             ),
+            // A retire keeps the node's identity, and its pages stay up all the same.
+            (
+                "kill_node",
+                json!({ "node_name": PAGE_PUBLISHER, "retire_instance": true }),
+                PAGE_PUBLISHER,
+            ),
             (
                 "remove_node_instance",
                 json!({ "node_name": PAGE_PUBLISHER }),
@@ -50079,6 +50424,11 @@ mod tests {
                 "AI.sales@worker1",
             ),
             (
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "retire_instance": true }),
+                "AI.sales@worker1",
+            ),
+            (
                 "remove_node_instance",
                 json!({ "node_name": " AI.sales ", "hive_id": "worker2" }),
                 "AI.sales@worker2",
@@ -50104,6 +50454,10 @@ mod tests {
             (
                 "kill_node",
                 json!({ "node_name": "AI.sales@worker1", "purge_instance": "true" }),
+            ),
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "retire_instance": false }),
             ),
             ("kill_node", json!({ "purge_instance": true })),
             ("remove_node_instance", json!({ "node_name": " " })),
@@ -50945,6 +51299,525 @@ mod tests {
         .expect("dispatch");
         assert_eq!(cloud.http_status, 403, "{}", cloud.envelope);
         assert_eq!(cloud.envelope["error_code"], json!("UNAUTHORIZED"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// set_ilk_works_for and set_person_document are actions of the catalog with their routes,
+    /// help and examples: writes the operator confirms, which Archi asks for over the mesh or
+    /// stages in a plan, and nobody else on the mesh, Fluxbee Cloud included
+    /// (docs/digital-executive-v1-stage-2.md §1.1, §1.2). The help of create_virtual_person names its
+    /// ilk_id, run_node's its ilk_id, and kill_node's its retire_instance.
+    #[test]
+    fn the_eds_identity_actions_are_in_the_catalog_archi_reaches() {
+        for (action, pattern, path, required) in [
+            (
+                "set_ilk_works_for",
+                "PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for",
+                "/hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/works-for",
+                json!(["hive", "ilk_id", "works_for", "work_role"]),
+            ),
+            (
+                "set_person_document",
+                "PUT /hives/{hive}/identity/ilks/{ilk_id}/document",
+                "/hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/document",
+                json!(["hive", "ilk_id", "document"]),
+            ),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect("registered");
+            assert!(matches!(spec.route, InternalActionRoute::Command(name) if name == action));
+            assert!(spec.requires_target, "{action}");
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], json!(false), "{action}");
+            assert_eq!(doc["confirmation_required"], json!(true), "{action}");
+            assert_eq!(doc["executor_available"], json!(true), "{action}");
+            assert_eq!(doc["path_patterns"], json!([pattern]), "{action}");
+            assert_eq!(
+                admin_methods_allowed_for_path(path),
+                vec!["PUT"],
+                "{action}"
+            );
+            let schema = &doc["executor_contract"]["function_schema"];
+            assert_eq!(schema["required"], required, "{action}: {schema}");
+            let contract = &doc["request_contract"];
+            assert_eq!(contract["method"], json!("PUT"), "{action}");
+            assert_eq!(contract["body"]["kind"], json!("json_object"), "{action}");
+            assert_eq!(contract["body"]["required"], json!(true), "{action}");
+            assert!(admin_action_example_scmd(action).is_some(), "{action}");
+            assert!(!admin_action_example_payload(action).is_null(), "{action}");
+            assert!(executor_visible_action_specs(None)
+                .iter()
+                .any(|spec| spec.action == action));
+
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            let params = json!({ "ilk_id": TEST_ILK });
+            assert!(mesh_admits(
+                "SY.architect@motherbee",
+                action,
+                Some(PRIMARY_HIVE_ID),
+                &params
+            )
+            .is_ok());
+            for caller in [
+                "IO.cloud@motherbee",
+                "SY.frontdesk.gov@motherbee",
+                "SY.orchestrator@worker1",
+                "SY.orchestrator@motherbee",
+                "SY.wf-rules@worker1",
+                "IO.wapp.ed4qm7k2xa@worker1",
+                "AI.ed4qm7k2xa@worker1",
+                "WF.invoice@motherbee",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, None, &params).is_err(),
+                    "{caller} {action}"
+                );
+            }
+            assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&action), "{action}");
+        }
+        let notes = admin_action_request_notes("set_ilk_works_for");
+        for words in [
+            "ILK_SET_WORKS_FOR",
+            "SY.admin@motherbee alone",
+            "INVALID_ILK_TYPE",
+            "PERSON_NOT_FOUND",
+            "TENANT_MISMATCH",
+            "ILK_NOT_FOUND",
+            "null and null",
+            "conscious",
+            "Fluxbee Cloud never",
+        ] {
+            assert!(
+                notes.iter().any(|note| note.contains(words)),
+                "{words}: {notes:?}"
+            );
+        }
+        let notes = admin_action_request_notes("set_person_document");
+        for words in [
+            "ILK_SET_DOCUMENT",
+            "\"schema\": 1",
+            "64 KiB",
+            "blob/people/person-<uuid>_<hash16>.json",
+            "fluxbee-dist-people",
+            "document_hash",
+            "read_blob",
+            "INVALID_ILK_TYPE",
+            "Fluxbee Cloud never",
+        ] {
+            assert!(
+                notes.iter().any(|note| note.contains(words)),
+                "{words}: {notes:?}"
+            );
+        }
+        let field_names = |fields: Vec<Value>| -> Vec<String> {
+            fields
+                .iter()
+                .filter_map(|field| field["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        for (action, field) in [
+            ("create_virtual_person", "ilk_id"),
+            ("run_node", "ilk_id"),
+            ("kill_node", "retire_instance"),
+            ("set_ilk_works_for", "change_reason"),
+        ] {
+            assert!(
+                field_names(admin_action_body_optional_fields(action)).contains(&field.to_string()),
+                "{action} {field}"
+            );
+        }
+        assert!(admin_action_request_notes("create_virtual_person")
+            .iter()
+            .any(|note| note.contains("ilk_id") && note.contains("ILK_ID_TAKEN")));
+        assert!(admin_action_request_notes("kill_node")
+            .iter()
+            .any(|note| note.contains("retire_instance")
+                && note.contains("teardown_node does not run")));
+        assert!(admin_action_summary("kill_node").contains("retire_instance"));
+
+        // SY.identity's answers, as HTTP statuses.
+        for (code, status) in [
+            ("ILK_ID_TAKEN", 409),
+            ("TENANT_MISMATCH", 409),
+            ("PERSON_NOT_FOUND", 404),
+            ("ILK_NOT_FOUND", 404),
+            ("INVALID_ILK_TYPE", 400),
+            ("INVALID_REQUEST", 400),
+            ("UNAUTHORIZED_REGISTRAR", 403),
+            ("NOT_PRIMARY", 409),
+            ("DB_NOT_READY", 503),
+            ("DOCUMENT_WRITE_FAILED", 503),
+        ] {
+            assert_eq!(error_code_to_http_status(code), status, "{code}");
+        }
+    }
+
+    /// set_ilk_works_for asks the primary's SY.identity for ILK_SET_WORKS_FOR with the relation,
+    /// from the operator's HTTP as from Archi over the mesh, and answers what SY.identity says, a
+    /// refusal included. A request that is not one, and Fluxbee Cloud's, are refused with nothing
+    /// sent.
+    #[tokio::test]
+    async fn set_ilk_works_for_asks_identity_for_the_relation() {
+        let (ctx, mut harness) = opa_test_admin("set-ilk-works-for");
+        let query = HashMap::new();
+        let node = "ilk:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let ed = "ilk:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let set = json!({
+            "status": "ok",
+            "ilk_id": node,
+            "works_for": ed,
+            "work_role": "conscious",
+        });
+
+        // The operator's HTTP: the path's ILK, the body's relation, trimmed.
+        let body = json!({ "works_for": format!(" {ed} "), "work_role": "conscious" }).to_string();
+        let path = format!("/hives/motherbee/identity/ilks/{node}/works-for");
+        let route = handle_hive_paths("PUT", &path, &query, body.as_bytes(), &ctx, &ctx.rpc);
+        let (result, sent) = tokio::join!(
+            route,
+            answer_teardown(&mut harness, vec![("ILK_SET_WORKS_FOR", set.clone())])
+        );
+        assert_eq!(
+            dst_of(&sent[0]),
+            json!(format!("SY.identity@{PRIMARY_HIVE_ID}"))
+        );
+        assert_eq!(
+            sent[0].payload,
+            json!({ "ilk_id": node, "works_for": ed, "work_role": "conscious" })
+        );
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 200, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["action"], json!("set_ilk_works_for"));
+        assert_eq!(envelope["payload"]["works_for"], json!(ed));
+        assert_eq!(envelope["payload"]["work_role"], json!("conscious"));
+
+        // Archi over the mesh clears it, with a reason; SY.identity's refusal is the answer.
+        let refused = json!({
+            "status": "error",
+            "error_code": "TENANT_MISMATCH",
+            "message": "the person is of another tenant",
+        });
+        let (result, sent) = tokio::join!(
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "set_ilk_works_for",
+                Some(PRIMARY_HIVE_ID),
+                json!({ "ilk_id": node, "works_for": null, "work_role": null, "change_reason": " retired " }),
+                AdminOrigin::Mesh("SY.architect@motherbee"),
+            ),
+            answer_teardown(&mut harness, vec![("ILK_SET_WORKS_FOR", refused)])
+        );
+        assert_eq!(
+            sent[0].payload,
+            json!({ "ilk_id": node, "works_for": null, "work_role": null, "change_reason": "retired" })
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 409, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], json!("TENANT_MISMATCH"));
+
+        // Not a request: refused, nothing sent.
+        let code_of = |body: &str| -> Value {
+            serde_json::from_str::<Value>(body).expect("JSON")["error_code"].clone()
+        };
+        for request in [
+            json!({ "works_for": ed, "work_role": "conscious" }),
+            json!({ "ilk_id": node, "work_role": "conscious" }),
+            json!({ "ilk_id": node, "works_for": ed }),
+            json!({ "ilk_id": node, "works_for": 7, "work_role": "conscious" }),
+            json!({ "ilk_id": node, "works_for": ed, "work_role": " " }),
+            json!({ "ilk_id": node, "works_for": ed, "work_role": "conscious", "tenant_id": "tnt:x" }),
+            json!({ "ilk_id": node, "works_for": ed, "work_role": "conscious", "change_reason": 1 }),
+            json!([node]),
+        ] {
+            let (status, answer) = handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "set_ilk_works_for",
+                request.clone(),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(status, 400, "{request}: {answer}");
+            assert_eq!(code_of(&answer), json!("INVALID_REQUEST"), "{request}");
+        }
+        let (status, answer) = handle_hive_paths("PUT", &path, &query, b"[1]", &ctx, &ctx.rpc)
+            .await
+            .expect("answered")
+            .expect("routed");
+        assert_eq!(status, 400, "{answer}");
+        // Fluxbee Cloud may not ask for it.
+        let cloud = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "set_ilk_works_for",
+            Some(PRIMARY_HIVE_ID),
+            json!({ "ilk_id": node, "works_for": ed, "work_role": "conscious" }),
+            AdminOrigin::Mesh("IO.cloud@motherbee"),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(cloud.http_status, 403, "{}", cloud.envelope);
+        assert_eq!(cloud.envelope["error_code"], json!("UNAUTHORIZED"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// set_person_document asks the primary's SY.identity for ILK_SET_DOCUMENT with the person and
+    /// the document, and answers its hash and its file; SY.identity's refusal is the answer. A
+    /// request that is not one is refused with nothing sent.
+    #[tokio::test]
+    async fn set_person_document_asks_identity_for_a_new_version() {
+        let (ctx, mut harness) = opa_test_admin("set-person-document");
+        let query = HashMap::new();
+        let ed = "ilk:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let document = json!({
+            "schema": 1,
+            "display_name": "Laura Gómez",
+            "company_name": "Acme",
+            "short_id": "ed4qm7k2xa",
+            "channels": [{ "type": "whatsapp", "address": "1234567890", "io_node": "IO.wapp.ed4qm7k2xa@worker1" }],
+        });
+        let hash = "ab".repeat(32);
+        let written = json!({
+            "status": "ok",
+            "ilk_id": ed,
+            "document_hash": hash,
+            "file": format!("person-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa_{}.json", &hash[..16]),
+        });
+        let body = json!({ "document": document }).to_string();
+        let path = format!("/hives/motherbee/identity/ilks/{ed}/document");
+        let route = handle_hive_paths("PUT", &path, &query, body.as_bytes(), &ctx, &ctx.rpc);
+        let (result, sent) = tokio::join!(
+            route,
+            answer_teardown(&mut harness, vec![("ILK_SET_DOCUMENT", written.clone())])
+        );
+        assert_eq!(
+            dst_of(&sent[0]),
+            json!(format!("SY.identity@{PRIMARY_HIVE_ID}"))
+        );
+        assert_eq!(
+            sent[0].payload,
+            json!({ "ilk_id": ed, "document": document })
+        );
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 200, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["action"], json!("set_person_document"));
+        assert_eq!(envelope["payload"]["document_hash"], json!(hash));
+        assert_eq!(envelope["payload"]["file"], written["file"]);
+
+        // A node's ILK is no person: SY.identity's refusal is the answer.
+        let refused = json!({
+            "status": "error",
+            "error_code": "INVALID_ILK_TYPE",
+            "message": "a document is a person's",
+        });
+        let (result, _) = tokio::join!(
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "set_person_document",
+                Some(PRIMARY_HIVE_ID),
+                json!({ "ilk_id": TEST_ILK, "document": { "schema": 1 } }),
+                AdminOrigin::Mesh("SY.architect@motherbee"),
+            ),
+            answer_teardown(&mut harness, vec![("ILK_SET_DOCUMENT", refused)])
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 400, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], json!("INVALID_ILK_TYPE"));
+        assert!(result.envelope["payload"].get("retryable").is_none());
+
+        // A file SY.identity could not write changed nothing: 503, and asked again it may pass.
+        let unwritten = json!({
+            "status": "error",
+            "error_code": "DOCUMENT_WRITE_FAILED",
+            "message": "the document's file could not be written",
+        });
+        let (result, _) = tokio::join!(
+            handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "set_person_document",
+                json!({ "ilk_id": ed, "document": { "schema": 1 } }),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            ),
+            answer_teardown(&mut harness, vec![("ILK_SET_DOCUMENT", unwritten)])
+        );
+        let (status, body) = result.expect("answered");
+        assert_eq!(status, 503, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["error_code"], json!("DOCUMENT_WRITE_FAILED"));
+        assert_eq!(envelope["payload"]["retryable"], json!(true), "{envelope}");
+
+        for request in [
+            json!({ "document": { "schema": 1 } }),
+            json!({ "ilk_id": ed }),
+            json!({ "ilk_id": ed, "document": "Laura" }),
+            json!({ "ilk_id": ed, "document": [1] }),
+            json!({ "ilk_id": ed, "document": { "schema": 1 }, "hash": "x" }),
+        ] {
+            let (status, answer) = handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "set_person_document",
+                request.clone(),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(status, 400, "{request}: {answer}");
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// create_virtual_person passes the ILK the caller minted (docs/digital-executive-v1-stage-2.md
+    /// §1.3), trimmed, and SY.identity's ILK_ID_TAKEN answers 409; an ilk_id that is not a string
+    /// is refused with nothing sent.
+    #[tokio::test]
+    async fn create_virtual_person_passes_the_ilk_it_is_born_with() {
+        let (ctx, mut harness) = opa_test_admin("create-virtual-person-ilk");
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let ed = "ilk:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let taken = json!({
+            "status": "error",
+            "error_code": "ILK_ID_TAKEN",
+            "message": "another ILK holds that id",
+        });
+        let (result, sent) = tokio::join!(
+            handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "create_virtual_person",
+                json!({ "tenant_id": tenant, "display_name": "Laura", "ilk_id": format!(" {ed} ") }),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            ),
+            answer_teardown(&mut harness, vec![("ILK_CREATE_VIRTUAL", taken)])
+        );
+        assert_eq!(
+            sent[0].payload,
+            json!({ "tenant_id": tenant, "display_name": "Laura", "ilk_id": ed })
+        );
+        let (status, body) = result.expect("answered");
+        assert_eq!(status, 409, "{body}");
+        for ilk_id in [json!(7), json!(" "), json!({ "id": ed })] {
+            let (status, body) = handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "create_virtual_person",
+                json!({ "tenant_id": tenant, "display_name": "Laura", "ilk_id": ilk_id }),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(status, 400, "{body}");
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// docs/digital-executive-v1-stage-2.md §9: kill_node takes a purge or a retire, never both,
+    /// and a retire_instance that is not a boolean is refused, with nothing sent. A retire goes to
+    /// the orchestrator as asked, and SY.admin sends nothing else for it: SY.admin runs no
+    /// teardown after a kill (the orchestrator asks for teardown_node on a purge only), so the
+    /// node's secrets and its ILK stay. Fluxbee Cloud's kill_node may not carry it.
+    #[tokio::test]
+    async fn kill_node_retires_without_a_teardown() {
+        assert!(kill_node_removal_error(
+            &json!({ "purge_instance": true, "retire_instance": true })
+        )
+        .is_some_and(|refusal| refusal.contains("exclusive")));
+        assert!(
+            kill_node_removal_error(&json!({ "retire_instance": "true" }))
+                .is_some_and(|refusal| refusal.contains("boolean"))
+        );
+        for fine in [
+            json!({}),
+            json!({ "retire_instance": true }),
+            json!({ "retire_instance": null, "purge_instance": true }),
+            json!({ "retire_instance": false, "purge_instance": true }),
+            json!({ "purge_instance": true }),
+        ] {
+            assert_eq!(kill_node_removal_error(&fine), None, "{fine}");
+        }
+
+        let (ctx, mut harness) = mesh_test_admin("kill-node-retire");
+        for refused in [
+            json!({ "node_name": "AI.ed@worker1", "purge_instance": true, "retire_instance": true }),
+            json!({ "node_name": "AI.ed@worker1", "retire_instance": 1 }),
+        ] {
+            let (status, body) = handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "kill_node",
+                refused.clone(),
+                Some("worker1".to_string()),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(status, 400, "{refused}: {body}");
+            assert!(body.contains("INVALID_REQUEST"), "{body}");
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+
+        let retired = json!({
+            "status": "ok",
+            "node_name": "AI.ed@worker1",
+            "retire_instance": true,
+            "ilk_retired": true,
+            "vault_secrets_kept": true,
+        });
+        let (answer, sent) = tokio::join!(
+            handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "kill_node",
+                json!({ "node_name": "AI.ed@worker1", "retire_instance": true }),
+                Some("worker1".to_string()),
+            ),
+            answer_admin_relay(&mut harness, "kill_node", retired)
+        );
+        assert_eq!(sent.payload["retire_instance"], json!(true));
+        assert_ne!(sent.payload["purge_instance"], json!(true));
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ilk_retired\":true"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // Fluxbee Cloud's kill_node carries no retire.
+        let cloud = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "kill_node",
+            Some(PRIMARY_HIVE_ID),
+            json!({
+                "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+                "node_name": "IO.wapp.ed4qm7k2xa@worker1",
+                "retire_instance": true,
+            }),
+            AdminOrigin::Mesh("IO.cloud@motherbee"),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(cloud.http_status, 403, "{}", cloud.envelope);
         assert!(harness
             .next_outgoing_within(Duration::from_millis(100))
             .await

@@ -425,7 +425,9 @@ it:
   (`edge_channel_secret:`, `edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account`,
   `web_exposure_key:` since 0.1.145; `is_cloud_reserved_vault_key`, over the SDK's
   `CLOUD_RESERVED_VAULT_KEY_PREFIXES`).
-- `run_node`, `start_node`, `kill_node` and `get_node_status` act only on `IO.*` nodes.
+- `run_node`, `start_node`, `kill_node` and `get_node_status` act only on `IO.*` nodes;
+  `kill_node` carries `force` and `purge_instance`, never `retire_instance`, which comes to Cloud
+  with SY.deploy.
 - `update_tenant` sets `status` only to `active` or `suspended`; `get_llm_usage` never reads all
   tenants.
 - Most actions accept only a fixed set of fields (`only_fields`). The exposure actions carry
@@ -514,7 +516,9 @@ through unchanged. The code is not in `error_code_to_http_status`, so over HTTP 
 
 `teardown_node {node_name, ilk_id}` removes what a purged node leaves in the stores
 (`handle_teardown_node`). `SY.orchestrator@H` asks for it for a node of H when `kill_node` runs
-with `purge_instance`; the operator (`POST /hives/{hive}/nodes/{node_name}/teardown`, body
+with `purge_instance`, never with `retire_instance`, whose node keeps its identity ([A Digital
+Executive's identity](#a-digital-executives-identity)); SY.admin itself runs no teardown after a
+kill; the operator (`POST /hives/{hive}/nodes/{node_name}/teardown`, body
 `{"ilk_id": "ilk:<uuid>"}`, a bare node name being a node of the path's hive), Archi and the
 executor may ask for it too. In order:
 
@@ -596,6 +600,54 @@ while their rows stay ([SY.identity](sy-identity.md#delete-marks-purge-removes))
 - **Only the operator purges a retired system ILK** (`purge_ilk`), once it made no history; one that
   made history stays retired. `delete_ilk` and `restore_ilk` refuse a system ILK
   (`SYSTEM_ILK_PROTECTED`).
+
+## A Digital Executive's identity
+
+What an ED is lives in identity ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md)
+§1): the person, its document, and the ILKs that work for it. SY.admin sends each action to the
+primary's SY.identity (`handle_identity_command`, `send_identity_command`), which takes these verbs
+from `SY.admin@motherbee` alone. Each request is checked for its fields first, and a field it does
+not take, or one of the wrong type, is refused with `400 INVALID_REQUEST` and nothing sent
+(`virtual_person_request`, `works_for_request`, `person_document_request`); SY.identity decides
+the rest. Callers: the operator's HTTP API, the executor and Archi (`MeshAccess::Archi`), never
+Fluxbee Cloud, which reaches an ED only through SY.deploy (§8, release 2D). SY.identity's
+`DB_NOT_READY` (and `DOCUMENT_WRITE_FAILED` below) answers `503` with `payload.retryable: true`
+(`with_identity_retryable`): nothing changed, ask again; `UNAUTHORIZED_REGISTRAR` is `403`. Archi's chat has no SCMD
+for the two new actions yet: `translate_scmd` maps no such path (its SCMD routes come with 2D), and
+the release that maps them lists them in `is_mutating_admin_action` too.
+
+- **`create_virtual_person`** takes an optional `ilk_id`, `ilk:<uuid>`, minted by the caller (§1.3).
+  With it the creation is idempotent: an active virtual person with that id, the same tenant and
+  the same names answers ok with it, `{status, ilk_id, tenant_id, virtual}` as a creation does;
+  any other holder of the id answers `409 ILK_ID_TAKEN`.
+- **`set_ilk_works_for`** (`PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for`, body
+  `{"works_for": "ilk:<uuid>" | null, "work_role": "conscious" | "channel" | "agent" | null}`, both
+  named, and an optional `change_reason`) sends `ILK_SET_WORKS_FOR` (§1.1), always with both keys.
+  Null and null clear the relation; a body that leaves either out is refused with `400
+  INVALID_REQUEST`, as SY.identity refuses it, so that no request clears a relation by omission. The ILK must be an agent's (`400 INVALID_ILK_TYPE`), the person an active person
+  (`404 PERSON_NOT_FOUND`) of the ILK's own tenant (`409 TENANT_MISMATCH`); an ILK SY.identity does
+  not hold is `404 ILK_NOT_FOUND`. The answer is `{status, ilk_id, works_for, work_role}`, and the
+  identity SHM carries the relation.
+- **`set_person_document`** (`PUT /hives/{hive}/identity/ilks/{ilk_id}/document`, body
+  `{"document": {...}}`) sends `ILK_SET_DOCUMENT` (§1.2): an object with `"schema": 1`, at most
+  64 KiB, of the keys §1.2 names, for a person only (`400 INVALID_ILK_TYPE`). Each write is a new
+  version, written once by SY.identity as `blob/people/person-<uuid>_<hash16>.json` on the
+  motherbee, which `fluxbee-dist-people` sends to the workers
+  ([SY.orchestrator](sy-orchestrator.md#syncthing)); the identity SHM's `document_hash` names it.
+  The answer is `{status, ilk_id, document_hash, file}`, the full hash in 64 hex. It is never read
+  through `read_blob`. `503 DOCUMENT_WRITE_FAILED`, a file SY.identity could not write, changed
+  nothing.
+- **`kill_node` with `retire_instance`** (§9) is forwarded to the orchestrator as asked, which
+  removes the node from its hive as a purge does and marks its ILK (`ILK_DELETE`), never purging
+  it. `teardown_node` does not run, so the secrets dedicated to the ILK stay and the marked ILK keeps
+  holding the node's name; the answer names the mark (`ilk_retired`, `ilk_retire`) and says
+  `vault_secrets_kept`, and names the node's pages left up as a purge does. It is exclusive with
+  `purge_instance`: a request with both, or a `retire_instance` that is not a boolean, is refused
+  with `400 INVALID_REQUEST` before anything is sent (`kill_node_removal_error`), and the
+  orchestrator refuses both again on every hive. Fluxbee Cloud's `kill_node` carries no
+  `retire_instance` (`enforce_cloud_relay_content`). A recreate that keeps the ILK: `restore_ilk`,
+  then `run_node` with that `ilk_id`, which the orchestrator registers the node on
+  (`resolve_node_ilk_id`).
 
 ## A node's self-description
 
@@ -2257,7 +2309,7 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 27, 127 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 29, 130 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -2303,7 +2355,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `run_node` | `POST /hives/{hive}/nodes` | Create and start a new managed node instance in a hive. |
 | `start_node` | `POST /hives/{hive}/nodes/{node_name}/start` | Start an existing persisted managed node instance in a hive. |
 | `restart_node` | `POST /hives/{hive}/nodes/{node_name}/restart` | Restart an existing managed node instance in a hive. |
-| `kill_node` | `DELETE /hives/{hive}/nodes/{node_name}` | Stop a node in a hive. Optional purge_instance also removes its persisted instance directory. |
+| `kill_node` | `DELETE /hives/{hive}/nodes/{node_name}` | Stop a node in a hive. Optional purge_instance also removes its persisted instance directory and tears its identity and secrets down; optional retire_instance removes the instance and keeps its identity, its ILK marked and never purged ([A Digital Executive's identity](#a-digital-executives-identity)). |
 | `remove_node_instance` | `DELETE /hives/{hive}/nodes/{node_name}/instance` | Delete a node instance from disk/runtime state. |
 | `teardown_node` | `POST /hives/{hive}/nodes/{node_name}/teardown` | Remove what a torn-down node leaves in the stores: the secrets dedicated to its ILK, then the ILK itself (marked, then purged). |
 | `get_node_config` | `GET /hives/{hive}/nodes/{node_name}/config` | Read the stored effective config.json payload for a managed node. |
@@ -2323,6 +2375,9 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `restore_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/restore` | Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant). Refuses system ILKs (SYSTEM_ILK_PROTECTED). |
 | `set_ilk_tenant` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant` | Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope. |
 | `purge_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise); a system ILK only once it is retired (SYSTEM_ILK_PROTECTED otherwise). |
+| `create_virtual_person` | `POST /hives/{hive}/identity/virtual-people` | Create a virtual person: a human ILK marked virtual (a Digital Executive), created only this way, with no channels; an optional ilk_id makes it idempotent (ILK_ID_TAKEN for another holder). The operator and Archi, never Fluxbee Cloud. |
+| `set_ilk_works_for` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for` | Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel or agent). The operator and Archi, never Fluxbee Cloud. |
+| `set_person_document` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/document` | Write a new version of a person's document, kept by SY.identity and written as blob/people/person-<uuid>_<hash16>.json on the motherbee. The operator and Archi, never Fluxbee Cloud. |
 | `delete_tenant` | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable. |
 | `restore_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | Undo the deleted mark of one tenant: it comes back as it was. |
 | `purge_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. |
