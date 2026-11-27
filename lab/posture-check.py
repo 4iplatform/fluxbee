@@ -49,7 +49,7 @@ PRIMARY = "motherbee"
 ROLE_FOLDERS = {
     "worker": {"fluxbee-blob", "fluxbee-dist-core-worker", "fluxbee-dist-vendor",
                "fluxbee-dist-policy", "fluxbee-dist-installation", "fluxbee-dist-runtimes",
-               "fluxbee-dist-agent-assets"},
+               "fluxbee-dist-agent-assets", "fluxbee-dist-people"},
     "ingress": {"fluxbee-blob-public", "fluxbee-dist-core-ingress", "fluxbee-dist-vendor",
                 "fluxbee-dist-policy", "fluxbee-dist-installation"},
     "egress": {"fluxbee-dist-core-egress", "fluxbee-dist-vendor", "fluxbee-dist-policy",

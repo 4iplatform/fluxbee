@@ -589,6 +589,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-366 🔵 Archi's designer is told a resource without `ownership` defaults to `external`; the code defaults a node to `solution`, and the reconciler never reads a node's ownership (low; Archi; found 2026-11-26 reading the code for the ED's stage 2).
 - A-367 ✅ The Go SDK's `TestTheQueueHandsOverItsSystemMessagesFirst` raced the queue's forwarder: it read the lanes' depths right after the last message, before the forwarder's pop, and failed on GitHub's runner with `[0 1]`; the test waits for the pop now (low; Go SDK; found 2026-11-27 in the identity SHM v7 branch's CI; fixed in 0.1.157).
 - A-368 🔵 A spoke's old orchestrator moves its managed nodes onto the runtimes an update brings as soon as Syncthing delivers them, before the spoke's core is updated: for a lockstep SHM layout change the new readers face the old writer (0.1.157: AI.pruebas on worker1 could not read identity for one minute); healed by itself (low; General/update; found 2026-11-27 in gate0257).
+- A-369 🔵 A full identity sync sends 256 ILKs a frame under a 16 MiB cap: 256 persons with documents near their 64 KiB limit would pass it and break a replica's full sync; real documents are about 1 KiB (low; identity; found 2026-11-27 building 0.1.159).
+- A-370 🔵 Purging a person leaves its document's files in `blob/people/` (low; identity; found 2026-11-27 building 0.1.159).
+- A-371 🔵 `ILK_SET_TENANT` does not check the relations that name the moved person: a node of the old tenant keeps working for someone of another tenant (low; identity; found 2026-11-27 building 0.1.159).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1665,6 +1668,30 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-371 [identity] 🔵 low (found 2026-11-27 by 0.1.159's builder, read in the code) — moving a person to another tenant leaves the relations that name it
+
+- **What:** `ILK_SET_WORKS_FOR` checks that the person is in the node's own tenant when the relation is
+  set. `ILK_SET_TENANT` later moves a person without looking at the ILKs whose `works_for` names it.
+- **Effect:** a node may keep working for a person of another tenant. Its IO still checks the
+  person's tenant against its own (docs/digital-executive-v1-stage-2.md §7), so it stops stamping.
+- **Status:** recorded; to look at with the identity talk after stage 2.
+
+### A-370 [identity] 🔵 low (found 2026-11-27 by 0.1.159's builder, read in the code) — a purged person's document files stay
+
+- **What:** `ILK_SET_DOCUMENT` writes `blob/people/person-<uuid>_<hash16>.json` and keeps the newest
+  three. `ILK_PURGE` removes the record and does not remove the files.
+- **Effect:** a purged person's document stays on the motherbee's disk and on every worker's mirror.
+- **Status:** recorded; the purge should remove them.
+
+### A-369 [identity] 🔵 low (found 2026-11-27 by 0.1.159's builder, read in the code) — a full sync's frame could pass its cap with large documents
+
+- **What:** a full identity sync sends 256 ILKs a chunk (`IDENTITY_FULL_SYNC_CHUNK_ITEMS`), and a
+  sync frame is capped at 16 MiB (`MAX_SYNC_LINE_BYTES`, `src/bin/sy_identity.rs`). A person's
+  document may hold up to 64 KiB.
+- **Effect:** 256 persons with documents near the limit in one chunk would break a replica's full
+  sync. Real documents are about 1 KiB.
+- **Status:** recorded; a chunk bounded by bytes as well as by items would close it.
 
 ### A-368 [General/update] 🔵 low (found 2026-11-27 in gate0257, 0.1.157; seen in worker1's journal) — a spoke's nodes move onto the update's runtimes before the spoke's core does
 
