@@ -41,9 +41,11 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
 ## How it starts
 
 1. Exits on non-Linux targets; log level from `JSR_LOG_LEVEL` (default `info`).
-2. Reads `hive.yaml`: `hive_id`, `role`, `government.identity_frontdesk` and `identity.*`
+2. Reads `hive.yaml`: `hive_id`, `role`, `government.identity_frontdesk`, `identity.*`
    (`merge_alias_ttl_secs`, `max_ilks`, `max_tenants`, `max_vocabulary`, `max_ilk_aliases`,
-   `sync.port`, `sync.upstream`, `sync.auth`) (`HiveFile`). A `system_nodes` key still there is
+   `sync.port`, `sync.upstream`, `sync.auth`) and `blob.path`, the blob root under which the
+   primary writes the people folder (`configured_blob_root`, `/var/lib/fluxbee/blob` when absent,
+   as the orchestrator and SY.admin read it) (`HiveFile`). A `system_nodes` key still there is
    ignored: the SY nodes come from the release (step 6).
 3. Connects to the router first, so it is registered before SY.vault sends its startup
    announcements (see [SY.vault](sy-vault.md)).
@@ -52,7 +54,7 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    `VAULT_BOOT_WAIT` = 60 s, retrying only when the vault does not answer). The value is a URL
    string or `{"postgres_url": ...}` without a database name; SY.identity creates the database
    `fluxbee_identity` if it is missing (`IDENTITY_DB_NAME`, `ensure_database_exists`) and applies
-   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v7 in
+   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v8 in
    `identity_schema_migrations`). Without the secret, or if the database cannot be set up, it
    starts without a database (`sy.identity started without active DB backend`): reads work from
    memory and writes answer `DB_NOT_READY`.
@@ -131,9 +133,11 @@ Identity is created in two steps:
 - Name `/jsr-identity-<hive_id>` (`identity_shm_name`); each instance writes its own hive's
   region, with an `is_primary` flag in the header (`IdentityRegionWriter::open_or_create`).
 - Writes are seqlock-guarded; the heartbeat is refreshed every 5 s.
-- Contents: tenants, ILKs (with `handler_node`, the node an ILK belongs to, and, since the
-  region's version 7, `works_for` and `work_role`, whom it works for and its role, empty until
-  something sets them), ICHs and their lookup mappings, and unexpired aliases (`sync_identity_shm_mappings`). Marked (deleted)
+- Contents: tenants, ILKs (with `handler_node`, the node an ILK belongs to; since the region's
+  version 7, `works_for` and `work_role`, whom it works for and its role, which only
+  `ILK_SET_WORKS_FOR` sets; and `document_hash`, a person's document's hash prefix, the first 8
+  bytes of its SHA-256, which only `ILK_SET_DOCUMENT` sets, all zeros for none), ICHs and their
+  lookup mappings, and unexpired aliases (`sync_identity_shm_mappings`). Marked (deleted)
   tenants and ILKs are left out. The vocabulary region is part of the layout and always empty:
   nothing fills it.
 - Default limits: 8192 ILKs, 1024 tenants, 4096 vocabulary entries, aliases = the ILK limit
@@ -242,6 +246,9 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 | `ILK_RESTORE` | `SY.admin@` | yes |
 | `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes; never a system ILK) | yes |
 | `ILK_RETIRE_HIVE` | `SY.admin@motherbee` only | yes |
+| `ILK_CREATE_VIRTUAL` | `SY.admin@motherbee` only | yes |
+| `ILK_SET_WORKS_FOR` | `SY.admin@motherbee` only | yes |
+| `ILK_SET_DOCUMENT` | `SY.admin@motherbee` only | yes |
 | `ICH_SET_ENABLED` | `IO.*` (only for an ICH it owns), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, the configured frontdesk | yes |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` | yes |
 | `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` | yes |
@@ -293,8 +300,63 @@ launches as type `agent`, and marks and purges it when the launch fails; on tear
 SY.admin's `teardown_node`, which deletes the node's secrets, then marks and purges the ILK
 (`src/bin/sy_orchestrator.rs`);
 SY.admin sends the operator's and Fluxbee Cloud's tenant and ILK operations
-(`handle_identity_command` in `src/bin/sy_admin.rs`), and `ILK_RETIRE_HIVE` for its
-`retire_hive_ilks` and after each `remove_hive` (`handle_retire_hive_ilks`).
+(`handle_identity_command` in `src/bin/sy_admin.rs`), `ILK_RETIRE_HIVE` for its
+`retire_hive_ilks` and after each `remove_hive` (`handle_retire_hive_ilks`), and the Digital
+Executive's three (below) for its `create_virtual_person`, `set_ilk_works_for` and
+`set_person_document`, which SY.deploy, the operator and Archi call.
+
+## The Digital Executive's identity
+
+A Digital Executive (ED) is a virtual person, and the nodes that make it up name it
+([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1). Each of the three is
+taken from exactly `SY.admin@motherbee`, on the primary; each refusal is `INVALID_REQUEST` or a
+code of its own, with a detail that names what the request takes, never a value it sent
+(FINDINGS A-232). Each write is persisted in one transaction, sent to the replicas as an
+`IlkUpsert` delta and applied to the SHM at once; the same request again changes nothing and
+sends no delta.
+
+- **`ILK_CREATE_VIRTUAL {tenant_id, display_name, company_name?, ilk_id?}`**
+  (`create_virtual_person`): a `human`, `complete` ILK with the `virtual` flag, charged to an
+  active tenant that is not the root one, with its names and no channel; answers `{ilk_id,
+  tenant_id, virtual}`. With `ilk_id` (`ilk:<uuid>`, canonical) it is born with that id, and the
+  call is idempotent: an active virtual person with that id, of the same tenant and with the same
+  names (trimmed, a blank company being none), answers the same; any other holder of the id
+  (another tenant's or other names, a person who is not virtual, a node, a system ILK, a marked
+  ILK, or an id an alias of a merge still names) answers `ILK_ID_TAKEN`.
+- **`ILK_SET_WORKS_FOR {ilk_id, works_for, work_role, change_reason?}`** (`set_ilk_works_for`):
+  whom a node's ILK works for. `works_for` and `work_role` are always named: an `ilk:<uuid>` and
+  `conscious`, `channel` or `agent` set the relation, two nulls clear it, and a request that
+  leaves either out is refused, so nothing clears a relation by omission. The ILK is an active
+  `agent` (a node's; `ILK_NOT_FOUND`, `INVALID_ILK_TYPE`); the person an active `human`, real or
+  virtual, of the ILK's own tenant (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`); a
+  person without a role, a role without a person or an unknown role is `INVALID_REQUEST`.
+  `change_reason` goes to the log (`identity set whom an ILK works for`). Answers `{ilk_id,
+  works_for, work_role}`. A replica's push never changes the relation: the primary's stands
+  (`with_primary_work_relation`).
+- **`ILK_SET_DOCUMENT {ilk_id, document}`** (`prepare_person_document`,
+  `commit_person_document`): a person's document, layer 2 now. The ILK is an active `human`, real
+  or virtual (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`). The document is a JSON object with
+  `"schema": 1`, top-level keys from `schema`, `display_name`, `company_name`, `short_id`,
+  `personality`, `channels`, `position`, `reports_to`, `responsibilities` and `public` only, and at
+  most 64 KiB in its canonical bytes (`check_person_document`): serde_json's compact serialization
+  of the document with every object's keys sorted, at every depth (`canonical_json`). Its
+  `document_hash` is the SHA-256 of those bytes, 64 hex. The record keeps the document and the
+  hash (`identity_ilks.document`, `document_hash`); the SHM entry the hash's first 8 bytes
+  (`apply_document_hash_to_ilk_entry`).
+  - **The file:** the primary writes exactly those bytes to
+    `<blob_root>/people/person-<uuid>_<hash16>.json` (the uuid without `ilk:`, the hash's 16-hex
+    prefix), creating `people/` when it is missing: a temp file in the blob root, synced, mode
+    0644, renamed in whole into the folder (`write_person_document_file`), as SY.architect writes
+    the agent assets. The file is written before the record changes, so the record never names a
+    missing file: one that cannot be written answers `DOCUMENT_WRITE_FAILED` and changes nothing.
+    Each person keeps its newest three files, by modification time, the current one always
+    (`prune_person_documents`); nothing else in the folder is touched. A replica never writes
+    there: the orchestrator's Syncthing folder `fluxbee-dist-people` brings it to the workers.
+  - The same document again (the same hash, whatever its keys' order) is no new version; it
+    writes its file again only when the file is missing. Answers `{ilk_id, document_hash, file}`.
+  - `ILK_GET` returns the document and its hash with the record; an `ILK_LIST` row carries only
+    `document_hash`, and only for a person who has one. A replica's push never changes a document
+    (`with_primary_document`).
 
 ## Delete marks, purge removes
 
@@ -353,7 +415,10 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   `identity_ilk_aliases`, `identity_ichs`, `identity_ilk_tenant_history`,
   `identity_schema_migrations`. Migration v5 drops `identity_vocabulary` and
   `identity_tenants.approved_by`, which nothing used (FINDINGS A-218); v6 adds
-  `identity_ilks.is_virtual`, and v7 `identity_ilks.works_for` and `work_role`.
+  `identity_ilks.is_virtual`, v7 `identity_ilks.works_for` and `work_role`, and v8
+  `identity_ilks.document` (JSONB) and `document_hash`.
+- The people folder (primary): `<blob_root>/people/person-<uuid>_<hash16>.json`, each person's
+  newest three documents (above).
 - A replica has no database: its state is in memory and in its SHM region, rebuilt from the
   primary at every start.
 - `/var/lib/fluxbee/identity/keys/<hive>.key`: sync HMAC keys (0600, directory 0700).

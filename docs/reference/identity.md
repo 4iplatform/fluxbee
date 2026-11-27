@@ -59,6 +59,9 @@ Where identity lives:
 | `definition` | An agent's cognitive definition (§4). `{}` for any other type. |
 | `channels` | Its ICHs (`ChannelRecord`, §2.5). |
 | `deleted_at_ms`, `deleted_reason` | The delete mark (§2.8). The reason is `direct` for a delete, and `retired: node` or `retired: hive` for a retired system ILK (§2.9); the column holds 16 characters. |
+| `virtual` | A virtual person, a Digital Executive (§2.10). On the wire only when true. |
+| `works_for`, `work_role` | Whom a node's ILK works for (a person's `ilk:<uuid>`) and its role to that person: `conscious`, `channel` or `agent` (§2.10). On the wire only when set. |
+| `document`, `document_hash` | A person's document, a JSON object, and the SHA-256 of its canonical bytes, 64 hex (§2.10). On the wire only when set. |
 
 Two identification keys are unique, and the database enforces both
 (`ensure_primary_schema`):
@@ -353,6 +356,79 @@ leaves every lookup and the SHM, its row stays, and its node name stays reserved
   its stale copy in vain (the primary takes no marked system ILK it does not hold), and drops it
   at its next full snapshot.
 
+### 2.10 A Digital Executive's identity
+
+A Digital Executive (ED) is a virtual person; the nodes that make it up name it, and its document
+holds what it is inside Fluxbee ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md)
+§1). Three messages write it, each from exactly `SY.admin@motherbee` (no prefix, no other hive's
+SY.admin, never Archi or SY.deploy directly), on the primary. SY.admin's actions
+`create_virtual_person`, `set_ilk_works_for` and `set_person_document` send them, for SY.deploy, the
+operator and Archi. Each write is persisted in one transaction (`commit_ilk_changes`), sent to the
+replicas as an `IlkUpsert` and applied to the SHM before the answer; the same request again
+changes nothing and sends no delta. A refusal's detail names what the request takes, never a value
+it sent (FINDINGS A-232).
+
+**`ILK_CREATE_VIRTUAL {tenant_id, display_name, company_name?, ilk_id?}`**
+(`create_virtual_person`):
+
+- A `human`, `complete` ILK with the `virtual` flag (`ILK_FLAG_VIRTUAL` in the SHM), charged to an
+  active tenant that is not the root one, born with its names (128 bytes each at most) and no
+  channel. It takes no merge, no channel added and no Cloud account (`ILK_VIRTUAL`).
+- With `ilk_id` (`ilk:<uuid>`, canonical) it is born with that id, and the call is idempotent: an
+  active virtual person with that id, of the same tenant and with the same names (trimmed, a blank
+  company being none) answers the same and changes nothing. Any other holder of the id answers
+  `ILK_ID_TAKEN`: a virtual person of another tenant or with other names, a person who is not
+  virtual, a node, a system ILK, a marked ILK, or an id an alias of a merge still names.
+- Answers `{ilk_id, tenant_id, virtual: true}`.
+
+**`ILK_SET_WORKS_FOR {ilk_id, works_for, work_role, change_reason?}`** (`set_ilk_works_for`):
+
+- Whom a node's ILK works for, and its role. `works_for` and `work_role` are always named: an
+  `ilk:<uuid>` and `conscious`, `channel` or `agent` set it, two nulls clear it. A request that
+  leaves either out is refused (`INVALID_REQUEST`), so nothing clears a relation by omission.
+- The ILK is an active `agent`, a node's (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`). The person is an
+  active `human`, real or virtual (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`), of the ILK's own tenant
+  (`TENANT_MISMATCH`). A person without a role, a role without a person and an unknown role are
+  `INVALID_REQUEST`.
+- `change_reason` goes to the log with the change (`identity set whom an ILK works for`).
+- Answers `{ilk_id, works_for, work_role}`. The SHM entry gets the person's 16 bytes and the role's
+  byte (`apply_work_relation_to_ilk_entry`, §6).
+- A replica's push never changes it: the primary's relation stands, and an ILK the primary does
+  not hold yet comes in with none (`with_primary_work_relation`).
+
+**`ILK_SET_DOCUMENT {ilk_id, document}`** (`prepare_person_document`, `commit_person_document`):
+
+- The ILK is an active `human`, real or virtual (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`).
+- The document (`check_person_document`, each refusal `INVALID_REQUEST`): a JSON object, with
+  `"schema": 1`; top-level keys only from `schema`, `display_name`, `company_name`, `short_id`,
+  `personality`, `channels`, `position`, `reports_to`, `responsibilities` and `public` (layer 2,
+  the profile's room and layer 1's); at most 64 KiB in its canonical bytes.
+- **Its canonical bytes:** serde_json's compact serialization (`to_vec`) of the document with every
+  object's keys sorted by their bytes, at every depth (`canonical_json`, which keeps the order
+  whether or not serde_json's `preserve_order` feature is on). Its `document_hash` is their
+  SHA-256, 64 lowercase hex; the same document with its keys in another order is the same version.
+- **The record** keeps the document and the hash (`identity_ilks.document` JSONB, `document_hash`
+  TEXT); **the SHM entry** the hash's first 8 bytes, all zeros for none
+  (`apply_document_hash_to_ilk_entry`). After a restart the document comes back from Postgres's
+  JSONB, which keeps its values but not their spelling: the hash stays the record's, never
+  computed again from what the database returns.
+- **The file:** `<blob_root>/people/person-<uuid>_<hash16>.json` (the uuid without `ilk:`, the
+  hash's 16-hex prefix), exactly the canonical bytes. The blob root is `hive.yaml`'s `blob.path`,
+  `/var/lib/fluxbee/blob` when absent (`configured_blob_root`, as the orchestrator and SY.admin read
+  it). The primary writes it before the record changes, as a temp file in the blob root, synced,
+  mode 0644, renamed in whole into `people/`, which it creates when missing
+  (`write_person_document_file`): the record never names a missing file, and a file that cannot be
+  written answers `DOCUMENT_WRITE_FAILED` and changes nothing. Each person keeps its newest three
+  files, by modification time, the current one always (`prune_person_documents`); nothing else in
+  the folder is touched. Replicas never write files: the orchestrator's Syncthing folder
+  `fluxbee-dist-people` carries the folder to the workers, and on another hive the SHM may name a
+  file that has not arrived yet (A-338).
+- The same document again is no new version; its file is written again only when it is missing.
+- Answers `{ilk_id, document_hash, file}`. `ILK_GET` returns the document and its hash with the
+  record; an `ILK_LIST` row carries `document_hash` only, for a person who has one.
+- A replica's push never changes it (`with_primary_document`): replicas push their nodes' ILKs,
+  which have no document, so this is a net.
+
 ---
 
 ## 3. Tenant
@@ -552,7 +628,9 @@ workers, so an agent with a definition runs on a worker too.
     which nothing wrote (FINDINGS A-218). The identity SHM keeps its vocabulary region, empty (§6);
   - v6: `identity_ilks.is_virtual`, the virtual person (a Digital Executive), false for every row;
   - v7: `identity_ilks.works_for` and `work_role`, whom an ILK works for and its role, NULL for
-    every row.
+    every row;
+  - v8: `identity_ilks.document` (JSONB) and `document_hash` (TEXT), a person's document and its
+    hash (§2.10), NULL for every row.
 - `identity_ichs.tenant_id` stores the channel's scope; `UNIQUE(channel_type, address,
   tenant_id)` makes the key unique.
 - **At boot** the primary loads the whole store from the database
@@ -570,7 +648,8 @@ workers, so an agent with a definition runs on a worker too.
 `action_requires_primary` lists every write:
 
 - the ILK writes: `ILK_PROVISION`, `ILK_REGISTER`, `ILK_SET_TENANT`, `ILK_ADD_CHANNEL`,
-  `ILK_UPDATE`, `ILK_SET_DEFINITION`;
+  `ILK_UPDATE`, `ILK_SET_DEFINITION`, and the Digital Executive's `ILK_CREATE_VIRTUAL`,
+  `ILK_SET_WORKS_FOR` and `ILK_SET_DOCUMENT` (§2.10);
 - the channel switch `ICH_SET_ENABLED`;
 - the tenant writes: `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`;
 - the lifecycle: delete, restore and purge, of ILKs and of tenants, and a removed hive's
@@ -689,10 +768,9 @@ converges to the union of the mesh.
   - tenants not marked, with their real status;
   - ILKs not marked, with tenant, type, status, display name, `handler_node`, definition
     hashes, the virtual flag, and whom the ILK works for and its role (`works_for`,
-    `work_role`, empty for an ILK that works for nobody; nothing sets them yet,
-    [digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1), and a person's
-    document's hash prefix (`document_hash`, 8 bytes, all zeros for none: SY.identity projects
-    zeros until release 2C writes it, §1.2);
+    `work_role`, empty for an ILK that works for nobody; `ILK_SET_WORKS_FOR` sets them, §2.10),
+    and a person's document's hash prefix (`document_hash`, the first 8 bytes of its SHA-256, all
+    zeros for none; `ILK_SET_DOCUMENT` sets it, §2.10);
   - channels with their scope, and the `(type, address, scope)` mappings;
   - aliases;
   - the vocabulary region, which nothing fills: it is always empty, and the layout keeps it.
@@ -752,6 +830,7 @@ All are system messages to `SY.identity@<hive>`. SY.identity checks the router-s
 | `ILK_RESTORE` | `SY.admin@` (same hive) |
 | `ILK_PURGE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes, never a system ILK) |
 | `ILK_RETIRE_HIVE` | `SY.admin@motherbee` only |
+| `ILK_CREATE_VIRTUAL`, `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` | `SY.admin@motherbee` only (§2.10) |
 | `ICH_SET_ENABLED` | `IO.*` (its own channel only), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@` (same hive), the configured frontdesk |
 | `ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET` | `SY.admin@` (same hive) |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` (same hive) |
@@ -850,6 +929,11 @@ SY.admin re-checks every relayed request (`enforce_cloud_relay_content`, `stamp_
 | `TENANT_ROOT_PROTECTED`, `TENANT_ROOT_NOT_REGISTRABLE` | The root tenant is not editable, and takes no person. |
 | `SYSTEM_ILK_PROTECTED` | A system ILK: never deleted or restored, and purged only once retired, by SY.admin (§2.9). |
 | `HIVE_NOT_REMOVED` | `ILK_RETIRE_HIVE` of the primary's own hive; from SY.admin's `retire_hive_ilks`, the motherbee or a hive the registry still lists (§2.9). |
+| `INVALID_ILK_TYPE` | The ILK is not of the type the message writes: a definition or a relation on an ILK that is not a node's, a document on one that is not a person's, or a relation that names no person (§4, §2.10). |
+| `ILK_ID_TAKEN` | `ILK_CREATE_VIRTUAL` with an `ilk_id` another ILK holds or an alias names, or a virtual person's of another tenant or with other names (§2.10). |
+| `PERSON_NOT_FOUND`, `TENANT_MISMATCH` | `ILK_SET_WORKS_FOR` naming no active person, or one of another tenant than the ILK's (§2.10). |
+| `DOCUMENT_WRITE_FAILED` | `ILK_SET_DOCUMENT` could not write the file to the people folder; nothing changed (§2.10). |
+| `ILK_VIRTUAL` | A virtual person refuses the action: a merge, a channel added, a Cloud account; the detail names the action. |
 | `DUPLICATE_EMAIL` | The vouched email (`identification.email`) is taken in that tenant and no merge applies. A `claimed_email` never answers it. |
 | `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ICH_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). `ICH_CONFLICT`: another ILK holds the channel. |
 | `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS` | A tenant lifecycle guard (§3.6). |
