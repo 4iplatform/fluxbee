@@ -315,11 +315,11 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   does, in the same order and with the same answers for each step: the stop (a node already down
   included), `relaunch_on_boot` cleared, the timer purge, the instance directory, its uuid file
   and its identity-map entry. Then, in place of the purge's `teardown_node`, it sends one
-  `ILK_DELETE {ilk_id}` to `SY.identity@motherbee` (`retire_mark_request`, the system forward's
-  45 s), which marks the ILK: hidden, reversible, its keys and the node's name held, never purged.
-  SY.identity takes ILK_DELETE from an orchestrator for its own hive's nodes, and marks it with its
-  own reason (`direct`): ILK_DELETE takes no reason. SY.vault is not asked, so the secrets dedicated
-  to the ILK stay. The answer carries `retire_instance: true`, the purge's file fields,
+  `ILK_DELETE {ilk_id, reason: "node_retired"}` to `SY.identity@motherbee` (`retire_mark_request`,
+  the system forward's 45 s), which marks the ILK with that reason: hidden, reversible, its keys and
+  the node's name held, never purged. SY.identity takes ILK_DELETE from an orchestrator for its own
+  hive's nodes, and the reason `node_retired` from `SY.orchestrator@<hive>` alone (a mark without
+  a reason is `direct`). SY.vault is not asked, so the secrets dedicated to the ILK stay. The answer carries `retire_instance: true`, the purge's file fields,
   `ilk_retired` (`true`, `false`, or `null` when the outcome is unknown), `ilk_retire` (`{status
   ok|error|unknown|skipped, target, ilk_id}`, with `already_deleted`, `not_found`, or
   `error_code` and `error_detail`), `ilk_retire_error` when that step is not `ok`,

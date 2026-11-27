@@ -32430,17 +32430,21 @@ async fn append_removed_node_identity(
     }
 }
 
+/// The reason a retire's mark records on the node's ILK (docs/digital-executive-v1-stage-2.md §9).
+const RETIRE_MARK_REASON: &str = "node_retired";
+
 /// docs/digital-executive-v1-stage-2.md §9: a retire's request to identity, in place of a purge's
-/// `teardown_node`: one `ILK_DELETE {ilk_id}` to the primary's SY.identity, which marks the ILK
-/// (reversible: hidden, its keys and the node's name held until a purge) and purges nothing.
-/// SY.identity takes ILK_DELETE from an orchestrator for its own hive's nodes, and marks with its
-/// own reason: the request names none, since ILK_DELETE takes `ilk_id`, `tenant_id` and
-/// `ilk_type` only. SY.vault is not asked: the secrets dedicated to the ILK stay with it.
+/// `teardown_node`: one `ILK_DELETE {ilk_id, reason: "node_retired"}` to the primary's SY.identity,
+/// which marks the ILK with that reason (reversible: hidden, its keys and the node's name held
+/// until a purge) and purges nothing. SY.identity takes ILK_DELETE from an orchestrator for its
+/// own hive's nodes, and takes the reason `node_retired` from `SY.orchestrator@<hive>` alone (a
+/// mark without a reason is `direct`). SY.vault is not asked: the secrets dedicated to the ILK stay
+/// with it.
 fn retire_mark_request(ilk_id: &str) -> (String, &'static str, serde_json::Value) {
     (
         ensure_l2_name("SY.identity", PRIMARY_HIVE_ID),
         MSG_ILK_DELETE,
-        serde_json::json!({ "ilk_id": ilk_id }),
+        serde_json::json!({ "ilk_id": ilk_id, "reason": RETIRE_MARK_REASON }),
     )
 }
 
@@ -64029,15 +64033,19 @@ blob:
         assert!(dispatch.contains("append_optional_teardown_cleanup("));
     }
 
-    /// What identity receives for a retire: one ILK_DELETE {ilk_id} to the primary's SY.identity,
-    /// which marks the ILK; never ILK_PURGE, never SY.admin's teardown_node, never SY.vault.
+    /// What identity receives for a retire: one ILK_DELETE {ilk_id, reason: "node_retired"} to the
+    /// primary's SY.identity, which marks the ILK with that reason; never ILK_PURGE, never
+    /// SY.admin's teardown_node, never SY.vault.
     #[test]
     fn a_retire_sends_identity_one_ilk_delete() {
         let ilk = "ilk:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let (target, msg, payload) = retire_mark_request(ilk);
         assert_eq!(target, "SY.identity@motherbee");
         assert_eq!(msg, "ILK_DELETE");
-        assert_eq!(payload, serde_json::json!({ "ilk_id": ilk }));
+        assert_eq!(
+            payload,
+            serde_json::json!({ "ilk_id": ilk, "reason": "node_retired" })
+        );
         let src = include_str!("sy_orchestrator.rs");
         let start = src
             .find("#[cfg(not(test))]\nasync fn retire_mark_node_ilk(")
