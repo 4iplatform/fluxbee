@@ -21,6 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
+| **0.1.155** | 2026-11-26 | `4cb16973` | motherbee + spokes (core), two binaries, one branch each: the Digital Executive's stage 1 cleanup, release one (the operator, 2026-11-26: the security path went ahead of the flow and bent the next stage's design). SY.identity: a virtual person takes channels as any person does, and an IO's provision of its address resolves to it (merges, in or out, still refused); io.api: `by_ilk` names a virtual person again | ✅ live, gate0255 16 PASS, no FAIL | snapshot `pre-edclean-0-1-155` · `apt install fluxbee=0.1.154` (nothing one-way) |
 | **0.1.154** | 2026-11-25 | `ba6d0d9a` | motherbee + spokes (core), the router alone, the Digital Executive's stage 1, release B ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §3): the router binds a person's `src_ilk` to its sender (IO, WF, SY; a virtual person's to SY) on its three paths, in REPORT mode (a would-be refusal only logs `src_ilk_bind would_refuse`, throttled); a background watcher publishes the view of the hive's persons and aliases, the message path never reads the region | ✅ live, gate0254 17 PASS, no FAIL | snapshot `pre-router-ed1-0-1-154` · `apt install fluxbee=0.1.153` |
 | **0.1.153** | 2026-11-25 | `93a4024a` | motherbee + spokes (core), the Digital Executive's stage 1, release A ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md)): the identity SHM's virtual-person bit (`ILK_FLAG_VIRTUAL`, its three copies), SY.identity's virtual person (migration v6, `ILK_CREATE_VIRTUAL` from SY.admin@motherbee only, the `ILK_VIRTUAL` refusals of merges, re-registration, channels and provisions), SY.admin's `create_virtual_person` and Cloud's person actions refused on an ED, io.api's `by_ilk` refusing one, Archi's SCMD route | ✅ live, gate0253 31/31 PASS (one tool FAIL re-run PASS) | snapshot `pre-ed1-0-1-153` · `apt install fluxbee=0.1.152` (migration v6 only adds a column) |
 | **0.1.152** | 2026-11-20 | `9dfe1a4d` | motherbee + spokes (core), two binaries, one branch each: Archi (SY.architect) takes an identity's whole lifecycle in SCMD on SY.admin's own routes (purges included, run directly as every SCMD; each mutation tracked, apart from what Archi's AI may write; the dead staged-action path removed), A-348 (SCMD config `?replace` and the binding fields), A-307's Archi part (`BUSY`), A-327 (the explanation turn reads the prompt cache); SY.admin A-358 (a `hive` upstream at an address io.web refuses is refused at publish, `HIVE_ADDRESS_REFUSED`) and A-337 (the plan review sees no secret; a plan holding the mask refused), the purge help as the code has it | ✅ live, checked on 8.x | snap `pre-archi-0-1-152` (all 4 VMs) · `apt install fluxbee=0.1.151` + 0.1.151's `update_installation` (nothing one-way) |
@@ -163,6 +164,53 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.155 — the Digital Executive's stage 1 cleanup, release one: SY.identity and io.api
+
+- **Date:** 2026-11-26 (ART) · **Previous version:** 0.1.154 · **Commit:** `4cb16973`.
+- **Scope:** motherbee and the three spokes, through the installation's update. Two binaries, one
+  branch each (METHOD §9).
+- **Why:** the operator, 2026-11-26: stage 1's security path (the router's binding of `src_ilk`,
+  and the refusals that decided which address and which node is an ED's) went ahead of the flow it
+  was to protect, and bent stage 2's design into a "hand" kept as a channel. It comes out of the
+  code before anything else; which node is an ED's, and what identity keeps of it, is talked once
+  the new path is built ([stage 1](../docs/digital-executive-v1-stage-1.md), its status;
+  [design](../docs/digital-executive-v1-design.md) §7.2 and open question 16).
+- **What changed:**
+  - **SY.identity (`coa/ed-cleanup-identity`):** `ILK_ADD_CHANNEL` and `ILK_UPDATE` add a channel to
+    a virtual person as to any person, and `ILK_PROVISION` of an address a virtual person holds
+    resolves to it. With them goes the refusal of a `cloud` channel on one. What stays: the flag,
+    `ILK_CREATE_VIRTUAL`, every merge's refusal, in or out, and re-registration's.
+  - **io.api (`coa/ed-cleanup-ioapi`):** `by_ilk` names a virtual person again, as any person its
+    tenant knows (reverts `147b25f4` and `6adb20e8`); its spec as before.
+  - **Docs:** stage 1's withdrawn parts marked; the design's `src_ilk` rule withdrawn.
+- **Review:** removals only; the tests that pinned the refusals were rewritten to pin the person's
+  behaviour and the merge refusals. Clippy denying warnings on the Mac for SY.identity.
+- **Build:** CI green on each branch and on the integrated head `4cb16973`. Build on fb-build
+  01:49:27–02:01:21Z (11.9 min), publish before the mark.
+- **The deploy:** the mark at 02:01:57Z; `ops deploy 0.1.155 --snapshot pre-edclean-0-1-155 --drop
+  pre-router-ed1-0-1-154` in 278 s:
+  - **Phases:** snapshots 32.7 s, the motherbee's apt 145.5 s, its admin on the version 40.0 s, the
+    spokes answering 15.1 s, the update's call 22.4 s, the hives on the target 6.8 s, health 7.1 s.
+  - **On the target after the update's call:** the motherbee 5.2 s, egress1 and ingress1 22.5 s,
+    worker1 28.0 s.
+  - **Health:** clean.
+- **Checked on 8.x (the gate, gate0255, 02:05–02:08Z; `scratchpad/gate-tools/r155_gate.py` and
+  `r155_probe.py`, git-ignored; 16 PASS, no FAIL, no model call):**
+  - **The smoke:** a new node RUNNING in 8.1 s on 0.1.155, stopped; a stopped one reads STOPPED.
+  - **A virtual person** created over the operator's HTTP, read back virtual with no channel.
+  - **The probe on the motherbee's router socket,** under a throwaway `IO.*` name, to SY.identity:
+    - a stranger provisioned (0.12 s);
+    - a channel added to the virtual person: ok (0.09 s; `ILK_VIRTUAL` in 0.1.154);
+    - its address provisioned: resolves to the virtual person (0.006 s; `ILK_VIRTUAL` before);
+    - the stranger merged into it: `ILK_VIRTUAL`, "merge" (kept).
+  - **Read back:** the virtual person's record holds the channel; the stranger stays temporary.
+  - **Cloud's door:** `delete_ilk`, `restore_ilk` and `set_ilk_tenant` on it answer `ILK_VIRTUAL`
+    (kept).
+  - **Cleaned:** the virtual person, the stranger, the smoke node.
+- **Next:** 0.1.156, the router's binding out, alone.
+- **Rollback:** snapshot `pre-edclean-0-1-155`, or `apt install fluxbee=0.1.154` and 0.1.154's
+  `update_installation`: nothing one-way.
 
 ## 0.1.154 — the router binds a person's src_ilk, in report mode (the Digital Executive's stage 1, release B)
 
