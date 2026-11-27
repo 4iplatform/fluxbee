@@ -348,6 +348,8 @@ fn slack_inbound_config(config: &Config, self_tenant_id: Option<String>) -> Inbo
         dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
         dedup_max_entries: config.dedup_max_entries,
         dst_node: None,
+        person_ilk: None,
+        self_ilk_id: None,
         provision_on_miss: true,
         blob_runtime: Some(config.blob_runtime.clone()),
         self_tenant_id,

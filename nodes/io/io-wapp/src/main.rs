@@ -539,6 +539,8 @@ async fn main() -> Result<()> {
             dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
             dedup_max_entries: config.dedup_max_entries,
             dst_node: None,
+            person_ilk: None,
+            self_ilk_id: None,
             provision_on_miss: true,
             blob_runtime: None,
             self_tenant_id: self_tenant_id.clone(),

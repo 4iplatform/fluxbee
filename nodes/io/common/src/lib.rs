@@ -18,6 +18,7 @@ pub mod io_linkedhelper_adapter_config;
 pub mod io_slack_adapter_config;
 pub mod io_wapp_adapter_config;
 pub mod io_web_adapter_config;
+pub mod person_assignment;
 pub mod provision;
 pub mod relay;
 pub mod reliability;

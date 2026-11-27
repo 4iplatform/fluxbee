@@ -163,6 +163,17 @@ When an IO node provisions a new ILK (lookup miss → `ILK_PROVISION`), it can d
 
 The decision is **constructive of the IO node itself**: only the IO runtime knows the nature of its counterpart (by config, subdomain, header, token type, etc.). When in doubt, omit the field and let the server default to human; switch to `"agent"` only when the IO has a deterministic signal that the other side is a bot. The provisional ILK's type is overwritten when `register_ilk` later promotes it to `complete`, so a wrong default is recoverable but produces incorrect short-lived behavior in policy/routing decisions taken during the provisional window.
 
+### The person an IO carries (`io.person_ilk`)
+
+`io.person_ilk`, an `ilk:<uuid>` next to `io.dst_node`, assigns the person an IO carries: a
+Digital Executive's channel, for one. Identity must confirm it: the IO's own ILK works for that
+person in the role `channel`, and the person is of the IO's tenant. While confirmed, each inbound
+message names the person as `dst_ilk`; while not, none, a WARN at most once a minute and the status
+(`extensions.person_ilk`) say why. The message goes to `io.dst_node` either way, and without the key
+nothing changes. The node hands the key to io-common's `InboundProcessor` as it hands on
+`io.dst_node` (`InboundConfig::person_ilk`, `set_person_ilk`); io.wapp does from the Digital
+Executive's release 2D, the other IOs when one needs it. See `docs/io/io-common.md` §3.4.
+
 ## io-sim quick test
 
 `io-sim` lets you validate `IO -> Router -> AI -> IO` without Slack integration.

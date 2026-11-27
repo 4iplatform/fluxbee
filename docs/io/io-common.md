@@ -287,6 +287,37 @@ Rules:
 - `reply_target` must not carry secrets or signed headers;
 - the real outbound sending node resolves that data at delivery time.
 
+### 3.4 The person an IO carries (`io.person_ilk`)
+
+An IO may carry one person's channel: a Digital Executive's, for one
+([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §7). Its config assigns the
+person, and identity confirms it; neither alone suffices.
+
+- **The key:** `io.person_ilk`, an `ilk:<uuid>`, next to `io.dst_node`. Like `io.dst_node`, each IO
+  node reads it from its effective config (`extract_runtime_person_ilk`,
+  `nodes/io/common/src/person_assignment.rs`) and hands it to its `InboundProcessor`:
+  `InboundConfig::person_ilk` at boot, `InboundProcessor::set_person_ilk` on a config change. The
+  IO's own ILK goes in `InboundConfig::self_ilk_id` (`FLUXBEE_NODE_ILK_ID`), beside
+  `self_tenant_id` (`FLUXBEE_NODE_TENANT_ID`).
+- **Confirmed** (`confirm_person_assignment`) while the IO's own ILK's entry in the identity SHM
+  works for that person (`works_for`) in the role `channel` (`work_role`), and the person's entry
+  is of the IO's own tenant. Both entries are read through `IdentityResolver::ilk_entry`
+  (`ShmIdentityResolver` reads the hive's region, never cached).
+- **When:** the first message after the person is set checks it, and then at most every 10 s
+  (`PERSON_RECHECK_INTERVAL`) as messages come in; `InboundProcessor::refresh_person_ilk` checks at
+  once (at boot, after a config change).
+- **While confirmed,** each inbound message names the person as `dst_ilk` (`meta.dst_ilk`, and
+  `meta.context.dst_ilk`).
+- **While not,** no `dst_ilk`; a WARN names the IO, the person and why, at most once a minute; and
+  the status says why: `InboundProcessor::person_ilk_status`, which
+  `PersonAssignmentStatus::add_to_status` puts in a status answer as `extensions.person_ilk`
+  (`{ilk, confirmed, reason}`). It never changes the node's health.
+- **Either way** the message goes where it went: `io.dst_node`, or the router's resolve.
+- **With no `io.person_ilk`** nothing is read and nothing changes.
+- **Which IOs read it:** io.wapp from the Digital Executive's release 2D; the others when one
+  needs it (io.slack waits for its revamp). Until a node reads the key, a config that carries it
+  changes nothing.
+
 ---
 
 ## Out of scope for io-common

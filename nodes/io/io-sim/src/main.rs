@@ -72,6 +72,8 @@ async fn main() -> Result<()> {
             dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
             dedup_max_entries: config.dedup_max_entries,
             dst_node: config.dst_node.clone(),
+            person_ilk: None,
+            self_ilk_id: None,
             provision_on_miss: true,
             blob_runtime: Some(io_common::text_v1_blob::IoBlobRuntimeConfig::default()),
             self_tenant_id: None,

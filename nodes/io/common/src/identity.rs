@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use fluxbee_sdk::identity::IdentityIlkOption;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
@@ -47,6 +48,13 @@ pub trait IdentityResolver: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn lookup(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError>;
     fn remember(&self, _input: &ResolveOrCreateInput, _src_ilk: &str) {}
+    /// One active ILK's entry in the identity SHM, by its id (`ilk:<uuid>`): `Ok(None)` when the
+    /// region does not hold it. The check of the person an IO carries reads the IO's own entry
+    /// and the person's (`crate::person_assignment`). A resolver that reads no region answers
+    /// `Unavailable`.
+    fn ilk_entry(&self, _ilk_id: &str) -> Result<Option<IdentityIlkOption>, IdentityError> {
+        Err(IdentityError::Unavailable)
+    }
 }
 
 #[async_trait]
@@ -247,6 +255,28 @@ impl IdentityResolver for ShmIdentityResolver {
             &input.external_id,
             src_ilk,
         );
+    }
+
+    /// The entry as the hive's region holds it now, never cached: whom an ILK works for may change
+    /// at any write.
+    fn ilk_entry(&self, ilk_id: &str) -> Result<Option<IdentityIlkOption>, IdentityError> {
+        if self.hive_id.is_empty() {
+            return Err(IdentityError::Other(
+                "no hive to read the identity SHM of".to_string(),
+            ));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = ilk_id;
+            return Err(IdentityError::Unavailable);
+        }
+
+        #[cfg(unix)]
+        {
+            fluxbee_sdk::identity::find_ilk_by_id_from_hive_id(&self.hive_id, ilk_id)
+                .map_err(|err| IdentityError::Other(err.to_string()))
+        }
     }
 }
 

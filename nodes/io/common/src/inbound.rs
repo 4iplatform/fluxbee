@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::identity::{IdentityProvisioner, IdentityResolver, ResolveOrCreateInput};
 use crate::io_context::{wrap_in_meta_context, IoContext};
+use crate::person_assignment::{IoSelf, PersonAssignment, PersonAssignmentStatus};
 use crate::relay::AssembledTurn;
 use crate::reliability::{dedup_key_from_io_context, DedupCache};
 use crate::router_message::{build_user_message, new_trace_id};
@@ -18,6 +19,15 @@ pub struct InboundConfig {
     pub dedup_ttl: Duration,
     pub dedup_max_entries: usize,
     pub dst_node: Option<String>,
+    /// The person this IO carries, its config's `io.person_ilk` (`ilk:<uuid>`, next to
+    /// `io.dst_node`; `crate::person_assignment::extract_runtime_person_ilk`): a Digital
+    /// Executive's channel, for one (docs/digital-executive-v1-stage-2.md §7). While identity
+    /// confirms it (`crate::person_assignment`), each inbound message names it as `dst_ilk`; it
+    /// never changes where the message goes. None, or blank, reads nothing and changes nothing.
+    pub person_ilk: Option<String>,
+    /// The ILK this node runs as (`FLUXBEE_NODE_ILK_ID`, `fluxbee_sdk::read_self_ilk_from_env`):
+    /// the entry identity's confirmation of `person_ilk` is read from. Read for nothing else.
+    pub self_ilk_id: Option<String>,
     pub provision_on_miss: bool,
     pub blob_runtime: Option<IoBlobRuntimeConfig>,
     /// The tenant this node runs as. Every external user it lets in belongs to it.
@@ -42,6 +52,8 @@ impl Default for InboundConfig {
             dedup_ttl: Duration::from_millis(10 * 60 * 1000),
             dedup_max_entries: 50_000,
             dst_node: None,
+            person_ilk: None,
+            self_ilk_id: None,
             provision_on_miss: true,
             self_tenant_id: None,
             blob_runtime: Some(IoBlobRuntimeConfig::default()),
@@ -68,6 +80,9 @@ pub struct InboundProcessor {
     dst_node: Option<String>,
     provision_on_miss: bool,
     self_tenant_id: Option<String>,
+    self_ilk_id: Option<String>,
+    /// The person the config assigns this IO, and identity's last word on it.
+    person: PersonAssignment,
     dedup: DedupCache,
     stats: InboundStats,
 }
@@ -91,6 +106,8 @@ impl InboundProcessor {
             dst_node,
             provision_on_miss: config.provision_on_miss,
             self_tenant_id: config.self_tenant_id,
+            self_ilk_id: config.self_ilk_id,
+            person: PersonAssignment::new(config.person_ilk.as_deref()),
             dedup,
             stats: InboundStats::default(),
         }
@@ -102,6 +119,46 @@ impl InboundProcessor {
 
     pub fn set_dst_node(&mut self, dst_node: Option<String>) {
         self.dst_node = dst_node;
+    }
+
+    /// Assigns the person this IO carries, from a new config's `io.person_ilk` (None for none), as
+    /// `set_dst_node` takes its `io.dst_node`. Another person than the one held is checked against
+    /// identity afresh, at the next message or `refresh_person_ilk`.
+    pub fn set_person_ilk(&mut self, person_ilk: Option<String>) {
+        self.person.set(person_ilk.as_deref());
+    }
+
+    /// Checks the person this IO carries against identity now, as at boot or after a config
+    /// change, rather than at the next message; nothing with no person. The status after it.
+    pub fn refresh_person_ilk(
+        &mut self,
+        identity: &dyn IdentityResolver,
+    ) -> Option<PersonAssignmentStatus> {
+        let io = IoSelf {
+            node_uuid: &self.node_uuid,
+            ilk: self.self_ilk_id.as_deref(),
+            tenant: self.self_tenant_id.as_deref(),
+        };
+        self.person.check(&io, identity, Instant::now());
+        self.person.status()
+    }
+
+    /// What the IO's status says of the person its config assigns
+    /// (`PersonAssignmentStatus::add_to_status`): None with no person.
+    pub fn person_ilk_status(&self) -> Option<PersonAssignmentStatus> {
+        self.person.status()
+    }
+
+    /// The person an inbound message names as its `dst_ilk` at `now`: the one the config assigns,
+    /// while identity confirms it, checked again once the last check is
+    /// `PERSON_RECHECK_INTERVAL` old. None otherwise.
+    fn person_to_stamp(&mut self, identity: &dyn IdentityResolver, now: Instant) -> Option<String> {
+        let io = IoSelf {
+            node_uuid: &self.node_uuid,
+            ilk: self.self_ilk_id.as_deref(),
+            tenant: self.self_tenant_id.as_deref(),
+        };
+        self.person.person_at(&io, identity, now)
     }
 
     pub async fn process_inbound(
@@ -269,13 +326,17 @@ impl InboundProcessor {
             }
         }
 
+        // The person this IO carries, while identity confirms it (docs/digital-executive-v1-stage-2.md
+        // §7): its `dst_ilk`. Where the message goes stays `io.dst_node`.
+        let dst_ilk = self.person_to_stamp(identity, Instant::now());
+
         InboundOutcome::SendNow(build_user_message(
             &self.node_uuid,
             dst_node_override.or_else(|| self.dst_node.clone()),
             self.ttl,
             trace_id,
             src_ilk,
-            None,
+            dst_ilk,
             meta_context,
             payload,
         ))
@@ -769,5 +830,184 @@ mod tests {
             capture.0.lock().unwrap().clone(),
             Some(Some("tnt:9999".to_string()))
         );
+    }
+
+    // docs/digital-executive-v1-stage-2.md §7: the person an IO carries.
+
+    use crate::person_assignment::tests::{ilk, Region, ED, IO_ILK, OTHER_TENANT, TENANT};
+    use fluxbee_sdk::protocol::Destination;
+
+    const CONSCIOUS: &str = "AI.laura@worker1";
+
+    fn person_config(person_ilk: Option<&str>) -> InboundConfig {
+        InboundConfig {
+            dst_node: Some(CONSCIOUS.to_string()),
+            person_ilk: person_ilk.map(str::to_string),
+            self_ilk_id: Some(IO_ILK.to_string()),
+            self_tenant_id: Some(TENANT.to_string()),
+            ..InboundConfig::default()
+        }
+    }
+
+    fn wapp_input() -> ResolveOrCreateInput {
+        ResolveOrCreateInput {
+            channel: "whatsapp".to_string(),
+            external_id: "5491100000000".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
+        }
+    }
+
+    async fn inbound_message(
+        processor: &mut InboundProcessor,
+        identity: &dyn IdentityResolver,
+        event: &str,
+    ) -> Message {
+        let io = slack_inbound_io_context("T", "U", "C", None, event);
+        let outcome = processor
+            .process_inbound(
+                identity,
+                None,
+                wapp_input(),
+                None,
+                io,
+                serde_json::json!({"type": "text", "content": "hola"}),
+            )
+            .await;
+        let InboundOutcome::SendNow(msg) = outcome else {
+            panic!("unexpected outcome: {outcome:?}");
+        };
+        msg
+    }
+
+    fn goes_to_the_conscious(msg: &Message) {
+        assert!(matches!(
+            msg.routing.dst,
+            Destination::Unicast(ref dst) if dst == CONSCIOUS
+        ));
+        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:writer"));
+    }
+
+    /// While identity confirms the person the config assigns, each inbound message names it as
+    /// its `dst_ilk`, and still goes to `io.dst_node`.
+    #[tokio::test]
+    async fn a_confirmed_person_is_each_inbound_messages_dst_ilk() {
+        let region = Region::confirming();
+        let mut p = InboundProcessor::new("uuid-io", person_config(Some(ED)));
+
+        let msg = inbound_message(&mut p, &region, "Ev1").await;
+        goes_to_the_conscious(&msg);
+        assert_eq!(msg.meta.dst_ilk.as_deref(), Some(ED));
+        assert_eq!(
+            msg.meta.context.as_ref().unwrap()["dst_ilk"],
+            serde_json::json!(ED)
+        );
+        assert_eq!(
+            p.person_ilk_status(),
+            Some(PersonAssignmentStatus {
+                ilk: ED.to_string(),
+                confirmed: true,
+                reason: None
+            })
+        );
+
+        // The next message within the interval reads no entry again.
+        let reads = region.reads();
+        let msg = inbound_message(&mut p, &region, "Ev2").await;
+        assert_eq!(msg.meta.dst_ilk.as_deref(), Some(ED));
+        assert_eq!(region.reads(), reads);
+    }
+
+    /// While identity does not confirm it, nothing is stamped, the status says why, and the
+    /// message still goes to `io.dst_node`: a config written by hand, a relation of another role,
+    /// a person of another tenant, an IO whose own ILK is unknown.
+    #[tokio::test]
+    async fn a_person_identity_does_not_confirm_is_never_stamped() {
+        let cases: [(&str, Box<dyn Fn(&Region)>, InboundConfig); 4] = [
+            (
+                "names no person",
+                Box::new(|region| region.put(ilk(IO_ILK, TENANT, None, None))),
+                person_config(Some(ED)),
+            ),
+            (
+                "the role conscious",
+                Box::new(|region| region.put(ilk(IO_ILK, TENANT, Some(ED), Some("conscious")))),
+                person_config(Some(ED)),
+            ),
+            (
+                "not of this IO's tenant",
+                Box::new(|region| region.put(ilk(ED, OTHER_TENANT, None, None))),
+                person_config(Some(ED)),
+            ),
+            (
+                "no ILK of its own",
+                Box::new(|_| {}),
+                InboundConfig {
+                    self_ilk_id: None,
+                    ..person_config(Some(ED))
+                },
+            ),
+        ];
+        for (why, change, config) in cases {
+            let region = Region::confirming();
+            change(&region);
+            let mut p = InboundProcessor::new("uuid-io", config);
+            let msg = inbound_message(&mut p, &region, "Ev1").await;
+            goes_to_the_conscious(&msg);
+            assert_eq!(msg.meta.dst_ilk, None, "{why}");
+            assert_eq!(
+                msg.meta.context.as_ref().unwrap()["dst_ilk"],
+                serde_json::Value::Null
+            );
+            let status = p.person_ilk_status().expect("a status");
+            assert_eq!(status.ilk, ED);
+            assert!(!status.confirmed);
+            assert!(
+                status.reason.as_deref().unwrap().contains(why),
+                "{status:?}"
+            );
+        }
+    }
+
+    /// With no person in the config nothing is read, nothing is stamped and the status says
+    /// nothing, as before.
+    #[tokio::test]
+    async fn no_person_in_the_config_changes_nothing() {
+        let region = Region::confirming();
+        for person in [None, Some("  ")] {
+            let mut p = InboundProcessor::new("uuid-io", person_config(person));
+            let msg = inbound_message(&mut p, &region, "Ev1").await;
+            goes_to_the_conscious(&msg);
+            assert_eq!(msg.meta.dst_ilk, None);
+            assert_eq!(p.person_ilk_status(), None);
+            assert_eq!(p.refresh_person_ilk(&region), None);
+        }
+        assert_eq!(region.reads(), 0);
+    }
+
+    /// A config change assigns a person, or takes it away, at once; `refresh_person_ilk` checks
+    /// it without waiting for a message.
+    #[tokio::test]
+    async fn a_config_change_assigns_the_person_and_the_check_runs_afresh() {
+        let region = Region::confirming();
+        let mut p = InboundProcessor::new("uuid-io", person_config(None));
+        let msg = inbound_message(&mut p, &region, "Ev1").await;
+        assert_eq!(msg.meta.dst_ilk, None);
+
+        p.set_person_ilk(Some(ED.to_string()));
+        assert_eq!(
+            p.refresh_person_ilk(&region).map(|status| status.confirmed),
+            Some(true)
+        );
+        let msg = inbound_message(&mut p, &region, "Ev2").await;
+        assert_eq!(msg.meta.dst_ilk.as_deref(), Some(ED));
+
+        p.set_person_ilk(None);
+        let msg = inbound_message(&mut p, &region, "Ev3").await;
+        assert_eq!(msg.meta.dst_ilk, None);
+        assert_eq!(p.person_ilk_status(), None);
     }
 }
