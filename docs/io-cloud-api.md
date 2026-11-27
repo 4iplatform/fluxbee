@@ -173,7 +173,7 @@ return body.result;
 
 | `error_code` | meaning |
 |---|---|
-| `INVALID_REQUEST` | a missing or malformed field, an unknown op, a `tenant_id` inside `params`, a reserved key, an envelope `tenant_id` on an exposure op (§5.8) |
+| `INVALID_REQUEST` | a missing or malformed field, an unknown op, a `tenant_id` inside `params`, a reserved key, an envelope `tenant_id` on an exposure op (§5.8), a param a `cd_*` op does not take (§5.9) |
 | `TENANT_ROOT_PROTECTED` | the op named the root tenant |
 | `UNAUTHORIZED` | the hive's admin refused the request (its own re-check of §3). Seeing it means a bug, not a client error |
 | `ADMIN_UNAVAILABLE` | IO.cloud reached no answer from the hive in time (§6): **the outcome is unknown** |
@@ -242,6 +242,12 @@ snapshot: a row written or removed meanwhile may be in it or not, though never t
 | `unpublish_exposure` | relay | refused | remove an exposure and its host |
 | `issue_exposure_link` | relay | refused | a one-time link that lets a person into an open exposure |
 | `list_exposures` | relay | refused | the exposures and their states |
+| `cd_deploy` | relay | yes | deploy a source into a grouping: a new Digital Executive (§5.9) |
+| `cd_get` | relay | yes | one deployment, its state and its nodes |
+| `cd_list` | relay | yes | your tenant's deployments |
+| `cd_remove` | relay | yes | remove a deployment, or a whole Digital Executive |
+| `cd_catalog` | relay | yes | the sources ready to deploy, with their blanks |
+| `cd_tree` | relay | yes | your tenant's Digital Executives, their parts and deployments |
 
 *relay* = IO.cloud turns it into a hive admin action; *local* = IO.cloud answers it itself, the fast
 identity reads straight from the hive's registry in memory. *refused*: the op takes no tenant and
@@ -1206,6 +1212,125 @@ Match on the code: IO.cloud passes the hive's text as `error_detail`, with no re
 
 While the first one still runs, a write sent again may answer `BUSY`: send it again shortly.
 
+### 5.9 Digital Executives
+
+A **Digital Executive** (an ED) is a virtual person of your tenant with nodes of its own: its
+conscious, an AI agent that speaks as the ED, and its channel, an `IO.wapp` node on its WhatsApp
+number. The hive's deployer, SY.deploy, makes them from a **source** (`plain-ed`, the one source of
+this release) and your **blanks** (the ED's names, its personality, its WhatsApp number and the key
+of its credential), and keeps a record of each **deployment**. The ED itself is an identity of
+your tenant, its `grouping.id`.
+
+- **Reachable from the release that brings SY.deploy** (the Digital Executive's stage 2, release
+  2D). Before it, IO.cloud answers these ops `INVALID_REQUEST` (an unknown op).
+- **Your tenant, always.** Each op takes the envelope `tenant_id` (rule 3) and acts on that tenant
+  alone: a deployment or an ED of another tenant answers `NOT_FOUND`, and `cd_list` and `cd_tree`
+  list only yours.
+- **Each op takes only the params listed for it:** any other param is refused with
+  `INVALID_REQUEST`, not ignored as rule 1 says for the other ops. A `null` param reads as absent.
+- **No secret travels.** A credential is the key of one you stored with `put_token`.
+
+**The flow for a new ED:** `put_token` of the WhatsApp credential (`resource_type: whatsapp`, its
+value `{access_token, app_secret, verify_token}`) in your tenant → `cd_catalog` for `plain-ed`'s
+blanks → `cd_deploy` of `plain-ed` into `{"kind": "ed"}`, naming that key → `cd_get` until `state`
+is `active` or `failed`. Its conscious also needs a usable key of its AI provider in your tenant
+(`anthropic` for `plain-ed`). **To end it:** `cd_remove` of its grouping → `cd_get` until `removed`
+→ `delete_token` of its credential when you no longer need it.
+
+| op | params | `result` |
+|---|---|---|
+| `cd_deploy` | `request_key`, `source`, `grouping`, `blanks`, `hive` (optional) | `{status, accepted: true, deployment_id, grouping, state: "deploying"}` |
+| `cd_get` | `deployment_id` | the deployment |
+| `cd_list` | `grouping_kind`, `grouping_id`, both optional filters | your deployments |
+| `cd_remove` | exactly one of `deployment_id` and `grouping_id` | `{status, accepted: true, …}` |
+| `cd_catalog` | none | the sources, by kind, each with its versions and blanks |
+| `cd_tree` | none | your tenant's tree |
+
+#### `cd_deploy`
+
+```json
+{"op":"cd_deploy","tenant_id":"tnt:…","request_id":"…",
+ "params":{"request_key":"cloud-ed-7f3a…",
+           "source":{"id":"plain-ed","version":"1"},
+           "grouping":{"kind":"ed"},
+           "blanks":{"display_name":"Laura Gómez","company_name":"Acme",
+                     "personality":{"timezone":"America/Argentina/Buenos_Aires","country_code":"AR",
+                                    "primary_language":"es","additional_languages":["en"],
+                                    "description":"…"},
+                     "whatsapp":{"phone_number_id":"1234567890","waba_id":"…",
+                                 "credential_key":"acme-laura-wapp"}},
+           "hive":"worker1"}}
+```
+
+| field | | |
+|---|---|---|
+| `params.request_key` | required | your id for this deployment, at most 64 characters of `[A-Za-z0-9._:-]`. The same key in your tenant gives back the same deployment; with other content it answers `REQUEST_KEY_REUSED` |
+| `params.source` | required | `{id, version}`, a source `cd_catalog` lists; without a `version`, the newest. The answer and the record name the exact version and its hash |
+| `params.grouping` | required | `{"kind": "ed"}` for a new ED. An existing ED's id comes with the sources of a later release |
+| `params.blanks` | required | exactly the source's blanks, as `cd_catalog` lists them, each checked by its type |
+| `params.hive` | optional | the worker of a new ED; without it, the worker with the most room. An ED's later deployments go to its hive |
+
+The hive checks everything before any step (your tenant, the request key, the source, every blank,
+the AI key and the credential in your tenant, the number held by no other deployment, a worker with
+room), records the deployment and answers at once:
+
+```json
+{"status":"ok","accepted":true,"deployment_id":"dp7xk3m2qa",
+ "grouping":{"kind":"ed","id":"ilk:…","short_id":"ed4qm7k2xa"},"state":"deploying"}
+```
+
+`grouping.id` is the ED's `ilk_id`. Read `cd_get` until `active` or `failed`.
+
+**A deployment's states:** `deploying`, then `active` or `failed`; `active` or `failed`, then
+`removing`, then `removed`. A failed one stays `failed`, with the step, its code and its detail, and
+nothing is undone by itself. Two ways out: `cd_deploy` again with the same `request_key` resumes it
+where it stopped; `cd_remove` ends what it made.
+
+#### `cd_get` / `cd_list`
+
+`cd_get` answers one deployment: its `grouping`, `tenant_id`, `request_key`, `source`
+(`{id, version, hash}`), `blanks`, `hive`, its `nodes` (each with its role, `node_name`, `ilk_id`,
+runtime and version, and its status), the key names of its credentials, `state` and `history`; a
+failed one names its step, code and detail. `cd_list` lists your deployments, optionally of one
+`grouping_kind` (`ed`) or of one ED (`grouping_id`, its `ilk_id`).
+
+#### `cd_remove`
+
+Exactly one of `params.deployment_id` (one deployment) and `params.grouping_id` (a whole ED, its
+`grouping.id`). It answers `accepted` at once; read `cd_get` until `removed`. An ED's deployments go
+newest first, each node retired (the channel first, so that nothing more comes in, then the
+conscious), and then the ED is marked deleted. What stays: the identities, marked, with their
+history; the ED's document; the credential, for you to delete (`delete_token`); published pages
+until they expire. The founding deployment alone, while its ED has others, answers
+`DEPLOYMENT_NOT_REMOVABLE`.
+
+#### `cd_catalog` / `cd_tree`
+
+`cd_catalog` lists the sources ready to deploy, by kind (`ed`, `infra`, `custom`), each with its
+versions and its blanks. `cd_tree` answers your tenant's tree, read when you ask: its general infra
+(none yet), its EDs (each with its document), each ED's parts (the identities that work for it,
+with their role, node and status) and its deployments (source, version, state, each agent's assets
+and each channel's credential key names). Never a secret.
+
+#### Errors
+
+| `error_code` | op | when | what to do |
+|---|---|---|---|
+| `INVALID_REQUEST` | any | a missing or malformed field, a param the op does not take, a `cd_remove` with both ids or neither | fix the request |
+| `BLANK_INVALID` | deploy | a blank missing, one the source does not have, or one its type refuses; `error_detail` names it | fix the blank |
+| `SOURCE_NOT_FOUND` | deploy | no such source or version | read `cd_catalog` |
+| `REQUEST_KEY_REUSED` | deploy | the `request_key` was given before with other content | a new key, or the same content |
+| `AI_KEY_MISSING` | deploy | no usable key of the conscious's AI provider in your tenant | store one with `put_token` |
+| `CREDENTIAL_MISSING` | deploy | the credential key is not in your tenant with the `resource_type` its blank asks for | store it with `put_token` first |
+| `NUMBER_TAKEN` | deploy | another deployment holds the `phone_number_id` | |
+| `NOT_FOUND` | get, remove | no such deployment or ED in your tenant | |
+| `DEPLOYMENT_NOT_REMOVABLE` | remove | the founding deployment while its ED has others | remove the ED (`grouping_id`) |
+| `HIVE_UNAVAILABLE` | deploy | the hive cannot reach the worker now: nothing was done | send it again with the same `request_key` |
+| `BUSY` | deploy, remove | another deployment of the same ED is under way: nothing was done | send it again shortly |
+| `DEPLOY_UNAVAILABLE` | any | SY.deploy did not answer the hive within 10 s: unknown, as `ADMIN_UNAVAILABLE` is | a `cd_deploy` again with the same `request_key`; read `cd_get` before a `cd_remove` again |
+
+Match on the code: IO.cloud passes the hive's text as `error_detail` (§5.4).
+
 ---
 
 ## 6. Timeouts and retries
@@ -1234,6 +1359,9 @@ completing inside**. Treat it as **unknown**, not failed:
 - the exposure ops: §5.8 says what each answers when sent again. All are safe but an
   `enable_exposure` whose first try was a renewal: the second ends the enablement the first one
   renewed, with its sessions.
+- `cd_deploy`: safe to send again with the same `request_key`, which gives back the same deployment
+  (§5.9). The reads (`cd_get`, `cd_list`, `cd_catalog`, `cd_tree`) are safe. Before a `cd_remove`
+  again, read `cd_get`: a removal that went through reads `removing` or `removed`.
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.
@@ -1395,6 +1523,16 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### The Digital Executive's release (stage 2, 2D)
+
+- **Six new ops, SY.deploy's orders** (§5.9): `cd_deploy`, `cd_get`, `cd_list`, `cd_remove`,
+  `cd_catalog` and `cd_tree`, each for your tenant alone, each with only its own params.
+  `list_cloud_actions` lists them. A new ED is a `put_token` of its WhatsApp credential and a
+  `cd_deploy` of `plain-ed`, followed with `cd_get`.
+- **An ED's nodes are launched by SY.deploy, not by Cloud:** `start_node`, `stop_node` and
+  `delete_node`, which act on the nodes Cloud launched, answer `NODE_NOT_FOUND` for them, and
+  `cd_remove` retires them. Nothing else changes for Cloud.
 
 ### 0.1.152
 

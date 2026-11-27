@@ -16,7 +16,9 @@
 //! - every op on a tenant acts on the tenant at the envelope root, never the root tenant
 //!   (`claimed_tenant`), and SY.admin re-checks that server-side;
 //! - the exposure ops act on the installation and refuse an envelope tenant (`refuse_tenant`,
-//!   docs/io-web-v2-stage-2-1.md §5.3).
+//!   docs/io-web-v2-stage-2-1.md §5.3);
+//! - SY.deploy's orders (`cd_*`, docs/digital-executive-v1-stage-2.md §2) carry the claimed tenant
+//!   and only the params the SDK lists for each (`cloud_deploy_op_params`).
 //!
 //! # Configuration: managed CONFIG plane, NOT env
 //!
@@ -50,7 +52,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
+use fluxbee_sdk::cloud::{
+    admin_action_for_cloud_op, cloud_action_catalog, cloud_deploy_op_params, is_cloud_local_op,
+};
 use fluxbee_sdk::managed_control_plane::{
     build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
@@ -1706,6 +1710,33 @@ fn translate_cloud_op(
             refuse_tenant(tenant_id, op)?;
             Ok(("list_exposures", json!({})))
         }
+        // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): each relays to SY.admin's
+        // action of its own name, for the claimed tenant, which SY.admin carries to SY.deploy as
+        // the caller's (SY.deploy answers NOT_FOUND for another tenant's), with the params the SDK
+        // lists for the op, the list SY.admin checks again (`cloud_deploy_op_params`). Any other
+        // param is refused, never dropped; a null one reads as absent. SY.deploy checks the values.
+        deploy_op if cloud_deploy_op_params(deploy_op).is_some() => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let allowed = cloud_deploy_op_params(op).unwrap_or(&[]);
+            let action = admin_action_for_cloud_op(op)
+                .ok_or_else(|| cloud_error(&format!("unknown op '{op}'")))?;
+            let Some(fields) = params.as_object() else {
+                return Err(cloud_error(&format!("{op} takes params as an object")));
+            };
+            let mut order = serde_json::Map::new();
+            for (field, value) in fields {
+                if !allowed.contains(&field.as_str()) {
+                    return Err(cloud_error(&format!(
+                        "{op} takes only params {allowed:?}, not params.{field}"
+                    )));
+                }
+                if !value.is_null() {
+                    order.insert(field.clone(), value.clone());
+                }
+            }
+            order.insert("tenant_id".to_string(), json!(tenant_id));
+            Ok((action, Value::Object(order)))
+        }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
     }
@@ -2853,6 +2884,8 @@ mod tests {
             let op_params = match *op {
                 "update_tenant" => json!({"name": "acme"}),
                 "get_usage" => json!({"since": "2026-10-01T00:00:00Z"}),
+                // SY.deploy's orders take only their own params (docs/io-cloud-api.md §5.9).
+                deploy_op if cloud_deploy_op_params(deploy_op).is_some() => json!({}),
                 _ => params.clone(),
             };
             // An exposure is the installation's: its ops refuse a tenant (docs/io-cloud-api.md §5.8).
@@ -3907,6 +3940,82 @@ mod tests {
                         .unwrap_err();
                 assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {id}");
             }
+        }
+    }
+
+    /// SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): each relays to the SY.admin
+    /// action of its own name with the claimed tenant and its own params as Cloud sent them, a null
+    /// one left out; a missing or root tenant, a param the op does not take (`_caller` and
+    /// `tenant_id` among them) and params that are no object are refused.
+    #[test]
+    fn translate_deploy_ops_carry_the_claimed_tenant_and_their_params() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let blanks = json!({
+            "display_name": "Laura",
+            "company_name": "Client Co",
+            "whatsapp": {"phone_number_id": "1234567890", "waba_id": "9876543210", "credential_key": "client-laura-wapp"},
+        });
+        for (op, params) in [
+            (
+                "cd_deploy",
+                json!({
+                    "request_key": "cloud-ed-7f3a",
+                    "source": {"id": "plain-ed", "version": "1"},
+                    "grouping": {"kind": "ed"},
+                    "blanks": blanks,
+                    "hive": "worker1",
+                }),
+            ),
+            ("cd_get", json!({"deployment_id": "dp7xk3m2qa"})),
+            ("cd_list", json!({"grouping_kind": "ed"})),
+            (
+                "cd_remove",
+                json!({"grouping_id": "ilk:22222222-2222-4222-8222-222222222222"}),
+            ),
+            ("cd_catalog", json!({})),
+            ("cd_tree", json!({})),
+        ] {
+            let (action, payload) = translate_cloud_op(op, Some(tenant), &params)
+                .unwrap_or_else(|e| panic!("{op}: {e}"));
+            assert_eq!(action, op);
+            let mut expected = params.clone();
+            expected["tenant_id"] = json!(tenant);
+            assert_eq!(payload, expected, "{op}");
+
+            let err = translate_cloud_op(op, None, &params).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{op}");
+            let err = translate_cloud_op(op, Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID), &params)
+                .unwrap_err();
+            assert_eq!(err["error_code"], "TENANT_ROOT_PROTECTED", "{op}");
+        }
+        let (_, payload) = translate_cloud_op(
+            "cd_list",
+            Some(tenant),
+            &json!({"grouping_kind": null, "grouping_id": "ilk:22222222-2222-4222-8222-222222222222"}),
+        )
+        .unwrap();
+        assert_eq!(
+            payload,
+            json!({"tenant_id": tenant, "grouping_id": "ilk:22222222-2222-4222-8222-222222222222"})
+        );
+        for (op, params) in [
+            (
+                "cd_get",
+                json!({"deployment_id": "dp7xk3m2qa", "hive": "worker1"}),
+            ),
+            (
+                "cd_deploy",
+                json!({"request_key": "k", "_caller": {"by": "operator"}}),
+            ),
+            (
+                "cd_tree",
+                json!({"tenant_id": "tnt:99999999-9999-4999-8999-999999999999"}),
+            ),
+            ("cd_catalog", json!({"kind": "ed"})),
+            ("cd_get", json!(["dp7xk3m2qa"])),
+        ] {
+            let err = translate_cloud_op(op, Some(tenant), &params).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {params}");
         }
     }
 
