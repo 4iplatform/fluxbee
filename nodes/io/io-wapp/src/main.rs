@@ -12,13 +12,12 @@ use anyhow::Result;
 use fluxbee_sdk::blob::BlobToolkit;
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
-    is_system_kind, Destination, Message as WireMessage, Meta, Routing, MSG_VAULT_SECRET_CHANGED,
-    SYSTEM_KIND,
+    is_system_kind, Destination, Message as WireMessage, Meta, Routing, MSG_NODE_STATUS_GET,
+    MSG_NODE_STATUS_GET_RESPONSE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient, VaultError,
-    FLUXBEE_NODE_NAME_ENV,
+    NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget,
+    RouterDispatcher, VaultCallerOwned, VaultClient, VaultError, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
@@ -42,11 +41,14 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_wapp_adapter_config::IoWappAdapterConfigContract;
+use io_common::person_assignment::{
+    extract_runtime_person_ilk, PersonAssignmentStatus, PERSON_RECHECK_INTERVAL,
+};
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
 use io_common::text_v1_blob::{resolve_text_v1_text_only_for_outbound, IoBlobRuntimeConfig};
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
 use webhook::{
@@ -504,6 +506,9 @@ async fn main() -> Result<()> {
         tracing::warn!(node_name = %config.node_name, "FLUXBEE_NODE_ILK_ID / hive suffix missing; vault lookup skipped");
     }
 
+    // The person this IO carries (io.person_ilk, docs/digital-executive-v1-stage-2.md §7), read at
+    // boot as io.dst_node is: the inbound processor stamps it while identity confirms it.
+    let boot_person_ilk = extract_runtime_person_ilk(boot_state.effective_config.as_ref());
     let control_plane = Arc::new(RwLock::new(boot_state));
     let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
         control_plane.read().await.current_state.as_str(),
@@ -539,20 +544,40 @@ async fn main() -> Result<()> {
             dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
             dedup_max_entries: config.dedup_max_entries,
             dst_node: None,
-            person_ilk: None,
-            self_ilk_id: None,
+            person_ilk: boot_person_ilk,
+            self_ilk_id: self_ilk_id.clone(),
             provision_on_miss: true,
             blob_runtime: None,
             self_tenant_id: self_tenant_id.clone(),
         },
     )));
+    // Checked against identity at once, so the status says it from the start, and then every
+    // PERSON_RECHECK_INTERVAL, so the status follows identity with no inbound message.
+    let person_status = PersonStatusView::default();
+    sync_person_ilk(&inbound, &control_plane, identity.as_ref(), &person_status).await;
+    if let Some(status) = person_status.get() {
+        tracing::info!(
+            node_name = %config.node_name,
+            person_ilk = %status.ilk,
+            confirmed = status.confirmed,
+            reason = ?status.reason,
+            "the config assigns the person this IO carries (io.person_ilk); inbound messages name it as dst_ilk while identity confirms it"
+        );
+    }
+    tokio::spawn(run_wapp_person_check_loop(
+        inbound.clone(),
+        control_plane.clone(),
+        identity.clone(),
+        person_status.clone(),
+    ));
     tokio::spawn(run_wapp_inbound_loop(
         dispatcher.clone(),
         control_plane.clone(),
         clients.clone(),
-        identity,
+        identity.clone(),
         provisioner,
-        inbound,
+        inbound.clone(),
+        person_status.clone(),
         config.island_id.clone(),
         self_tenant_id.clone(),
     ));
@@ -584,6 +609,11 @@ async fn main() -> Result<()> {
         adapter_contract,
         clients,
         vault_change_notify,
+        PersonSync {
+            inbound,
+            identity,
+            status: person_status,
+        },
     )
     .await
 }
@@ -646,6 +676,130 @@ fn extract_runtime_dst_node(effective: Option<&Value>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The person this IO carries, as its status answers say it (docs/digital-executive-v1-stage-2.md
+/// §7): the inbound processor's `person_ilk_status`, copied out after each check, so a status
+/// answer never waits for the processor, which an inbound message holds through its identity
+/// provisioning (up to `IO_WAPP_IDENTITY_TIMEOUT_MS`, 10 s).
+#[derive(Clone, Default)]
+struct PersonStatusView(Arc<std::sync::Mutex<Option<PersonAssignmentStatus>>>);
+
+impl PersonStatusView {
+    fn get(&self) -> Option<PersonAssignmentStatus> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set(&self, status: Option<PersonAssignmentStatus>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+}
+
+/// What the control loop needs to hand a config's `io.person_ilk` to the inbound processor.
+struct PersonSync {
+    inbound: Arc<Mutex<InboundProcessor>>,
+    identity: Arc<dyn IdentityResolver>,
+    status: PersonStatusView,
+}
+
+/// Hands the effective config's `io.person_ilk` to the inbound processor (`set_person_ilk`, as at
+/// boot), checks it against identity now (`refresh_person_ilk`) and copies the outcome to the
+/// status. With no person in the config, nothing is read: the status says nothing of it.
+async fn sync_person_ilk(
+    inbound: &Mutex<InboundProcessor>,
+    control_plane: &RwLock<IoControlPlaneState>,
+    identity: &dyn IdentityResolver,
+    status: &PersonStatusView,
+) {
+    let person_ilk =
+        extract_runtime_person_ilk(control_plane.read().await.effective_config.as_ref());
+    let mut processor = inbound.lock().await;
+    processor.set_person_ilk(person_ilk);
+    status.set(processor.refresh_person_ilk(identity));
+}
+
+/// Checks the person the config assigns against identity every `PERSON_RECHECK_INTERVAL` (10 s,
+/// the AI SDK's `speaks_as` check's pace), so the status follows a relation set or cleared in
+/// identity with no inbound message, and an inbound message finds a fresh check.
+async fn run_wapp_person_check_loop(
+    inbound: Arc<Mutex<InboundProcessor>>,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    identity: Arc<dyn IdentityResolver>,
+    status: PersonStatusView,
+) {
+    loop {
+        tokio::time::sleep(PERSON_RECHECK_INTERVAL).await;
+        sync_person_ilk(&inbound, &control_plane, identity.as_ref(), &status).await;
+    }
+}
+
+/// `NODE_STATUS_GET`'s answer: the one the SDK's `try_handle_default_node_status` gives (`status`
+/// `ok` and `health_state`, `HEALTHY` unless `NODE_STATUS_DEFAULT_HEALTH_STATE` names another;
+/// none at all with `NODE_STATUS_DEFAULT_HANDLER_ENABLED` off), and while the config assigns a
+/// person, `extensions.person_ilk` `{ilk, confirmed, reason?}`
+/// (`PersonAssignmentStatus::add_to_status`, docs/digital-executive-v1-stage-2.md §7), its health
+/// unchanged. None for any other message.
+fn wapp_node_status_reply(
+    sender: &NodeSender,
+    incoming: &WireMessage,
+    person: Option<&PersonAssignmentStatus>,
+) -> Option<WireMessage> {
+    if !is_system_kind(&incoming.meta.msg_type)
+        || incoming.meta.msg.as_deref() != Some(MSG_NODE_STATUS_GET)
+    {
+        return None;
+    }
+    let mut payload = default_node_status_payload()?;
+    if let Some(person) = person {
+        person.add_to_status(&mut payload);
+    }
+    Some(WireMessage {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(incoming.routing.src.clone()),
+            ttl: 16,
+            trace_id: incoming.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_NODE_STATUS_GET_RESPONSE.to_string()),
+            ..Meta::default()
+        },
+        payload,
+    })
+}
+
+/// The SDK's default status payload (`fluxbee_sdk::try_handle_default_node_status`, with its
+/// environment switches): None when `NODE_STATUS_DEFAULT_HANDLER_ENABLED` turns it off.
+fn default_node_status_payload() -> Option<Value> {
+    let enabled = std::env::var("NODE_STATUS_DEFAULT_HANDLER_ENABLED")
+        .ok()
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let health_state = match std::env::var("NODE_STATUS_DEFAULT_HEALTH_STATE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "DEGRADED" => "DEGRADED",
+        "ERROR" => "ERROR",
+        "UNKNOWN" => "UNKNOWN",
+        _ => "HEALTHY",
+    };
+    Some(serde_json::json!({"status": "ok", "health_state": health_state}))
+}
+
 async fn run_router_control_loop(
     dispatcher: Arc<RouterDispatcher>,
     node_name: String,
@@ -654,6 +808,7 @@ async fn run_router_control_loop(
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     clients: WappClients,
     vault_change_notify: Arc<Notify>,
+    person: PersonSync,
 ) -> Result<()> {
     let control_src = dispatcher.sender_snapshot().uuid().to_string();
     let mut system_rx = dispatcher
@@ -667,7 +822,8 @@ async fn run_router_control_loop(
         };
         let sender = dispatcher.sender_snapshot();
 
-        if try_handle_default_node_status(&sender, &msg).await? {
+        if let Some(status) = wapp_node_status_reply(&sender, &msg, person.status.get().as_ref()) {
+            sender.send(status).await?;
             continue;
         }
 
@@ -694,10 +850,25 @@ async fn run_router_control_loop(
             control_metrics.clone(),
             adapter_contract.as_ref(),
             &clients,
+            person.status.get(),
         )
         .await
         {
             sender.send(response).await?;
+            // A CONFIG_SET hands its io.person_ilk to the inbound processor at once, as boot does
+            // (io.dst_node is read from the live config at each message). Off the control loop:
+            // an inbound message may hold the processor through its identity provisioning.
+            if is_config_set(&msg) {
+                let (inbound, control_plane, identity, status) = (
+                    person.inbound.clone(),
+                    control_plane.clone(),
+                    person.identity.clone(),
+                    person.status.clone(),
+                );
+                tokio::spawn(async move {
+                    sync_person_ilk(&inbound, &control_plane, identity.as_ref(), &status).await;
+                });
+            }
         }
     }
 }
@@ -821,6 +992,9 @@ async fn run_wapp_inbound_loop(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
+    // The status's copy of the person this IO carries: refreshed after each message, whose
+    // processing may check the person against identity again.
+    person_status: PersonStatusView,
     // For the first-contact gate (io_common::frontdesk_gate): the identity SHM is looked up by
     // hive, and the tenant is the node's (the external user belongs to it).
     hive_id: String,
@@ -903,9 +1077,8 @@ async fn run_wapp_inbound_loop(
                 &wapp_msg.message_id,
                 wapp_msg.timestamp.as_deref(),
             );
-            let outcome = inbound
-                .lock()
-                .await
+            let mut processor = inbound.lock().await;
+            let outcome = processor
                 .process_inbound(
                     identity.as_ref(),
                     Some(provisioner.as_ref()),
@@ -930,6 +1103,8 @@ async fn run_wapp_inbound_loop(
                     payload,
                 )
                 .await;
+            person_status.set(processor.person_ilk_status());
+            drop(processor);
             // First-contact gate (OFF by default, io.api's gate-then-forward pattern): if the
             // sender is not registered yet, it is introduced to the frontdesk and the message still
             // goes on to its destination. See io_common::frontdesk_gate.
@@ -1059,6 +1234,7 @@ async fn handle_io_control_plane_message(
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
     clients: &WappClients,
+    person: Option<PersonAssignmentStatus>,
 ) -> Option<WireMessage> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
     if !is_system_kind(&msg.meta.msg_type) {
@@ -1075,7 +1251,7 @@ async fn handle_io_control_plane_message(
 
     if command.eq_ignore_ascii_case("STATUS") {
         let state = control_plane.read().await.clone();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "ok": true,
             "node_name": node_name,
             "state": state.current_state.as_str(),
@@ -1089,6 +1265,10 @@ async fn handle_io_control_plane_message(
                 "config_generation": clients.config_generation().await,
             }
         });
+        // The person the config assigns, as NODE_STATUS_GET says it: extensions.person_ilk.
+        if let Some(person) = person.as_ref() {
+            person.add_to_status(&mut payload);
+        }
         return Some(build_system_reply(
             msg,
             control_src,
@@ -1267,6 +1447,16 @@ async fn run_wapp_vault_refresh_loop(
             WappVaultResolution::Transient => { /* keep current creds; retry next pass */ }
         }
     }
+}
+
+/// A `CONFIG_SET` to this node's control plane.
+fn is_config_set(msg: &WireMessage) -> bool {
+    is_system_kind(&msg.meta.msg_type)
+        && msg
+            .meta
+            .msg
+            .as_deref()
+            .is_some_and(|command| command.eq_ignore_ascii_case("CONFIG_SET"))
 }
 
 fn redact_state(
@@ -1631,6 +1821,208 @@ mod tests {
             2,
             "version must advance to 2"
         );
+    }
+
+    // --- docs/digital-executive-v1-stage-2.md §7: the person this IO carries (io.person_ilk) ---
+
+    const IO_ILK: &str = "ilk:7d1e0b2a-5c3f-4a8e-9b6d-2f4c8a1e3b50";
+    const ED: &str = "ilk:3f0c6a52-9c1e-4f5e-8f43-6d2b1a7e9c10";
+    const TENANT: &str = "tnt:6a1f3c2e-0b4d-4e8a-9c7f-2d5e8b1a3c40";
+
+    /// An identity SHM of the test's own: the entries it holds.
+    #[derive(Default)]
+    struct Region(std::sync::Mutex<std::collections::HashMap<String, Value>>);
+
+    impl Region {
+        /// The IO's ILK working for the ED as its channel, and the ED in the IO's tenant.
+        fn confirming() -> Self {
+            let region = Self::default();
+            region.put(IO_ILK, Some("channel"));
+            region.put(ED, None);
+            region
+        }
+
+        fn put(&self, ilk: &str, work_role: Option<&str>) {
+            let entry = match work_role {
+                Some(role) => json!({"ilk_id": ilk, "tenant_id": TENANT,
+                    "registration_status": "complete", "ilk_type": "agent",
+                    "works_for": ED, "work_role": role}),
+                None => json!({"ilk_id": ilk, "tenant_id": TENANT,
+                    "registration_status": "complete", "ilk_type": "human"}),
+            };
+            self.0.lock().unwrap().insert(ilk.to_string(), entry);
+        }
+    }
+
+    impl IdentityResolver for Region {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn lookup(
+            &self,
+            _input: &ResolveOrCreateInput,
+        ) -> Result<Option<String>, io_common::identity::IdentityError> {
+            Ok(None)
+        }
+
+        fn ilk_entry(
+            &self,
+            ilk_id: &str,
+        ) -> Result<
+            Option<fluxbee_sdk::identity::IdentityIlkOption>,
+            io_common::identity::IdentityError,
+        > {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(ilk_id)
+                .map(|entry| serde_json::from_value(entry.clone()).expect("an entry")))
+        }
+    }
+
+    fn wapp_config(person_ilk: Option<&str>) -> Value {
+        let mut io = json!({"phone_number_id": "1234567890", "waba_id": "2",
+            "dst_node": "AI.ed4qm7k2xa@worker1"});
+        if let Some(person) = person_ilk {
+            io["person_ilk"] = json!(person);
+        }
+        json!({"wapp": {"auth": {"type": "vault_ref", "resource_type": "whatsapp",
+            "key": "acme-laura-wapp"}}, "io": io})
+    }
+
+    fn processor(person_ilk: Option<&str>) -> Mutex<InboundProcessor> {
+        Mutex::new(InboundProcessor::new(
+            "io-wapp-test-uuid",
+            InboundConfig {
+                person_ilk: person_ilk.map(str::to_string),
+                self_ilk_id: Some(IO_ILK.to_string()),
+                self_tenant_id: Some(TENANT.to_string()),
+                blob_runtime: None,
+                ..InboundConfig::default()
+            },
+        ))
+    }
+
+    fn configured(config: Value) -> RwLock<IoControlPlaneState> {
+        RwLock::new(IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            effective_config: Some(config),
+            ..IoControlPlaneState::default()
+        })
+    }
+
+    /// The person the config assigns reaches the inbound processor at boot (from the effective
+    /// config, as io.dst_node does) and at each config change, and the status says identity's
+    /// word on it: confirmed, why not, or nothing once the config names none.
+    #[tokio::test]
+    async fn the_config_hands_its_person_to_the_inbound_processor_and_the_status_says_it() {
+        let region = Region::confirming();
+        let boot = wapp_config(Some(ED));
+        let boot_person = extract_runtime_person_ilk(Some(&boot));
+        assert_eq!(boot_person.as_deref(), Some(ED));
+        let inbound = processor(boot_person.as_deref());
+        let control_plane = configured(boot);
+        let status = PersonStatusView::default();
+
+        sync_person_ilk(&inbound, &control_plane, &region, &status).await;
+        assert_eq!(
+            status.get(),
+            Some(PersonAssignmentStatus {
+                ilk: ED.to_string(),
+                confirmed: true,
+                reason: None
+            })
+        );
+
+        // Identity takes the relation away: the next check says why.
+        region.put(IO_ILK, Some("conscious"));
+        sync_person_ilk(&inbound, &control_plane, &region, &status).await;
+        let now = status.get().expect("a status");
+        assert!(!now.confirmed);
+        assert!(
+            now.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("the role conscious"),
+            "{now:?}"
+        );
+
+        // A config change that names no person: nothing more is said of one.
+        control_plane.write().await.effective_config = Some(wapp_config(None));
+        sync_person_ilk(&inbound, &control_plane, &region, &status).await;
+        assert_eq!(status.get(), None);
+        assert_eq!(inbound.lock().await.person_ilk_status(), None);
+
+        // And one that names it again is checked at once.
+        region.put(IO_ILK, Some("channel"));
+        control_plane.write().await.effective_config = Some(wapp_config(Some(ED)));
+        sync_person_ilk(&inbound, &control_plane, &region, &status).await;
+        assert_eq!(status.get().map(|status| status.confirmed), Some(true));
+    }
+
+    /// NODE_STATUS_GET's answer is the SDK's default one, field for field, and while the config
+    /// assigns a person it adds `extensions.person_ilk`, its health unchanged. Any other message
+    /// is not its to answer.
+    #[tokio::test]
+    async fn the_node_status_answer_is_the_sdks_default_with_the_person() {
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "IO.wapp.laura@worker1",
+            build_io_wapp_rpc_profile().expect("profile"),
+        );
+        let sender = dispatcher.sender_snapshot();
+        let request = WireMessage {
+            routing: Routing {
+                src: "orchestrator-uuid".to_string(),
+                src_l2_name: Some("SY.orchestrator@worker1".to_string()),
+                dst: Destination::Unicast(sender.uuid().to_string()),
+                ttl: 8,
+                trace_id: "trace-status".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_NODE_STATUS_GET.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        assert!(
+            fluxbee_sdk::try_handle_default_node_status(&sender, &request)
+                .await
+                .expect("the default answer")
+        );
+        let default = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the default answer");
+
+        let plain = wapp_node_status_reply(&sender, &request, None).expect("an answer");
+        assert_eq!(
+            serde_json::to_value(&plain).expect("plain"),
+            serde_json::to_value(&default).expect("default")
+        );
+
+        let person = PersonAssignmentStatus {
+            ilk: ED.to_string(),
+            confirmed: false,
+            reason: Some("identity names no person this IO's ILK works for".to_string()),
+        };
+        let with_person =
+            wapp_node_status_reply(&sender, &request, Some(&person)).expect("an answer");
+        let mut expected = default.payload.clone();
+        expected["extensions"] = json!({"person_ilk": {"ilk": ED, "confirmed": false,
+            "reason": "identity names no person this IO's ILK works for"}});
+        assert_eq!(with_person.payload, expected);
+        assert_eq!(
+            with_person.payload["health_state"],
+            default.payload["health_state"]
+        );
+        assert_eq!(with_person.meta.msg, default.meta.msg);
+
+        let mut config_get = request.clone();
+        config_get.meta.msg = Some("CONFIG_GET".to_string());
+        assert!(wapp_node_status_reply(&sender, &config_get, Some(&person)).is_none());
     }
 
     #[tokio::test]

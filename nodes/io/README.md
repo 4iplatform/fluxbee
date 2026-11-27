@@ -149,6 +149,21 @@ Logging note:
 
 - `publish-io-api-runtime.sh` publishes `start.sh` with default `RUST_LOG=info,io_api=debug,io_common=debug,fluxbee_sdk=info`
 
+### IO.wapp
+
+- `io-wapp` runs as a managed instance, one per WhatsApp business number; every IO.wapp node takes
+  the same fanned-out webhooks and keeps only its own number's (`docs/io-wapp-design.md` §5).
+- Its config names a SY.vault key, never the credentials
+  (`nodes/io/common/src/io_wapp_adapter_config.rs`).
+  - Required: `wapp.auth` = `{"type":"vault_ref","resource_type":"whatsapp","key":"<vault key>"}`,
+    `io.phone_number_id` and `io.waba_id`.
+  - Optional: `io.dst_node` (without it the router resolves the destination), `io.person_ilk`
+    (the person it carries, [below](#the-person-an-io-carries-ioperson_ilk)),
+    `io.graph_api_version`, `io.blob.*`, `identity.target`, `identity.timeout_ms`, `node.*`,
+    `runtime.*`.
+- `NODE_STATUS_GET` answers the SDK's default status, with `extensions.person_ilk` while the config
+  assigns a person.
+
 Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 
 ### Declaring `ilk_type` at provision time
@@ -171,8 +186,10 @@ person in the role `channel`, and the person is of the IO's tenant. While confir
 message names the person as `dst_ilk`; while not, none, a WARN at most once a minute and the status
 (`extensions.person_ilk`) say why. The message goes to `io.dst_node` either way, and without the key
 nothing changes. The node hands the key to io-common's `InboundProcessor` as it hands on
-`io.dst_node` (`InboundConfig::person_ilk`, `set_person_ilk`); io.wapp does from the Digital
-Executive's release 2D, the other IOs when one needs it. See `docs/io/io-common.md` §3.4.
+`io.dst_node` (`InboundConfig::person_ilk`, `set_person_ilk`). io.wapp does since the Digital
+Executive's release 2D: at boot, on each `CONFIG_SET` and every 10 s, so its status follows
+identity with no inbound message. The other IOs read it when one needs it. See
+`docs/io/io-common.md` §3.4.
 
 ## io-sim quick test
 

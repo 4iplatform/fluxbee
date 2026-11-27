@@ -71,6 +71,7 @@ config with real operator content is validated (SDK `managed_control_plane.rs:20
     "phone_number_id": "1234567890",          // the sending number id (binding, like slack workspace_id)
     "waba_id": "9876543210",                  // WhatsApp Business Account id (binding)
     "dst_node": "AI.generic@motherbee",       // where inbound relays (absent → router resolve), like io.slack
+    "person_ilk": "ilk:…",                     // optional: the person this IO carries (a Digital Executive's channel)
     "graph_api_version": "v20.0",             // optional, default pinned
     "blob": { /* io.blob.* media knobs, like io.slack */ }
   }
@@ -82,6 +83,16 @@ config with real operator content is validated (SDK `managed_control_plane.rs:20
   non-empty phone_number_id/waba_id. NO inline tokens accepted (mirror io.slack).
 - `secret_descriptors`: one `config.wapp.auth.key`, `persistence="vault"`, `value_redacted=false`.
 - `redact_effective_config`: no-op (auth.key is a reference, not the secret).
+- `io.person_ilk` (optional, a string; since the Digital Executive's release 2D): the person this IO
+  carries, an `ilk:<uuid>`, which SY.deploy writes for an ED's channel. While identity confirms it
+  (the node's ILK works for that person as its `channel`, and the person is of the node's tenant),
+  each inbound message names the person as `dst_ilk`; it never changes where the message goes
+  ([digital-executive-v1-stage-2](digital-executive-v1-stage-2.md) §7,
+  [io-common](io/io-common.md) §3.4). The node hands it to the inbound processor at boot and on each
+  `CONFIG_SET`, and checks it again every 10 s.
+- `NODE_STATUS_GET`: the SDK's default answer (`status`, `health_state`), plus
+  `extensions.person_ilk` `{ilk, confirmed, reason?}` while the config assigns a person; `STATUS`
+  carries the same extension.
 
 **Vault secret object** (one key, `resource_type="whatsapp"`, resolved + validated like io.slack's
 `{app_token,bot_token}`):

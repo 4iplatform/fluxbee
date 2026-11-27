@@ -314,9 +314,11 @@ person, and identity confirms it; neither alone suffices.
   (`{ilk, confirmed, reason}`). It never changes the node's health.
 - **Either way** the message goes where it went: `io.dst_node`, or the router's resolve.
 - **With no `io.person_ilk`** nothing is read and nothing changes.
-- **Which IOs read it:** io.wapp from the Digital Executive's release 2D; the others when one
-  needs it (io.slack waits for its revamp). Until a node reads the key, a config that carries it
-  changes nothing.
+- **Which IOs read it:** io.wapp since the Digital Executive's release 2D: it hands the key on at
+  boot and on each `CONFIG_SET`, checks it again every 10 s with no message (so its status follows
+  identity), and answers `NODE_STATUS_GET` with the SDK's default status plus
+  `extensions.person_ilk`. The others read it when one needs it (io.slack waits for its revamp).
+  Until a node reads the key, a config that carries it changes nothing.
 
 ---
 

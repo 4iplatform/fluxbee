@@ -26,6 +26,7 @@ impl IoAdapterConfigContract for IoWappAdapterConfigContract {
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
             "config.io.dst_node",
+            "config.io.person_ilk",
             "config.io.graph_api_version",
             "config.io.blob.*",
             "config.identity.target",
@@ -44,6 +45,12 @@ impl IoAdapterConfigContract for IoWappAdapterConfigContract {
             "phone_number_id + waba_id identify the WhatsApp Business number/account this instance \
              sends from and owns the webhook for; they are the stable binding (not secrets).",
             "dst_node is where inbound messages relay (absent => router resolve), like io.slack.",
+            "person_ilk (an ilk:<uuid>, next to dst_node) assigns the person this IO carries, a \
+             Digital Executive's channel, written by SY.deploy: while identity confirms it (this \
+             IO's ILK works for the person as its channel, and the person is of the IO's tenant) \
+             each inbound message names the person as dst_ilk; it never changes where the message \
+             goes. NODE_STATUS_GET's extensions.person_ilk says whether identity confirms it and \
+             why not. A CONFIG_SET applies it at once.",
         ]
     }
 
@@ -92,6 +99,16 @@ impl IoAdapterConfigContract for IoWappAdapterConfigContract {
         // injected. graph_api_version, when present, must be a non-empty string.
         if io_obj.contains_key("graph_api_version") {
             require_non_empty_string(io_obj, "graph_api_version", "io.graph_api_version")?;
+        }
+        // The person this IO carries: a string when present (blank for none). Whether it is an
+        // ilk:<uuid> identity confirms is the status's to say (crate::person_assignment).
+        if io_obj
+            .get(crate::person_assignment::PERSON_ILK_CONFIG_KEY)
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(IoAdapterConfigError::InvalidConfig(
+                "io.person_ilk must be a string (an ilk:<uuid>) when present".to_string(),
+            ));
         }
 
         Ok(Value::Object(cfg))
@@ -245,6 +262,38 @@ mod tests {
         assert!(d[0].configured);
         assert!(!d[0].value_redacted);
         assert_eq!(d[0].persistence, "vault");
+    }
+
+    /// The plain ED's IO config, as SY.deploy writes it at run_node
+    /// (docs/digital-executive-v1-stage-2.md §7): it validates and keeps io.person_ilk, which the
+    /// node reads as it reads io.dst_node. A person that is not a string is refused.
+    #[test]
+    fn validate_materialize_keeps_the_person_and_refuses_one_that_is_not_a_string() {
+        const PERSON: &str = "ilk:3f0c6a52-9c1e-4f5e-8f43-6d2b1a7e9c10";
+        let contract = IoWappAdapterConfigContract;
+        let out = contract
+            .validate_and_materialize(&json!({
+                "wapp":{"auth":{"type":"vault_ref","resource_type":"whatsapp","key":"acme-laura-wapp"}},
+                "io":{"phone_number_id":"1234567890","waba_id":"2","dst_node":"AI.ed4qm7k2xa@worker1",
+                      "person_ilk": PERSON}
+            }))
+            .expect("must pass");
+        assert_eq!(out["io"]["person_ilk"], json!(PERSON));
+        assert_eq!(
+            crate::person_assignment::extract_runtime_person_ilk(Some(&out)).as_deref(),
+            Some(PERSON)
+        );
+
+        let err = contract
+            .validate_and_materialize(&json!({
+                "wapp":{"auth": valid_auth()},
+                "io":{"phone_number_id":"1","waba_id":"2","person_ilk": 7}
+            }))
+            .expect_err("must refuse a person that is not a string");
+        assert!(
+            matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("io.person_ilk"))
+        );
+        assert!(contract.optional_fields().contains(&"config.io.person_ilk"));
     }
 
     #[test]
