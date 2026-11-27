@@ -1,3 +1,4 @@
+pub mod agent_assets;
 pub mod ai_settings;
 pub mod config;
 pub mod instance_lock;
