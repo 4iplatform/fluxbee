@@ -671,8 +671,15 @@ not read `ich`.
   incoming `src_ilk`, clears `src_ilk` and `memory_package`, and drops `thread_id`, `src_ilk`,
   `response_envelope`, `wf`, `evaluation` and, unless told to keep it, `final_response_contract`
   from `context`. The runtime then stamps the agent's ILK (`RuntimeConfig.self_ilk_id`,
-  `crates/fluxbee_ai_sdk/src/runtime.rs`). A reply never carries the human's ILK as its own;
-  `thread_id` and `ich` stay.
+  `crates/fluxbee_ai_sdk/src/runtime.rs`), or, on a solution reply, the person the agent's config
+  says it speaks as (`RuntimeConfig.speaks_as`, a Digital Executive's conscious) while identity
+  confirms it: the agent's own ILK works for that person, as its `conscious`
+  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §6.1). It never copies an
+  ILK from the request, so a reply never carries the human's ILK as its own; the writer
+  (`meta.context.writer`) stays the agent; `thread_id` and `ich` stay.
+- An IO whose config assigns it a person (`io.person_ilk`) names that person as the `dst_ilk` of
+  each inbound message, while identity confirms it: the IO's own ILK works for the person, as its
+  `channel`, and the person is of the IO's tenant ([io-common](../io/io-common.md) §3.4).
 - Reply routing (`build_reply_routing`): `dst` the incoming `src`, the same `trace_id`, `ttl` the
   incoming one (at least 1). A reply whose payload has `type: "error"` gets `.error` appended to
   `meta.msg`, when there is one (`apply_error_reply_msg_suffix`).

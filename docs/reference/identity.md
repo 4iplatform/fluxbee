@@ -721,9 +721,10 @@ converges to the union of the mesh.
 | SY.storage | The tenant a usage record is charged to (`identity_tenant`, the motherbee's region). |
 | SY.frontdesk.gov | The tenant of a case (`identity_shm_ilk_tenant`), read again while the region cannot be read or lacks SY.identity's own ILK (FINDINGS A-303). |
 | SY.admin | A caller's ILK by name; channel owners (`list_ich_options_from_hive_config`). |
-| IO nodes | A sender's ILK before provisioning (`resolve_ilk_from_hive_id`). |
+| IO nodes | A sender's ILK before provisioning (`resolve_ilk_from_hive_id`); with `io.person_ilk` set, their own ILK's `works_for` and `work_role` and the person's tenant (`IdentityResolver::ilk_entry`, `nodes/io/common`). |
 | IO.cloud | Its fast `get_ilk` and `list_ilks` reads (`CLOUD_LOCAL_OPS` in `crates/fluxbee_sdk/src/cloud.rs`). |
 | ai.generic | Its own ILK and definition hashes. |
+| AI SDK runtime | With `RuntimeConfig.speaks_as` set, its own ILK's `works_for` and `work_role`, every 10 s (`crates/fluxbee_ai_sdk/src/speaks_as.rs`). |
 | Go SDK | `go/fluxbee-go-sdk/identity_shm.go`. |
 
 ---
