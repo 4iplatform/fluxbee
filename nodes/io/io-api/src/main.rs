@@ -1942,6 +1942,7 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document_hash: None,
         }];
         assert!(ilk_belongs_to_tenant(
             &ilks,
@@ -1976,6 +1977,7 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document_hash: None,
         };
         let channel = |scope: &str| IdentityIchOption {
             ich_id: "ich:44444444-4444-4444-8444-444444444444".to_string(),

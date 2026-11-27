@@ -4424,6 +4424,7 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document_hash: None,
         };
         let channel = |channel_type: &str, scope: &str, ilk: IdentityIlkOption| IdentityIchOption {
             ich_id: format!("ich:{}", uuid::Uuid::new_v4()),

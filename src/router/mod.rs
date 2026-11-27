@@ -10795,7 +10795,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         copy_bytes_with_len(&mut ilk.handler_node, "SY.frontdesk.gov@sandbox");
 
@@ -10946,7 +10946,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         let alias = IlkAliasEntry {
             old_ilk_id: *old_ilk_id.as_bytes(),
@@ -11082,7 +11082,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         let alias = IlkAliasEntry {
             old_ilk_id: *old_ilk_id.as_bytes(),
@@ -11157,7 +11157,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         let alias = IlkAliasEntry {
             old_ilk_id: *old_ilk_id.as_bytes(),

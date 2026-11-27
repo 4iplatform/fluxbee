@@ -690,7 +690,9 @@ converges to the union of the mesh.
   - ILKs not marked, with tenant, type, status, display name, `handler_node`, definition
     hashes, the virtual flag, and whom the ILK works for and its role (`works_for`,
     `work_role`, empty for an ILK that works for nobody; nothing sets them yet,
-    [digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1);
+    [digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1), and a person's
+    document's hash prefix (`document_hash`, 8 bytes, all zeros for none: SY.identity projects
+    zeros until release 2C writes it, §1.2);
   - channels with their scope, and the `(type, address, scope)` mappings;
   - aliases;
   - the vocabulary region, which nothing fills: it is always empty, and the layout keeps it.

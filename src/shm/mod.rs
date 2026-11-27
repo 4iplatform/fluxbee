@@ -33,8 +33,9 @@ pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
 /// IDENTITY_VERSION = 7: `IlkEntry` gained `works_for` and `work_role`, the person an ILK works
-/// for and its role (docs/digital-executive-v1-stage-2.md §1.1), before its reserved bytes. A
-/// reader refuses another version, so writer and readers change together.
+/// for and its role (docs/digital-executive-v1-stage-2.md §1.1), before its last 8 bytes, which
+/// are `document_hash`, a person's document's hash prefix (§1.2), all zeros until release 2C writes
+/// them. A reader refuses another version, so writer and readers change together.
 pub const IDENTITY_VERSION: u32 = 7;
 pub const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
 pub const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
@@ -446,8 +447,11 @@ pub struct IlkEntry {
     /// What this ILK is to that person (`ILK_WORK_ROLE_*`), `ILK_WORK_ROLE_NONE` for nobody.
     pub work_role: u8,
     pub _pad1: [u8; 7],
-    /// Kept for the person's document's hash (docs/digital-executive-v1-stage-2.md §1.2).
-    pub _reserved: [u8; 8],
+    /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): the first 8 bytes of its
+    /// SHA-256, its 16-hex prefix, which names its file in the people folder
+    /// (`person-<uuid>_<hash16>.json`); all zeros for none. SY.identity writes it from release
+    /// 2C; until then every entry holds zeros.
+    pub document_hash: [u8; 8],
 }
 
 #[repr(C)]
@@ -505,7 +509,7 @@ const _: () = {
     assert!(std::mem::offset_of!(IlkEntry, personality_hash) == 1120);
     assert!(std::mem::offset_of!(IlkEntry, works_for) == 1152);
     assert!(std::mem::offset_of!(IlkEntry, work_role) == 1168);
-    assert!(std::mem::offset_of!(IlkEntry, _reserved) == 1176);
+    assert!(std::mem::offset_of!(IlkEntry, document_hash) == 1176);
     assert!(std::mem::size_of::<IchEntry>() == 488);
     assert!(std::mem::size_of::<IchMappingEntry>() == 384);
 };
@@ -4042,7 +4046,7 @@ fn empty_ilk_entry() -> IlkEntry {
         works_for: [0u8; 16],
         work_role: 0,
         _pad1: [0u8; 7],
-        _reserved: [0u8; 8],
+        document_hash: [0u8; 8],
     }
 }
 
@@ -4567,7 +4571,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         writer.upsert_ilk_entry(ilk).expect("ilk upsert");
 
@@ -4658,7 +4662,10 @@ mod tests {
             ),
             ("works_for", std::mem::offset_of!(IlkEntry, works_for)),
             ("work_role", std::mem::offset_of!(IlkEntry, work_role)),
-            ("reserved", std::mem::offset_of!(IlkEntry, _reserved)),
+            (
+                "document_hash",
+                std::mem::offset_of!(IlkEntry, document_hash),
+            ),
         ];
         assert_eq!(
             fixture["offsets"].as_object().expect("offsets").len(),
@@ -4720,7 +4727,7 @@ mod tests {
         channel.flags = FLAG_ACTIVE;
         channel.works_for = laura;
         channel.work_role = ILK_WORK_ROLE_CHANNEL;
-        channel._reserved = [0xee; 8];
+        channel.document_hash = [0xee; 8];
         let mut alone = empty_ilk_entry();
         alone.ilk_id = [0x33u8; 16];
         alone.flags = FLAG_ACTIVE;
@@ -4740,8 +4747,8 @@ mod tests {
         assert_eq!(read.works_for, laura);
         assert_eq!(read.work_role, ILK_WORK_ROLE_CHANNEL);
         assert_eq!(ilk_work_role_name(read.work_role), Some("channel"));
-        // The reserved bytes stay apart from the relation.
-        assert_eq!(read._reserved, [0xee; 8]);
+        // The document's hash stays apart from the relation.
+        assert_eq!(read.document_hash, [0xee; 8]);
         let read = entry_of([0x33u8; 16]);
         assert_eq!(read.works_for, [0u8; 16]);
         assert_eq!(read.work_role, ILK_WORK_ROLE_NONE);
@@ -4913,7 +4920,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            document_hash: [0u8; 8],
         };
         let ich = IchEntry {
             ich_id: [5u8; 16],

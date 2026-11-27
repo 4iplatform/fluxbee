@@ -49,6 +49,9 @@ const (
 	ilkOffHandlerNode = 164  // [u8; 128]
 	ilkOffWorksFor    = 1152 // [u8; 16]: the person's ILK, zeros for nobody (version 7)
 	ilkOffWorkRole    = 1168 // u8: ilkWorkRole* (version 7)
+	// [u8; 8]: a person's document, the first 8 bytes of its SHA-256, zeros for none (version 7;
+	// SY.identity writes it from the Digital Executive's release 2C). This SDK does not read it.
+	ilkOffDocumentHash = 1176
 
 	// IlkEntry flags.
 	ilkFlagActive uint16 = 0x0001

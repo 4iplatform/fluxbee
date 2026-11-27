@@ -29685,6 +29685,7 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document_hash: None,
             }
         };
         let known = vec![
@@ -51023,6 +51024,7 @@ mod tests {
             is_virtual,
             works_for: None,
             work_role: None,
+            document_hash: None,
         };
         let held = [person(laura, true), person(ana, false)];
         ctx.ilk_by_id = Arc::new(move |hive: &str, ilk_id: &str| {

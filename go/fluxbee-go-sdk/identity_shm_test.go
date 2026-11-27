@@ -29,15 +29,16 @@ func TestIlkEntryLayoutMatchesTheFixtureSharedWithRust(t *testing.T) {
 	if fixture.IlkEntrySize != ilkEntrySize {
 		t.Fatalf("entry size: fixture %d, Go %d", fixture.IlkEntrySize, ilkEntrySize)
 	}
-	// The offsets this SDK reads.
+	// The offsets this SDK reads, and document_hash, which it names without reading.
 	for field, offset := range map[string]int{
-		"ilk_id":       ilkOffIlkID,
-		"ilk_type":     ilkOffType,
-		"flags":        ilkOffFlags,
-		"display_name": ilkOffDisplayName,
-		"handler_node": ilkOffHandlerNode,
-		"works_for":    ilkOffWorksFor,
-		"work_role":    ilkOffWorkRole,
+		"ilk_id":        ilkOffIlkID,
+		"ilk_type":      ilkOffType,
+		"flags":         ilkOffFlags,
+		"display_name":  ilkOffDisplayName,
+		"handler_node":  ilkOffHandlerNode,
+		"works_for":     ilkOffWorksFor,
+		"work_role":     ilkOffWorkRole,
+		"document_hash": ilkOffDocumentHash,
 	} {
 		got, ok := fixture.Offsets[field]
 		if !ok || got != offset {

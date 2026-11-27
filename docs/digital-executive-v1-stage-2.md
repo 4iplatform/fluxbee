@@ -112,8 +112,10 @@ The profile's JSON (design §10.4) becomes the person's document. Identity keeps
   `/var/lib/fluxbee/blob/people`, the agent-assets folder's sibling: the motherbee sends it, the
   workers receive it, ingress and egress never get it (design §10.5). The file is
   `person-<uuid>_<hash16>.json`.
-- **Its name in the SHM:** the 16-hex hash prefix in the `IlkEntry`'s 8 reserved bytes. The record
-  keeps the full hash and the document, and the SHM is rebuilt from it.
+- **Its name in the SHM:** the 16-hex hash prefix in the `IlkEntry`'s last 8 bytes, named
+  `document_hash` in 2B (the Rust SDK reads it as `IdentityIlkOption.document_hash`, `None` for
+  zeros) and written from 2C. The record keeps the full hash and the document, and the SHM is
+  rebuilt from it.
 - **Layer 2, inside Fluxbee, in this stage:**
 
   ```json

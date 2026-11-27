@@ -145,6 +145,12 @@ pub struct IdentityIlkOption {
     /// Absent on the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_role: Option<String>,
+    /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): the 16 lowercase hex of
+    /// the first 8 bytes of its SHA-256, which name its file in the people folder
+    /// (`person-<uuid>_<hash16>.json`); `None` for none. Written from release 2C. Absent on the
+    /// wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -361,7 +367,9 @@ struct IlkEntry {
     works_for: [u8; 16],
     work_role: u8,
     _pad1: [u8; 7],
-    _reserved: [u8; 8],
+    /// A person's document: the first 8 bytes of its SHA-256; all zeros for none
+    /// (`src/shm/mod.rs` `IlkEntry::document_hash`).
+    document_hash: [u8; 8],
 }
 
 // The layout of `src/shm/mod.rs`'s `IlkEntry`, which asserts the same numbers
@@ -371,7 +379,7 @@ const _: () = {
     assert!(std::mem::offset_of!(IlkEntry, personality_hash) == 1120);
     assert!(std::mem::offset_of!(IlkEntry, works_for) == 1152);
     assert!(std::mem::offset_of!(IlkEntry, work_role) == 1168);
-    assert!(std::mem::offset_of!(IlkEntry, _reserved) == 1176);
+    assert!(std::mem::offset_of!(IlkEntry, document_hash) == 1176);
 };
 
 #[repr(C)]
@@ -1449,8 +1457,12 @@ fn prefixed_uuid_from_bytes(prefix: &str, bytes: [u8; 16]) -> String {
 }
 
 fn sha256_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    bytes_to_hex(bytes)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
@@ -1512,7 +1524,16 @@ fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
             .any(|byte| *byte != 0)
             .then(|| prefixed_uuid_from_bytes("ilk", ilk.works_for)),
         work_role: work_role_from_shm(ilk.work_role).map(str::to_string),
+        document_hash: document_hash_from_shm(&ilk.document_hash),
     }
+}
+
+/// A person's document's hash prefix as 16 lowercase hex; `None` for all zeros (none).
+fn document_hash_from_shm(bytes: &[u8; 8]) -> Option<String> {
+    bytes
+        .iter()
+        .any(|byte| *byte != 0)
+        .then(|| bytes_to_hex(bytes))
 }
 
 /// A `work_role` byte's name; `None` for none (0) and for any byte no writer of this version
@@ -1829,7 +1850,10 @@ mod tests {
             ),
             ("works_for", std::mem::offset_of!(IlkEntry, works_for)),
             ("work_role", std::mem::offset_of!(IlkEntry, work_role)),
-            ("reserved", std::mem::offset_of!(IlkEntry, _reserved)),
+            (
+                "document_hash",
+                std::mem::offset_of!(IlkEntry, document_hash),
+            ),
         ];
         assert_eq!(
             fixture["offsets"].as_object().expect("offsets").len(),
@@ -1878,7 +1902,7 @@ mod tests {
             works_for,
             work_role,
             _pad1: [0; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let laura = Uuid::parse_str("5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a").unwrap();
         for (code, role) in [
@@ -1913,6 +1937,65 @@ mod tests {
         assert_eq!(unknown.work_role, None);
     }
 
+    /// A person's document's hash prefix (docs/digital-executive-v1-stage-2.md §1.2): its 8 bytes
+    /// read as their 16 lowercase hex, which name the document's file; all zeros read as none,
+    /// absent on the wire.
+    #[test]
+    fn a_persons_document_hash_reads_as_its_16_hex_and_zeros_as_none() {
+        let entry = |document_hash: [u8; 8]| IlkEntry {
+            ilk_id: Uuid::parse_str("5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_HUMAN,
+            registration_status: SHM_REG_STATUS_COMPLETE,
+            flags: FLAG_ACTIVE | ILK_FLAG_VIRTUAL,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Laura Gómez"),
+            handler_node: [0; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
+            created_at: 0,
+            updated_at: 0,
+            personality_hash: [0; 32],
+            works_for: [0; 16],
+            work_role: 0,
+            _pad1: [0; 7],
+            document_hash,
+        };
+
+        let laura = identity_ilk_option_from_entry(&entry([
+            0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0xff,
+        ]));
+        assert_eq!(laura.document_hash.as_deref(), Some("0a1b2c3d4e5f60ff"));
+        let json = serde_json::to_value(&laura).unwrap();
+        assert_eq!(json["document_hash"], serde_json::json!("0a1b2c3d4e5f60ff"));
+        let back: IdentityIlkOption = serde_json::from_value(json).unwrap();
+        assert_eq!(back, laura);
+        // One byte is enough to name a document.
+        let mut low = [0u8; 8];
+        low[7] = 1;
+        assert_eq!(
+            identity_ilk_option_from_entry(&entry(low))
+                .document_hash
+                .as_deref(),
+            Some("0000000000000001")
+        );
+
+        // None: zeros, absent on the wire, and so read back.
+        let none = identity_ilk_option_from_entry(&entry([0; 8]));
+        assert_eq!(none.document_hash, None);
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("document_hash").is_none());
+        let back: IdentityIlkOption = serde_json::from_value(json).unwrap();
+        assert_eq!(back, none);
+    }
+
     #[test]
     fn the_virtual_bit_reads_as_a_virtual_person_and_nothing_else() {
         let entry = |flags: u16| IlkEntry {
@@ -1939,7 +2022,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let person = identity_ilk_option_from_entry(&entry(FLAG_ACTIVE));
         let virtual_person = identity_ilk_option_from_entry(&entry(FLAG_ACTIVE | ILK_FLAG_VIRTUAL));
@@ -1985,7 +2068,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let mut skill_hashes = [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
         skill_hashes[0] = [0xcd; 32];
@@ -2015,7 +2098,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let ich_primary = IchEntry {
             ich_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010")
@@ -2100,7 +2183,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let ich = IchEntry {
             ich_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010")
@@ -2261,7 +2344,7 @@ mod tests {
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0; 8],
+            document_hash: [0; 8],
         };
         let layout = layout_identity(IdentityRegionLimits {
             max_ilks: 1,

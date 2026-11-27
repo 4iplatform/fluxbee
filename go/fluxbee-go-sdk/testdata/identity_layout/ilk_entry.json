@@ -1,5 +1,5 @@
 {
-  "_doc": "The identity SHM's IlkEntry (src/shm/mod.rs, #[repr(C)]) as its three copies read it: src/shm's tests, the Rust SDK's (crates/fluxbee_sdk/src/identity.rs) and the Go SDK's (identity_shm_test.go). Version 7 added works_for (the 16 bytes of the person's ILK, zeros for nobody) and work_role (one byte) before the 8 reserved bytes (docs/digital-executive-v1-stage-2.md §1.1). Change the layout here and in the three copies together.",
+  "_doc": "The identity SHM's IlkEntry (src/shm/mod.rs, #[repr(C)]) as its three copies read it: src/shm's tests, the Rust SDK's (crates/fluxbee_sdk/src/identity.rs) and the Go SDK's (identity_shm_test.go). Version 7 added works_for (the 16 bytes of the person's ILK, zeros for nobody) and work_role (one byte) (docs/digital-executive-v1-stage-2.md §1.1), and named its last 8 bytes document_hash: the first 8 bytes of the SHA-256 of a person's document, zeros for none, written from release 2C (§1.2). Change the layout here and in the three copies together.",
   "version": 7,
   "ilk_entry_size": 1184,
   "offsets": {
@@ -11,7 +11,7 @@
     "personality_hash": 1120,
     "works_for": 1152,
     "work_role": 1168,
-    "reserved": 1176
+    "document_hash": 1176
   },
   "work_roles": {
     "none": 0,

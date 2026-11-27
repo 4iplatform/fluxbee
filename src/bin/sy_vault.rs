@@ -3452,6 +3452,7 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document_hash: None,
         };
         let admin = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
         // A system node proves its derived ILK by its name alone: no SHM at boot.

@@ -5616,7 +5616,9 @@ fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, Ide
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            _reserved: [0u8; 8],
+            // A person's document's hash prefix: zeros, none, until release 2C keeps the document
+            // in the record (docs/digital-executive-v1-stage-2.md §1.2).
+            document_hash: [0u8; 8],
         };
         apply_definition_to_ilk_entry(&mut ilk_entry, &ilk.definition)?;
         apply_work_relation_to_ilk_entry(&mut ilk_entry, ilk);
@@ -5870,7 +5872,8 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         works_for: [0u8; 16],
         work_role: 0,
         _pad1: [0u8; 7],
-        _reserved: [0u8; 8],
+        // None until release 2C (docs/digital-executive-v1-stage-2.md §1.2).
+        document_hash: [0u8; 8],
     };
     apply_definition_to_ilk_entry(&mut entry, &ilk.definition)?;
     apply_work_relation_to_ilk_entry(&mut entry, ilk);

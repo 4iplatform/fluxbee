@@ -338,6 +338,7 @@ pub(crate) mod tests {
             is_virtual: false,
             works_for: works_for.map(str::to_string),
             work_role: work_role.map(str::to_string),
+            document_hash: None,
         }
     }
 

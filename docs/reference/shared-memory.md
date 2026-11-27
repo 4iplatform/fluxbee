@@ -326,8 +326,11 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `works_for`, the 16 bytes of the person's ILK the ILK works for (all zeros = nobody), and
   `work_role`, its role to that person (`ILK_WORK_ROLE_*`: 0 none, 1 conscious, 2 channel,
   3 agent), written together or not at all
-  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1); 8 reserved bytes
-  last. `flags` carries `FLAG_ACTIVE` and, for a virtual person, `ILK_FLAG_VIRTUAL` (0x0100).
+  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1); last,
+  `document_hash`, a person's document: the first 8 bytes of its SHA-256, its 16-hex prefix,
+  which names its file in the people folder (all zeros = none; §1.2), written by SY.identity from
+  the Digital Executive's release 2C and all zeros until then; the Rust SDK reads it as
+  `IdentityIlkOption.document_hash`. `flags` carries `FLAG_ACTIVE` and, for a virtual person, `ILK_FLAG_VIRTUAL` (0x0100).
 - `IchEntry`: `ich_id`, `ilk_id`, `tenant_id` (the channel's scope), `channel_type` (32 B) and
   `address` (256 B), both trimmed and lowercased, `flags`, `owner_l2_name`, `is_primary` (the first
   channel), `enabled`, `added_at`.

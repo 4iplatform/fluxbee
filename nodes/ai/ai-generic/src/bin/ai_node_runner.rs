@@ -7946,6 +7946,7 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document_hash: None,
         }
     }
 
