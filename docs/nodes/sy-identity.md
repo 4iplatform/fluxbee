@@ -363,7 +363,11 @@ sends no delta.
 Deleting is reversible; purging is physical and final (`delete_ilk`, `restore_ilk`, `purge_ilk`,
 `delete_tenant`, `restore_tenant`, `purge_tenant`):
 
-- `ILK_DELETE` marks the ILK (`deleted_at_ms`) and removes it from lookups and from the SHM.
+- `ILK_DELETE` marks the ILK (`deleted_at_ms`) and removes it from lookups and from the SHM. Its
+  reason is `direct`, or `node_retired` when an orchestrator sends `reason: "node_retired"`: its
+  retire mode marks the ILK of a node it took down ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md)
+  §9). Only a `SY.orchestrator@<hive>` may name `reason`, and only with that value; anything else
+  answers `INVALID_REQUEST` (`authorize_delete_reason`, `delete_ilk`). It is a mark like any other.
   Its rows stay, so its channel keys, node name and email stay reserved (`ILK_DELETED` for anyone
   who tries to take them). A second delete answers `already_deleted: true`. System ILKs are
   refused (`SYSTEM_ILK_PROTECTED`).

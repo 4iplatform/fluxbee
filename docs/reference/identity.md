@@ -285,6 +285,13 @@ Delete is a reversible mark. Purge is a separate, final step.
 
 **`ILK_DELETE`** (`delete_ilk`): marks the ILK (`deleted_at_ms`, reason `direct`).
 
+- `reason: "node_retired"` marks it `node_retired` instead: the orchestrator's retire mode, for the
+  ILK of a node it took down ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md)
+  §9). Only a `SY.orchestrator@<hive>` may name `reason` (`authorize_delete_reason`), and only with
+  that value (`delete_ilk`); anything else answers `INVALID_REQUEST`. `ILK_RESTORE` and `ILK_PURGE`
+  take no reason. The mark is the same as any other: the ILK keeps holding its node's name, and the
+  mark replicates as an `IlkUpsert`.
+
 - The ILK leaves the lookup and the SHM at once (`mark_ilk_unchecked`; `sync_identity_shm_mappings`
   skips marked ILKs).
 - Its rows stay, so its keys stay reserved. A channel answers `ILK_DELETED` on provision and add;

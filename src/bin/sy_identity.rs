@@ -440,6 +440,13 @@ struct IlkDeleteRequest {
     /// node identities are the orchestrator's (operator decision 2026-10-14, D4).
     #[serde(default)]
     ilk_type: Option<String>,
+    /// ILK_DELETE only: why the ILK is marked. Absent: `direct`, as every delete before it.
+    /// `node_retired` (`DELETED_REASON_NODE_RETIRED`) marks the ILK of a node the orchestrator's
+    /// retire mode took down (docs/digital-executive-v1-stage-2.md §9); only a `SY.orchestrator@`
+    /// sends it (`authorize_delete_reason`), and no other value is taken. ILK_RESTORE and ILK_PURGE
+    /// take none.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// ILK_SET_TENANT: charge an ILK to another tenant, its cost center (docs/ilk-tenant-model-v1.md).
@@ -526,11 +533,17 @@ const DELETED_REASON_DIRECT: &str = "direct";
 const RETIRED_REASON_PREFIX: &str = "retired: ";
 const RETIRED_REASON_NODE: &str = "retired: node";
 const RETIRED_REASON_HIVE: &str = "retired: hive";
+/// A node's ILK marked by the orchestrator's retire mode (docs/digital-executive-v1-stage-2.md §9):
+/// the node is gone and its ILK stays, marked, holding its node's name, to be restored with it. A
+/// mark like `direct`, never a purge; it does not start with `RETIRED_REASON_PREFIX`, which is a
+/// system ILK's.
+const DELETED_REASON_NODE_RETIRED: &str = "node_retired";
 /// identity_ilks.deleted_reason is a VARCHAR(16) (migration v2).
 const DELETED_REASON_MAX_LEN: usize = 16;
 const _: () = assert!(
     RETIRED_REASON_NODE.len() <= DELETED_REASON_MAX_LEN
         && RETIRED_REASON_HIVE.len() <= DELETED_REASON_MAX_LEN
+        && DELETED_REASON_NODE_RETIRED.len() <= DELETED_REASON_MAX_LEN
 );
 
 /// Everything a lifecycle op (mark / restore / purge, ilk or tenant) changed, so the handler
@@ -2623,17 +2636,30 @@ impl IdentityStore {
         removed_aliases
     }
 
-    /// ILK_DELETE: MARK (reversible). Idempotent: an already-marked ilk answers ok.
+    /// ILK_DELETE: MARK (reversible). Idempotent: an already-marked ilk answers ok, and keeps the
+    /// reason it was marked with. The reason is `direct`, or with `reason: "node_retired"`, which
+    /// only an orchestrator sends (`authorize_delete_reason`), `node_retired`; any other value is
+    /// `INVALID_REQUEST`.
     fn delete_ilk(
         &mut self,
         req: IlkDeleteRequest,
         now_ms: u64,
     ) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        let reason = match req.reason.as_deref() {
+            None => DELETED_REASON_DIRECT,
+            Some(reason) if reason == DELETED_REASON_NODE_RETIRED => DELETED_REASON_NODE_RETIRED,
+            Some(_) => {
+                return Err(lifecycle_error(
+                    "INVALID_REQUEST",
+                    "reason takes only node_retired, or is left out",
+                ))
+            }
+        };
         self.check_ilk_markable(&req.ilk_id)?;
         self.check_ilk_tenant_scope(&req)?;
         let mut changes = LifecycleChanges::default();
-        let marked = self.mark_ilk_unchecked(&req.ilk_id, DELETED_REASON_DIRECT, now_ms);
+        let marked = self.mark_ilk_unchecked(&req.ilk_id, reason, now_ms);
         let already_deleted = marked.is_none();
         changes.ilks.extend(marked);
         Ok((
@@ -2653,6 +2679,12 @@ impl IdentityStore {
     /// in its tenant, D6). A retired system ILK comes back only with its node (FINDINGS A-191).
     fn restore_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        if req.reason.is_some() {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "ILK_RESTORE takes no reason",
+            ));
+        }
         self.check_ilk_tenant_scope(&req)?;
         let entry = self.check_ilk_markable(&req.ilk_id)?;
         if entry.deleted_at_ms.is_none() {
@@ -2680,6 +2712,12 @@ impl IdentityStore {
     /// is retired (`check_ilk_purgeable`, FINDINGS A-191).
     fn purge_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        if req.reason.is_some() {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "ILK_PURGE takes no reason",
+            ));
+        }
         self.check_ilk_tenant_scope(&req)?;
         let entry = self.check_ilk_purgeable(&req.ilk_id)?;
         if entry.deleted_at_ms.is_none() {
@@ -4364,6 +4402,16 @@ impl IdentityRuntime {
                 "node_name": node_name,
                 "state": identity_state_label(self.is_primary, control_state),
             });
+            send_system_response(sender, msg, response_name(action), payload).await?;
+            return Ok(Vec::new());
+        }
+        if let Err(payload) = authorize_delete_reason(action, &msg.payload, src_l2_name) {
+            tracing::warn!(
+                action,
+                trace_id = %trace_id,
+                src_l2_name = src_l2_name.unwrap_or("<unknown>"),
+                "identity refused a delete reason from a sender other than an orchestrator"
+            );
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
         }
@@ -8393,6 +8441,31 @@ fn authorize_ich_enabled_mutation(
 /// An ILK that does not exist passes, and its handler answers as before (`ILK_NOT_FOUND`); an id
 /// in another spelling than the canonical one names none of its nodes. Every other caller passes:
 /// the table in `IdentityRuntime::new` already admitted it.
+/// ILK_DELETE's `reason` is the orchestrator's alone (docs/digital-executive-v1-stage-2.md §9): its
+/// retire mode marks a node's ILK `node_retired`. From any other sender a request that names
+/// `reason` at all is refused with `INVALID_REQUEST`, so an operator's or SY.admin's delete stays
+/// `direct`. Its value is `delete_ilk`'s to check.
+fn authorize_delete_reason(
+    action: &str,
+    payload: &Value,
+    src_l2_name: Option<&str>,
+) -> Result<(), Value> {
+    if action != MSG_ILK_DELETE || payload.get("reason").is_none() {
+        return Ok(());
+    }
+    let from_an_orchestrator = src_l2_name
+        .map(str::trim)
+        .and_then(|caller| caller.strip_prefix("SY.orchestrator@"))
+        .is_some_and(|hive| !hive.is_empty());
+    if from_an_orchestrator {
+        return Ok(());
+    }
+    Err(error_payload(
+        "INVALID_REQUEST",
+        "ILK_DELETE takes reason from SY.orchestrator@<hive> only",
+    ))
+}
+
 fn authorize_orchestrator_ilk_scope(
     store: &IdentityStore,
     action: &str,
@@ -11933,6 +12006,7 @@ mod tests {
                     ilk_id: ilk_id.clone(),
                     tenant_id: None,
                     ilk_type: None,
+                    reason: None,
                 },
                 1_000,
             )
@@ -11951,6 +12025,7 @@ mod tests {
                 ilk_id: ilk_id.clone(),
                 tenant_id: None,
                 ilk_type: None,
+                reason: None,
             })
             .expect("purge ok");
         assert_eq!(ok.get("status").and_then(Value::as_str), Some("ok"));
@@ -12081,6 +12156,7 @@ mod tests {
                     ilk_id: ilk_id.clone(),
                     tenant_id: None,
                     ilk_type: None,
+                    reason: None,
                 },
                 1,
             )
@@ -12098,6 +12174,7 @@ mod tests {
                     ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
                     tenant_id: None,
                     ilk_type: None,
+                    reason: None,
                 },
                 1,
             )
@@ -12826,6 +12903,7 @@ mod tests {
             ilk_id: id.to_string(),
             tenant_id: None,
             ilk_type: None,
+            reason: None,
         }
     }
 
@@ -13107,6 +13185,7 @@ mod tests {
             ilk_id: ilk.clone(),
             tenant_id: Some("tnt:99999999-9999-9999-9999-999999999999".to_string()),
             ilk_type: None,
+            reason: None,
         };
         assert_eq!(
             store.delete_ilk(foreign, 1).expect_err("other tenant"),
@@ -13117,6 +13196,7 @@ mod tests {
             ilk_id: ilk.clone(),
             tenant_id: Some(LC_TENANT.to_string()),
             ilk_type: None,
+            reason: None,
         };
         store.delete_ilk(own, 1).expect("own tenant");
         assert!(store.ilks[&ilk].deleted_at_ms.is_some());
@@ -15067,6 +15147,7 @@ mod tests {
             ilk_id: ilk_id.to_string(),
             tenant_id: None,
             ilk_type: Some("human".to_string()),
+            reason: None,
         };
         assert_eq!(
             store.delete_ilk(people_only(&node.ilk_id), 1).unwrap_err(),
@@ -18973,5 +19054,150 @@ mod tests {
                 "{action}"
             );
         }
+    }
+
+    // ---- ILK_DELETE's reason: the orchestrator's retire mode (docs/digital-executive-v1-stage-2.md §9) ----
+
+    fn nr_delete(ilk_id: &str, reason: Option<&str>) -> IlkDeleteRequest {
+        IlkDeleteRequest {
+            ilk_id: ilk_id.to_string(),
+            tenant_id: None,
+            ilk_type: None,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    /// The orchestrator's retire mark records `node_retired`, replicates as every mark (its
+    /// record is the IlkUpsert the handler sends) and keeps the ILK holding its node's name; no
+    /// reason stays `direct`; any other value is refused and marks nothing.
+    #[test]
+    fn an_orchestrators_retire_mark_records_node_retired() {
+        let mut store = IdentityStore::with_default_tenant();
+        let retired = t_ilk("AI.retired@worker1");
+        let deleted = t_ilk("AI.deleted@worker1");
+        store
+            .ilks
+            .insert(retired.clone(), ilk_for("AI.retired@worker1", &retired));
+        store
+            .ilks
+            .insert(deleted.clone(), ilk_for("AI.deleted@worker1", &deleted));
+
+        let before = store.ilks.clone();
+        for other in ["retired", "direct", "NODE_RETIRED", "node_retired ", ""] {
+            let (code, _) = ed_refusal(
+                store
+                    .delete_ilk(nr_delete(&retired, Some(other)), 7)
+                    .expect_err("another value"),
+            );
+            assert_eq!(code, "INVALID_REQUEST", "{other:?}");
+        }
+        assert_eq!(store.ilks, before);
+
+        let (ok, changes) = store
+            .delete_ilk(nr_delete(&retired, Some("node_retired")), 7)
+            .expect("the retire mark");
+        assert_eq!(ok["state"], json!("deleted"));
+        assert_eq!(ok["already_deleted"], json!(false));
+        let record = &store.ilks[&retired];
+        assert_eq!(record.deleted_at_ms, Some(7));
+        assert_eq!(record.deleted_reason.as_deref(), Some("node_retired"));
+        assert_eq!(changes.ilks.len(), 1);
+        assert_eq!(
+            changes.ilks[0].deleted_reason.as_deref(),
+            Some(DELETED_REASON_NODE_RETIRED)
+        );
+        assert!(changes.purged_ilks.is_empty());
+        // A mark, never a purge: the ILK holds its node's name, and is no retired system ILK.
+        assert_eq!(
+            store
+                .deleted_ilk_holding_identification("node_name", "AI.retired@worker1")
+                .as_deref(),
+            Some(retired.as_str())
+        );
+        assert!(!is_retired_system_ilk(record));
+        // Again: already marked, the reason it was marked with stays.
+        let (again, changes) = store
+            .delete_ilk(nr_delete(&retired, Some("node_retired")), 9)
+            .expect("again");
+        assert_eq!(again["already_deleted"], json!(true));
+        assert!(changes.ilks.is_empty());
+        assert_eq!(store.ilks[&retired].deleted_at_ms, Some(7));
+
+        // No reason: `direct`, as before.
+        store
+            .delete_ilk(nr_delete(&deleted, None), 8)
+            .expect("a delete");
+        assert_eq!(
+            store.ilks[&deleted].deleted_reason.as_deref(),
+            Some(DELETED_REASON_DIRECT)
+        );
+
+        // ILK_RESTORE and ILK_PURGE take no reason; the plain restore brings it back.
+        for refused in [
+            store.restore_ilk(nr_delete(&retired, Some("node_retired"))),
+            store.purge_ilk(nr_delete(&retired, Some("node_retired"))),
+        ] {
+            let (code, _) = ed_refusal(refused.expect_err("no reason"));
+            assert_eq!(code, "INVALID_REQUEST");
+        }
+        assert!(store.ilks.contains_key(&retired));
+        store
+            .restore_ilk(nr_delete(&retired, None))
+            .expect("restored");
+        assert_eq!(store.ilks[&retired].deleted_reason, None);
+
+        // On the wire, `reason` is the only new key.
+        let req: IlkDeleteRequest =
+            serde_json::from_value(json!({"ilk_id": retired, "reason": "node_retired"}))
+                .expect("a retire mark");
+        assert_eq!(req.reason.as_deref(), Some("node_retired"));
+        assert!(serde_json::from_value::<IlkDeleteRequest>(
+            json!({"ilk_id": retired, "deleted_reason": "node_retired"})
+        )
+        .is_err());
+    }
+
+    /// `reason` comes from an orchestrator only: from any other sender, an ILK_DELETE that names
+    /// it is refused, whatever its value; without it, every sender's delete passes as before.
+    #[test]
+    fn only_an_orchestrator_names_a_delete_reason() {
+        let retire = json!({"ilk_id": t_ilk("AI.retired@worker1"), "reason": "node_retired"});
+        for caller in ["SY.orchestrator@worker1", "SY.orchestrator@motherbee"] {
+            assert!(
+                authorize_delete_reason(MSG_ILK_DELETE, &retire, Some(caller)).is_ok(),
+                "{caller}"
+            );
+        }
+        for caller in [
+            None,
+            Some("SY.admin@motherbee"),
+            Some("SY.identity@motherbee"),
+            Some("SY.orchestrator@"),
+            Some("SY.orchestrator.relay@worker1"),
+            Some("IO.cloud@motherbee"),
+            Some("AI.ed4qm7k2xa@worker1"),
+        ] {
+            for payload in [
+                retire.clone(),
+                json!({"ilk_id": t_ilk("AI.retired@worker1"), "reason": "direct"}),
+                json!({"ilk_id": t_ilk("AI.retired@worker1"), "reason": null}),
+            ] {
+                let refusal = authorize_delete_reason(MSG_ILK_DELETE, &payload, caller)
+                    .expect_err("not an orchestrator");
+                assert_eq!(
+                    refusal["error_code"],
+                    json!("INVALID_REQUEST"),
+                    "{caller:?}"
+                );
+            }
+        }
+        // Without a reason, and for any other message, nothing changes.
+        let plain = json!({"ilk_id": t_ilk("AI.retired@worker1")});
+        for caller in [Some("SY.admin@motherbee"), Some("SY.orchestrator@worker1")] {
+            assert!(authorize_delete_reason(MSG_ILK_DELETE, &plain, caller).is_ok());
+        }
+        assert!(
+            authorize_delete_reason(MSG_ILK_RESTORE, &retire, Some("SY.admin@motherbee")).is_ok()
+        );
     }
 }
