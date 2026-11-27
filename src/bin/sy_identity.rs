@@ -181,9 +181,49 @@ const MSG_ILK_RETIRE_HIVE_RESPONSE: &str = "ILK_RETIRE_HIVE_RESPONSE";
 // born only this way, on the operator's SY.admin's word.
 const MSG_ILK_CREATE_VIRTUAL: &str = "ILK_CREATE_VIRTUAL";
 const MSG_ILK_CREATE_VIRTUAL_RESPONSE: &str = "ILK_CREATE_VIRTUAL_RESPONSE";
+// The Digital Executive's stage 2 (docs/digital-executive-v1-stage-2.md §1.1, §1.2): whom a node's
+// ILK works for, and a person's document, each set on the operator's SY.admin's word alone.
+const MSG_ILK_SET_WORKS_FOR: &str = "ILK_SET_WORKS_FOR";
+const MSG_ILK_SET_WORKS_FOR_RESPONSE: &str = "ILK_SET_WORKS_FOR_RESPONSE";
+const MSG_ILK_SET_DOCUMENT: &str = "ILK_SET_DOCUMENT";
+const MSG_ILK_SET_DOCUMENT_RESPONSE: &str = "ILK_SET_DOCUMENT_RESPONSE";
 /// What a virtual person refuses (docs/digital-executive-v1-design.md §3.1): a merge, a channel
 /// added, a Fluxbee Cloud account. The detail names the action refused (`virtual_refusal`).
 const ILK_VIRTUAL: &str = "ILK_VIRTUAL";
+/// ILK_CREATE_VIRTUAL with an `ilk_id` another ILK holds, or an alias names, or a virtual person of
+/// another tenant or with other names (docs/digital-executive-v1-stage-2.md §1.3).
+const ILK_ID_TAKEN: &str = "ILK_ID_TAKEN";
+/// ILK_SET_WORKS_FOR naming a person that is not there, or is marked.
+const PERSON_NOT_FOUND: &str = "PERSON_NOT_FOUND";
+/// ILK_SET_WORKS_FOR naming a person of another tenant than the ILK's.
+const TENANT_MISMATCH: &str = "TENANT_MISMATCH";
+/// A person's document failed to reach the people folder: nothing changed.
+const DOCUMENT_WRITE_FAILED: &str = "DOCUMENT_WRITE_FAILED";
+/// A person's document (docs/digital-executive-v1-stage-2.md §1.2): its schema, its size once
+/// serialized canonically, and the top-level keys it may hold. Layer 2 (`display_name` through
+/// `channels`), the profile's room (`position`, `reports_to`, `responsibilities`) and layer 1's
+/// (`public`).
+const PERSON_DOCUMENT_SCHEMA: u64 = 1;
+const PERSON_DOCUMENT_MAX_BYTES: usize = 64 * 1024;
+const PERSON_DOCUMENT_KEYS: [&str; 10] = [
+    "schema",
+    "display_name",
+    "company_name",
+    "short_id",
+    "personality",
+    "channels",
+    "position",
+    "reports_to",
+    "responsibilities",
+    "public",
+];
+/// The people folder (`fluxbee-dist-people`): `<blob_root>/people`, the agent-assets folder's
+/// sibling, which the motherbee's SY.identity writes and Syncthing sends to the workers. Each
+/// person keeps its newest three files there.
+const PEOPLE_DIR_NAME: &str = "people";
+const PERSON_DOCUMENT_VERSIONS_KEPT: usize = 3;
+/// The blob root when `hive.yaml` names no `blob.path`: the orchestrator's and SY.admin's default.
+const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityDbSecretSource {
@@ -233,6 +273,28 @@ struct HiveFile {
     government: Option<GovernmentSection>,
     #[serde(default)]
     identity: Option<IdentitySection>,
+    /// The blob root (`blob.path`), under which the primary writes the people folder.
+    #[serde(default)]
+    blob: Option<BlobSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSection {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// The blob root as SY.orchestrator and SY.admin read it: `hive.yaml`'s `blob.path`, else
+/// `/var/lib/fluxbee/blob`. The orchestrator lays its Syncthing folders out under the same root, so
+/// the people folder SY.identity writes is the one it shares.
+fn configured_blob_root(hive: &HiveFile) -> PathBuf {
+    hive.blob
+        .as_ref()
+        .and_then(|blob| blob.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_BLOB_ROOT))
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,6 +469,8 @@ struct IlkRetireHiveRequest {
 
 /// ILK_CREATE_VIRTUAL: a Digital Executive's ILK, a person with the `virtual` flag, charged to
 /// `tenant_id` (docs/digital-executive-v1-stage-1.md §1.2). Born with its company and no channel.
+/// With `ilk_id` (`ilk:<uuid>`, canonical) it is born with that id, and a call repeated with the same
+/// values answers the same person (docs/digital-executive-v1-stage-2.md §1.3).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IlkCreateVirtualRequest {
@@ -414,6 +478,41 @@ struct IlkCreateVirtualRequest {
     display_name: String,
     #[serde(default)]
     company_name: Option<String>,
+    #[serde(default)]
+    ilk_id: Option<String>,
+}
+
+/// ILK_SET_WORKS_FOR: whom a node's ILK works for, and its role (docs/digital-executive-v1-stage-2.md
+/// §1.1). `works_for` and `work_role` are both always named: a person and a role set it, two nulls
+/// clear it, so a request that forgets one of them never clears a relation by omission.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkSetWorksForRequest {
+    ilk_id: String,
+    #[serde(deserialize_with = "present_or_null")]
+    works_for: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
+    work_role: Option<String>,
+    /// Why, for the log: SY.deploy's step, or the operator's word.
+    #[serde(default)]
+    change_reason: Option<String>,
+}
+
+/// ILK_SET_DOCUMENT: a person's document (docs/digital-executive-v1-stage-2.md §1.2).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkSetDocumentRequest {
+    ilk_id: String,
+    document: Value,
+}
+
+/// A key that must be there, with a string or `null`: with `deserialize_with` and no `default`,
+/// serde refuses the request when the key is missing, where a plain `Option` would read it as null.
+fn present_or_null<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 /// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason, 16 characters at most).
@@ -574,13 +673,24 @@ struct IlkRecord {
     /// The person this ILK works for, its ILK (`ilk:<uuid>`), and the ILK's role to that person:
     /// `conscious`, `channel` or `agent` (docs/digital-executive-v1-stage-2.md §1.1). Replicated
     /// from the primary like any field, and projected into the identity SHM (version 7). `None` for
-    /// an ILK that works for nobody, which is every ILK until `ILK_SET_WORKS_FOR` sets them. Absent
-    /// on the wire when `None`, so a record or a delta from a binary that predates them reads as
+    /// an ILK that works for nobody, until `ILK_SET_WORKS_FOR` sets them on the primary. Absent on
+    /// the wire when `None`, so a record or a delta from a binary that predates them reads as
     /// working for nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     works_for: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     work_role: Option<String>,
+    /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): a JSON object of
+    /// `"schema": 1`, set by `ILK_SET_DOCUMENT` on the primary, and `document_hash`, the SHA-256
+    /// (64 lowercase hex) of its canonical bytes (`check_person_document`), which are the bytes of
+    /// its file in the people folder (`person_document_file_name`). The identity SHM carries the
+    /// hash's first 8 bytes. `None` for an ILK without one; absent on the wire when `None`, so a
+    /// record or a delta from a binary that predates them reads as having none. Replicated from the
+    /// primary like any field, and never changed by a replica's push (`with_primary_document`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -876,8 +986,9 @@ impl IdentityStore {
                     "deleted_at_ms": ilk.deleted_at_ms,
                     "deleted_reason": ilk.deleted_reason,
                 }))
-                // `virtual` only on a virtual person's row, and whom it works for only on the row
-                // of an ILK that works for someone, as its record carries them.
+                // `virtual` only on a virtual person's row, whom it works for only on the row of an
+                // ILK that works for someone, and a person's document's hash only on the row of a
+                // person who has one, as its record carries them. The document itself is ILK_GET's.
                 .map(|mut row| {
                     if ilk.is_virtual {
                         row["virtual"] = Value::Bool(true);
@@ -887,6 +998,9 @@ impl IdentityStore {
                     }
                     if let Some(work_role) = &ilk.work_role {
                         row["work_role"] = json!(work_role);
+                    }
+                    if let Some(document_hash) = &ilk.document_hash {
+                        row["document_hash"] = json!(document_hash);
                     }
                     row
                 })
@@ -1114,6 +1228,8 @@ impl IdentityStore {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             };
             let needs_upsert = self
                 .ilks
@@ -1305,6 +1421,8 @@ impl IdentityStore {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document: None,
+            document_hash: None,
         };
         self.ich_lookup.insert(key, ilk_id.clone());
         self.ilks.insert(ilk_id.clone(), ilk);
@@ -1338,8 +1456,18 @@ impl IdentityStore {
     /// ILK_CREATE_VIRTUAL: a Digital Executive's ILK (docs/digital-executive-v1-stage-1.md §1.2). A
     /// person (`human`, `complete`) with the `virtual` flag, charged to `tenant_id`, born with its
     /// name and company and no channel. The tenant must take registrations, as ILK_REGISTER's does,
-    /// and is never the root one, which holds no person. Answers `{ilk_id, tenant_id, virtual}`.
-    fn create_virtual_person(&mut self, req: IlkCreateVirtualRequest) -> Result<Value, String> {
+    /// and is never the root one, which holds no person. Answers `{ilk_id, tenant_id, virtual}`, and
+    /// whether it created the person.
+    ///
+    /// With `ilk_id` the person is born with that id, and the call is idempotent
+    /// (docs/digital-executive-v1-stage-2.md §1.3): an active virtual person with that id, of the same
+    /// tenant and with the same names, answers the same, created nothing; any other holder of the id
+    /// (another tenant's person, other names, a person who is not virtual, a node, a marked ILK, an
+    /// alias of a merge) answers `ILK_ID_TAKEN`, and the request's values are not repeated.
+    fn create_virtual_person(
+        &mut self,
+        req: IlkCreateVirtualRequest,
+    ) -> Result<(Value, bool), String> {
         let tenant_id = req.tenant_id.trim().to_string();
         let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
         let display_name = req.display_name.trim();
@@ -1368,6 +1496,13 @@ impl IdentityStore {
                 "company_name must be at most 128 bytes",
             ));
         }
+        let requested_ilk_id = req.ilk_id.as_deref().map(str::trim);
+        if requested_ilk_id.is_some_and(|ilk_id| !is_canonical_id(ilk_id, "ilk")) {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "ilk_id must be ilk:<uuid>, the uuid lowercase and hyphenated",
+            ));
+        }
         let Some(tenant) = self.tenants.get(&tenant_id) else {
             return Err("INVALID_TENANT".to_string());
         };
@@ -1383,7 +1518,43 @@ impl IdentityStore {
         if tenant_id == DEFAULT_ROOT_TENANT_ID {
             return Err("TENANT_ROOT_NOT_REGISTRABLE".to_string());
         }
-        let ilk_id = format!("ilk:{}", Uuid::new_v4());
+        let answer = |ilk_id: &str| {
+            json!({
+                "status": "ok",
+                "ilk_id": ilk_id,
+                "tenant_id": tenant_id,
+                "virtual": true,
+            })
+        };
+        let ilk_id = match requested_ilk_id {
+            Some(ilk_id) => {
+                if let Some(holder) = self.ilks.get(ilk_id) {
+                    let same_person = holder.is_virtual
+                        && holder.deleted_at_ms.is_none()
+                        && holder.ilk_type == "human"
+                        && holder.tenant_id == tenant_id
+                        && identification_str(&holder.identification, "display_name")
+                            == Some(display_name)
+                        && identification_str(&holder.identification, "company_name")
+                            == company_name;
+                    if same_person {
+                        return Ok((answer(ilk_id), false));
+                    }
+                    return Err(lifecycle_error(
+                        ILK_ID_TAKEN,
+                        "another ILK holds the ilk_id, or a virtual person of another tenant or with other names",
+                    ));
+                }
+                if self.aliases.contains_key(ilk_id) {
+                    return Err(lifecycle_error(
+                        ILK_ID_TAKEN,
+                        "the ilk_id is a merged ILK's, which an alias still names",
+                    ));
+                }
+                ilk_id.to_string()
+            }
+            None => format!("ilk:{}", Uuid::new_v4()),
+        };
         let mut identification = Map::new();
         identification.insert("display_name".to_string(), json!(display_name));
         if let Some(company_name) = company_name {
@@ -1404,14 +1575,11 @@ impl IdentityStore {
                 is_virtual: true,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
-        Ok(json!({
-            "status": "ok",
-            "ilk_id": ilk_id,
-            "tenant_id": tenant_id,
-            "virtual": true,
-        }))
+        Ok((answer(&ilk_id), true))
     }
 
     fn register_ilk(
@@ -1553,6 +1721,8 @@ impl IdentityStore {
                         is_virtual: false,
                         works_for: None,
                         work_role: None,
+                        document: None,
+                        document_hash: None,
                     },
                 );
             }
@@ -1898,6 +2068,137 @@ impl IdentityStore {
             "ilk_id": req.ilk_id,
             "definition": normalized,
         }))
+    }
+
+    /// ILK_SET_WORKS_FOR (docs/digital-executive-v1-stage-2.md §1.1): whom a node's ILK works for,
+    /// and its role. The ILK is an active `agent`, a node's (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`). A
+    /// person and a role set it: the person is an active `human`, real or virtual, of the ILK's own
+    /// tenant (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`). Two nulls clear it. A role
+    /// that is not `conscious`, `channel` or `agent`, a person without a role and a role without a
+    /// person answer `INVALID_REQUEST`. It checks everything before it changes anything. Answers
+    /// `{ilk_id, works_for, work_role}`, and whether the record changed: the same relation again
+    /// changes nothing.
+    fn set_ilk_works_for(&mut self, req: &IlkSetWorksForRequest) -> Result<(Value, bool), String> {
+        let ilk_id = req.ilk_id.as_str();
+        let _ = parse_prefixed_uuid(ilk_id, "ilk")?;
+        let works_for = req.works_for.as_deref();
+        let work_role = req.work_role.as_deref();
+        if work_role.is_some_and(|role| ilk_work_role_code(role).is_none()) {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "work_role must be conscious, channel, agent or null",
+            ));
+        }
+        match (works_for, work_role) {
+            (Some(_), None) => {
+                return Err(lifecycle_error(
+                    "INVALID_REQUEST",
+                    "works_for names a person, so work_role must name the ILK's role to it",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(lifecycle_error(
+                    "INVALID_REQUEST",
+                    "work_role needs works_for, the person it is a role to",
+                ))
+            }
+            _ => {}
+        }
+        if works_for.is_some_and(|person| !is_canonical_id(person, "ilk")) {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "works_for must be ilk:<uuid>, the uuid lowercase and hyphenated, or null",
+            ));
+        }
+        let target = match self.ilks.get(ilk_id) {
+            Some(target) if target.deleted_at_ms.is_none() => target,
+            _ => return Err("ILK_NOT_FOUND".to_string()),
+        };
+        if target.ilk_type != "agent" {
+            return Err(lifecycle_error(
+                "INVALID_ILK_TYPE",
+                "only a node's ILK (agent) works for a person",
+            ));
+        }
+        if let Some(person_id) = works_for {
+            let person = match self.ilks.get(person_id) {
+                Some(person) if person.deleted_at_ms.is_none() => person,
+                _ => {
+                    return Err(lifecycle_error(
+                        PERSON_NOT_FOUND,
+                        "works_for names no active ILK",
+                    ))
+                }
+            };
+            if person.ilk_type != "human" {
+                return Err(lifecycle_error(
+                    "INVALID_ILK_TYPE",
+                    "works_for must name a person (human), real or virtual",
+                ));
+            }
+            if person.tenant_id != target.tenant_id {
+                return Err(lifecycle_error(
+                    TENANT_MISMATCH,
+                    "works_for names a person of another tenant than the ILK's",
+                ));
+            }
+        }
+        let changed =
+            target.works_for.as_deref() != works_for || target.work_role.as_deref() != work_role;
+        if changed {
+            if let Some(target) = self.ilks.get_mut(ilk_id) {
+                target.works_for = works_for.map(str::to_string);
+                target.work_role = work_role.map(str::to_string);
+            }
+        }
+        Ok((
+            json!({
+                "status": "ok",
+                "ilk_id": ilk_id,
+                "works_for": works_for,
+                "work_role": work_role,
+            }),
+            changed,
+        ))
+    }
+
+    /// ILK_SET_DOCUMENT's checks (docs/digital-executive-v1-stage-2.md §1.2), which change nothing:
+    /// the ILK is an active `human`, real or virtual (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`), and its
+    /// document passes `check_person_document`. The document's canonical value, bytes and hash, and
+    /// whether it is a new version: the same document again (the same hash) is none.
+    fn prepare_person_document(
+        &self,
+        req: IlkSetDocumentRequest,
+    ) -> Result<PersonDocument, String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        let person = match self.ilks.get(&req.ilk_id) {
+            Some(person) if person.deleted_at_ms.is_none() => person,
+            _ => return Err("ILK_NOT_FOUND".to_string()),
+        };
+        if person.ilk_type != "human" {
+            return Err(lifecycle_error(
+                "INVALID_ILK_TYPE",
+                "only a person (human), real or virtual, has a document",
+            ));
+        }
+        let (document, bytes) = check_person_document(&req.document)?;
+        let hash = sha256_hex_of(&bytes);
+        let changed = person.document_hash.as_deref() != Some(hash.as_str());
+        Ok(PersonDocument {
+            ilk_id: req.ilk_id,
+            document,
+            bytes,
+            hash,
+            changed,
+        })
+    }
+
+    /// Writes a checked document into its person's record (`prepare_person_document`).
+    fn apply_person_document(&mut self, document: &PersonDocument) {
+        if let Some(person) = self.ilks.get_mut(&document.ilk_id) {
+            person.document = Some(document.document.clone());
+            person.document_hash = Some(document.hash.clone());
+        }
     }
 
     // ---- lifecycle: active -> deleted (marked: reversible, hidden, keys RESERVED) -> purged ----
@@ -3220,7 +3521,7 @@ impl IdentityStore {
             .collect();
         let incoming: Vec<IlkRecord> = incoming
             .into_iter()
-            .map(|ilk| with_primary_work_relation(ilk, self))
+            .map(|ilk| with_primary_owned_fields(ilk, self))
             .collect();
         let mut deltas = Vec::new();
         for ilk in incoming {
@@ -3319,6 +3620,228 @@ fn with_primary_work_relation(mut incoming: IlkRecord, store: &IdentityStore) ->
     incoming
 }
 
+/// A person's document is the primary's to change, by ILK_SET_DOCUMENT alone
+/// (docs/digital-executive-v1-stage-2.md §1.2), as whom an ILK works for is
+/// (`with_primary_work_relation`): a replica-pushed record takes the primary's document and hash, or
+/// none for an ILK the primary does not hold yet, whatever it carries. A replica pushes only its own
+/// hive's ILKs, its nodes', which have no document, so this is a net.
+fn with_primary_document(mut incoming: IlkRecord, store: &IdentityStore) -> IlkRecord {
+    let existing = store.ilks.get(&incoming.ilk_id);
+    incoming.document = existing.and_then(|existing| existing.document.clone());
+    incoming.document_hash = existing.and_then(|existing| existing.document_hash.clone());
+    incoming
+}
+
+/// Every field only the primary changes, kept on a replica-pushed record: whom it works for and its
+/// role, and a person's document.
+fn with_primary_owned_fields(incoming: IlkRecord, store: &IdentityStore) -> IlkRecord {
+    with_primary_document(with_primary_work_relation(incoming, store), store)
+}
+
+/// A person's document as ILK_SET_DOCUMENT checked it (`IdentityStore::prepare_person_document`).
+#[derive(Debug, Clone)]
+struct PersonDocument {
+    ilk_id: String,
+    /// The document's canonical form, which the record keeps.
+    document: Value,
+    /// Its canonical bytes (`canonical_document_bytes`), its file's content.
+    bytes: Vec<u8>,
+    /// The SHA-256 of `bytes`, 64 lowercase hex.
+    hash: String,
+    /// The record holds another document, or none: this one is a new version.
+    changed: bool,
+}
+
+impl PersonDocument {
+    fn file_name(&self) -> Option<String> {
+        person_document_file_name(&self.ilk_id, &self.hash)
+    }
+}
+
+/// A person's document's checks (docs/digital-executive-v1-stage-2.md §1.2): a JSON object, of
+/// `"schema": 1`, with top-level keys from `PERSON_DOCUMENT_KEYS` only, at most 64 KiB in its
+/// canonical bytes. Each refusal is `INVALID_REQUEST` and names what the document takes, never a
+/// value it holds (FINDINGS A-232). Answers its canonical form and its canonical bytes:
+/// serde_json's compact serialization (`to_vec`, no spaces) of the canonical form (`canonical_json`,
+/// every object's keys sorted by their bytes, at every depth). Their SHA-256 is the document's hash,
+/// and they are its file's content.
+fn check_person_document(document: &Value) -> Result<(Value, Vec<u8>), String> {
+    let Some(fields) = document.as_object() else {
+        return Err(lifecycle_error(
+            "INVALID_REQUEST",
+            "document must be a JSON object",
+        ));
+    };
+    if fields
+        .keys()
+        .any(|key| !PERSON_DOCUMENT_KEYS.contains(&key.as_str()))
+    {
+        return Err(lifecycle_error(
+            "INVALID_REQUEST",
+            &format!(
+                "document takes only the top-level keys {}",
+                PERSON_DOCUMENT_KEYS.join(", ")
+            ),
+        ));
+    }
+    if fields.get("schema").and_then(Value::as_u64) != Some(PERSON_DOCUMENT_SCHEMA) {
+        return Err(lifecycle_error(
+            "INVALID_REQUEST",
+            "document must hold \"schema\": 1",
+        ));
+    }
+    let canonical = canonical_json(document);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| lifecycle_error("INVALID_REQUEST", "document could not be serialized"))?;
+    if bytes.len() > PERSON_DOCUMENT_MAX_BYTES {
+        return Err(lifecycle_error(
+            "INVALID_REQUEST",
+            "document must be at most 65536 bytes serialized",
+        ));
+    }
+    Ok((canonical, bytes))
+}
+
+/// A JSON value with every object's keys in sorted order, at every depth. serde_json's `Map` keeps
+/// its keys sorted already, but its `preserve_order` feature, which any crate of the build can turn
+/// on for all of them, keeps them in insertion order instead: rebuilt in sorted order, the value
+/// serializes the same either way.
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort_unstable();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_json(&fields[key.as_str()])))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// A person's document's file in the people folder: `person-<uuid>_<hash16>.json`, the person's
+/// uuid without `ilk:` and the hash's 16-hex prefix, the blob store's flat `<name>_<hash16>.<ext>`
+/// (docs/digital-executive-v1-stage-2.md §1.2). `None` for an id or a hash that is not canonical.
+fn person_document_file_name(ilk_id: &str, hash: &str) -> Option<String> {
+    let uuid = parse_prefixed_uuid(ilk_id, "ilk").ok()?;
+    let prefix = hash.get(..16)?;
+    (hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| format!("person-{uuid}_{prefix}.json"))
+}
+
+/// Whether `name` is one of the person's files: `<person_prefix><16 lowercase hex>.json`, with
+/// `person_prefix` = `person-<uuid>_`.
+fn is_person_document_file(name: &str, person_prefix: &str) -> bool {
+    name.strip_prefix(person_prefix)
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|hash16| {
+            hash16.len() == 16
+                && hash16
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// Writes a person's document into the people folder (docs/digital-executive-v1-stage-2.md §1.2):
+/// `<people_dir>/<file>`, exactly its canonical bytes, and answers the file's name. It creates the
+/// folder when it is missing. The folder is shared with the workers by Syncthing, so the file is
+/// written next to it, in the blob root (the same filesystem, and shared by nobody), synced, and
+/// renamed in whole, as SY.architect writes the agent assets: a worker never sees half a file. Its
+/// mode is 0644, whatever the umask. Only the primary writes; a replica never does.
+fn write_person_document_file(people_dir: &Path, document: &PersonDocument) -> io::Result<String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let file_name = document.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the person's id or the document's hash is not canonical",
+        )
+    })?;
+    let blob_root = people_dir.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the people folder has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(people_dir)?;
+    let tmp_path = blob_root.join(format!(".{file_name}.tmp"));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(&document.bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644))?;
+        fs::rename(&tmp_path, people_dir.join(&file_name))
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(file_name)
+}
+
+/// Keeps a person's newest `PERSON_DOCUMENT_VERSIONS_KEPT` files in the people folder and removes
+/// the older ones (docs/digital-executive-v1-stage-2.md §1.2): another hive's SHM may still name a
+/// version that its newer one has not replaced yet (A-338). `current`, the file the record names, is
+/// always kept; the person's other files (`is_person_document_file`) are ranked by their
+/// modification time, newest first, and by name on a tie. Nothing else in the folder is touched.
+/// Answers the names it removed.
+fn prune_person_documents(
+    people_dir: &Path,
+    ilk_id: &str,
+    current: &str,
+) -> io::Result<Vec<String>> {
+    let uuid = parse_prefixed_uuid(ilk_id, "ilk").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the person's id is not canonical",
+        )
+    })?;
+    let person_prefix = format!("person-{uuid}_");
+    let mut others: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in fs::read_dir(people_dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == current || !is_person_document_file(&name, &person_prefix) {
+            continue;
+        }
+        // The entry itself, never what a link names.
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        others.push((modified, name));
+    }
+    others.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut removed = Vec::new();
+    for (_, name) in others
+        .into_iter()
+        .skip(PERSON_DOCUMENT_VERSIONS_KEPT.saturating_sub(1))
+    {
+        fs::remove_file(people_dir.join(&name))?;
+        removed.push(name);
+    }
+    Ok(removed)
+}
+
 /// Per-hive authority: is `publisher_hive` allowed to push this delta? A replica
 /// may only upsert/delete ilks it owns (`@<publisher_hive>`). For `IlkDelete`
 /// (which carries only an ilk_id) ownership is resolved against the existing ilk
@@ -3414,6 +3937,10 @@ struct IdentityRuntime {
     /// The Fluxbee Cloud relay, the only caller that may write a `cloud` channel (an account's
     /// email) and the installation-wide scope. IO.cloud runs on the primary's hive.
     cloud_relay: String,
+    /// The people folder, `<blob_root>/people` (`configured_blob_root`), where the primary writes
+    /// each person's document (ILK_SET_DOCUMENT). A replica never writes there: Syncthing brings the
+    /// folder to the workers.
+    people_dir: PathBuf,
 }
 
 impl IdentityRuntime {
@@ -3481,6 +4008,16 @@ impl IdentityRuntime {
             MSG_ILK_CREATE_VIRTUAL,
             HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
         );
+        // Whom a node's ILK works for and a person's document, likewise: SY.deploy, the operator
+        // and Archi reach them through SY.admin's actions (docs/digital-executive-v1-stage-2.md §1).
+        allowed_exacts.insert(
+            MSG_ILK_SET_WORKS_FOR,
+            HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
+        );
+        allowed_exacts.insert(
+            MSG_ILK_SET_DOCUMENT,
+            HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
+        );
         if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
             allowed_exacts
                 .entry(MSG_ILK_REGISTER)
@@ -3511,6 +4048,7 @@ impl IdentityRuntime {
             allowed_prefixes,
             allowed_exacts,
             cloud_relay: format!("IO.cloud@{}", hive.hive_id),
+            people_dir: configured_blob_root(hive).join(PEOPLE_DIR_NAME),
         }
     }
 
@@ -3610,6 +4148,87 @@ impl IdentityRuntime {
             deltas.push(delta_envelope(IdentityDelta::AliasUpsert { alias }));
         }
         ok
+    }
+
+    /// ILK_SET_DOCUMENT's write, once its checks passed (`prepare_person_document`;
+    /// docs/digital-executive-v1-stage-2.md §1.2). A new version is written to its file in the people
+    /// folder first (`write_person_document_file`), so the record never names a file that is not
+    /// there; then the record takes it and is persisted, replicated and projected as any ILK write
+    /// (`commit_ilk_changes`); then the person's older files beyond the newest three go
+    /// (`prune_person_documents`). A file that cannot be written answers `DOCUMENT_WRITE_FAILED` and
+    /// changes nothing; a database error leaves the new file unnamed, for the next prune. The same
+    /// document again is no new version: it answers the same, and writes its file again only when the
+    /// file is missing, so a retry converges. Answers `{ilk_id, document_hash, file}`.
+    async fn commit_person_document(
+        &mut self,
+        deltas: &mut Vec<IdentityDeltaEnvelope>,
+        document: PersonDocument,
+    ) -> Value {
+        let Some(file) = document.file_name() else {
+            return error_payload("INVALID_REQUEST", "the person's id is not canonical");
+        };
+        let ok = json!({
+            "status": "ok",
+            "ilk_id": document.ilk_id,
+            "document_hash": document.hash,
+            "file": file,
+        });
+        if !document.changed && self.people_dir.join(&file).is_file() {
+            return ok;
+        }
+        if let Err(err) = write_person_document_file(&self.people_dir, &document) {
+            tracing::warn!(
+                ilk_id = %document.ilk_id,
+                people_dir = %self.people_dir.display(),
+                file = %file,
+                error = %err,
+                "identity could not write a person's document to the people folder; nothing changed"
+            );
+            return error_payload(
+                DOCUMENT_WRITE_FAILED,
+                &format!("the person's document could not be written to the people folder: {err}"),
+            );
+        }
+        if !document.changed {
+            tracing::info!(
+                ilk_id = %document.ilk_id,
+                file = %file,
+                "identity wrote a person's document again: its file was missing"
+            );
+            return ok;
+        }
+        let snapshot = if self.is_primary && self.db_config.is_some() {
+            Some(self.store.clone())
+        } else {
+            None
+        };
+        self.store.apply_person_document(&document);
+        let answer = self
+            .commit_ilk_changes(
+                deltas,
+                snapshot,
+                std::slice::from_ref(&document.ilk_id),
+                None,
+                "failed to persist the person's document",
+                ok,
+            )
+            .await;
+        if answer.get("status").and_then(Value::as_str) == Some("ok") {
+            match prune_person_documents(&self.people_dir, &document.ilk_id, &file) {
+                Ok(removed) if !removed.is_empty() => tracing::info!(
+                    ilk_id = %document.ilk_id,
+                    removed = ?removed,
+                    "identity removed a person's documents older than its newest three"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    ilk_id = %document.ilk_id,
+                    error = %err,
+                    "identity could not remove a person's older documents; they stay until its next version"
+                ),
+            }
+        }
+        answer
     }
 
     async fn process_system_message(
@@ -4248,10 +4867,13 @@ impl IdentityRuntime {
                             None
                         };
                         match self.store.create_virtual_person(req) {
-                            Ok(ok) => {
+                            Ok((ok, created)) => {
+                                // The same person asked for again with its id changes nothing and
+                                // sends no delta.
                                 let changed: Vec<String> = ok
                                     .get("ilk_id")
                                     .and_then(Value::as_str)
+                                    .filter(|_| created)
                                     .map(str::to_string)
                                     .into_iter()
                                     .collect();
@@ -4273,7 +4895,77 @@ impl IdentityRuntime {
                     // A fixed text: the request's values are not repeated (FINDINGS A-232).
                     Err(_) => error_payload(
                         "INVALID_REQUEST",
-                        "ILK_CREATE_VIRTUAL takes {tenant_id, display_name, company_name?} and nothing else",
+                        "ILK_CREATE_VIRTUAL takes {tenant_id, display_name, company_name?, ilk_id?} and nothing else",
+                    ),
+                }
+            }
+            MSG_ILK_SET_WORKS_FOR => {
+                match serde_json::from_value::<IlkSetWorksForRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.set_ilk_works_for(&req) {
+                            Ok((ok, changed)) => {
+                                tracing::info!(
+                                    action,
+                                    trace_id = %trace_id,
+                                    src_l2_name = src_l2_name.unwrap_or("<unknown>"),
+                                    ilk_id = %req.ilk_id,
+                                    works_for = req.works_for.as_deref().unwrap_or("<nobody>"),
+                                    work_role = req.work_role.as_deref().unwrap_or("<none>"),
+                                    change_reason = req.change_reason.as_deref().unwrap_or(""),
+                                    changed,
+                                    "identity set whom an ILK works for"
+                                );
+                                let changed: Vec<String> =
+                                    changed.then(|| req.ilk_id.clone()).into_iter().collect();
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    None,
+                                    "failed to persist whom the ILK works for",
+                                    ok,
+                                )
+                                .await
+                            }
+                            Err(code) => {
+                                op_error_payload(&code, "failed to set whom the ILK works for")
+                            }
+                        }
+                    }
+                    // A fixed text: the request's values are not repeated (FINDINGS A-232).
+                    Err(_) => error_payload(
+                        "INVALID_REQUEST",
+                        "ILK_SET_WORKS_FOR takes {ilk_id, works_for, work_role, change_reason?}, works_for and work_role both ilk:<uuid> and a role, or both null, and nothing else",
+                    ),
+                }
+            }
+            MSG_ILK_SET_DOCUMENT => {
+                match serde_json::from_value::<IlkSetDocumentRequest>(msg.payload.clone()) {
+                    Ok(req) => match self.store.prepare_person_document(req) {
+                        Ok(document) => {
+                            tracing::info!(
+                                action,
+                                trace_id = %trace_id,
+                                src_l2_name = src_l2_name.unwrap_or("<unknown>"),
+                                ilk_id = %document.ilk_id,
+                                document_hash = %document.hash,
+                                bytes = document.bytes.len(),
+                                changed = document.changed,
+                                "identity received a person's document"
+                            );
+                            self.commit_person_document(&mut deltas, document).await
+                        }
+                        Err(code) => op_error_payload(&code, "failed to set the person's document"),
+                    },
+                    // A fixed text: the request's values are not repeated (FINDINGS A-232).
+                    Err(_) => error_payload(
+                        "INVALID_REQUEST",
+                        "ILK_SET_DOCUMENT takes {ilk_id, document} and nothing else",
                     ),
                 }
             }
@@ -5616,12 +6308,11 @@ fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, Ide
             works_for: [0u8; 16],
             work_role: 0,
             _pad1: [0u8; 7],
-            // A person's document's hash prefix: zeros, none, until release 2C keeps the document
-            // in the record (docs/digital-executive-v1-stage-2.md §1.2).
             document_hash: [0u8; 8],
         };
         apply_definition_to_ilk_entry(&mut ilk_entry, &ilk.definition)?;
         apply_work_relation_to_ilk_entry(&mut ilk_entry, ilk);
+        apply_document_hash_to_ilk_entry(&mut ilk_entry, ilk);
         let display_name = identification_str(&ilk.identification, "display_name")
             .or_else(|| identification_str(&ilk.identification, "node_name"))
             .unwrap_or(ilk.ilk_id.as_str());
@@ -5846,6 +6537,22 @@ fn apply_work_relation_to_ilk_entry(entry: &mut IlkEntry, ilk: &IlkRecord) {
     entry.work_role = work_role;
 }
 
+/// A person's document in its SHM entry (docs/digital-executive-v1-stage-2.md §1.2): the first 8
+/// bytes of its hash, which name its file in the people folder (`person-<uuid>_<hash16>.json`).
+/// All zeros for an ILK without one, or whose record holds no 64-hex hash.
+fn apply_document_hash_to_ilk_entry(entry: &mut IlkEntry, ilk: &IlkRecord) {
+    entry.document_hash = ilk
+        .document_hash
+        .as_deref()
+        .and_then(sha256_hex_to_bytes)
+        .map(|hash| {
+            let mut prefix = [0u8; 8];
+            prefix.copy_from_slice(&hash[..8]);
+            prefix
+        })
+        .unwrap_or([0u8; 8]);
+}
+
 fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
     let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
@@ -5872,11 +6579,11 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         works_for: [0u8; 16],
         work_role: 0,
         _pad1: [0u8; 7],
-        // None until release 2C (docs/digital-executive-v1-stage-2.md §1.2).
         document_hash: [0u8; 8],
     };
     apply_definition_to_ilk_entry(&mut entry, &ilk.definition)?;
     apply_work_relation_to_ilk_entry(&mut entry, ilk);
+    apply_document_hash_to_ilk_entry(&mut entry, ilk);
     let display_name = identification_str(&ilk.identification, "display_name")
         .or_else(|| identification_str(&ilk.identification, "node_name"))
         .unwrap_or(ilk.ilk_id.as_str());
@@ -7186,7 +7893,7 @@ fn ingest_replica_frame(
             if delta_authorized_for_hive(&delta, &publisher_hive, store) {
                 let delta = match delta {
                     IdentityDelta::IlkUpsert { ilk } => IdentityDelta::IlkUpsert {
-                        ilk: with_primary_work_relation(ilk, store),
+                        ilk: with_primary_owned_fields(ilk, store),
                     },
                     other => other,
                 };
@@ -7518,6 +8225,8 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_PURGE => MSG_TNT_PURGE_RESPONSE,
         MSG_ILK_RETIRE_HIVE => MSG_ILK_RETIRE_HIVE_RESPONSE,
         MSG_ILK_CREATE_VIRTUAL => MSG_ILK_CREATE_VIRTUAL_RESPONSE,
+        MSG_ILK_SET_WORKS_FOR => MSG_ILK_SET_WORKS_FOR_RESPONSE,
+        MSG_ILK_SET_DOCUMENT => MSG_ILK_SET_DOCUMENT_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
         _ => "SYSTEM_ERROR",
@@ -7545,6 +8254,8 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_TNT_PURGE
             | MSG_ILK_RETIRE_HIVE
             | MSG_ILK_CREATE_VIRTUAL
+            | MSG_ILK_SET_WORKS_FOR
+            | MSG_ILK_SET_DOCUMENT
     )
 }
 
@@ -8385,6 +9096,16 @@ const MIGRATION_V7_WORKS_FOR: &str = "ALTER TABLE identity_ilks \
      INSERT INTO identity_schema_migrations (version, name) \
      VALUES (7, 'works_for') ON CONFLICT (version) DO NOTHING;";
 
+/// Migration v8 -- a person's document (docs/digital-executive-v1-stage-2.md §1.2): the document,
+/// a JSON object, and the SHA-256 of its canonical bytes (64 hex), the name of its file in the
+/// people folder. NULL for every row that exists, since no person has one yet. Every boot;
+/// idempotent.
+const MIGRATION_V8_PERSON_DOCUMENT: &str = "ALTER TABLE identity_ilks \
+     ADD COLUMN IF NOT EXISTS document JSONB NULL, \
+     ADD COLUMN IF NOT EXISTS document_hash TEXT NULL;\n\
+     INSERT INTO identity_schema_migrations (version, name) \
+     VALUES (8, 'person_document') ON CONFLICT (version) DO NOTHING;";
+
 async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
     let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
@@ -8710,6 +9431,12 @@ RETURNING ilk_id::text
         tx.batch_execute(MIGRATION_V7_WORKS_FOR).await?;
         tx.commit().await?;
     }
+    // v8 -- a person's document and its hash (MIGRATION_V8_PERSON_DOCUMENT).
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(MIGRATION_V8_PERSON_DOCUMENT).await?;
+        tx.commit().await?;
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -8717,7 +9444,7 @@ RETURNING ilk_id::text
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (migrations through v7, works_for)");
+    tracing::info!("identity primary schema ensured (migrations through v8, person_document)");
     Ok(())
 }
 
@@ -8907,6 +9634,8 @@ INSERT INTO identity_ilks (
     is_virtual,
     works_for,
     work_role,
+    document,
+    document_hash,
     updated_at
 )
 VALUES (
@@ -8925,6 +9654,8 @@ VALUES (
     $13,
     $14,
     $15,
+    $16::jsonb,
+    $17,
     NOW()
 )
 ON CONFLICT (ilk_id) DO UPDATE
@@ -8943,6 +9674,8 @@ SET
     is_virtual = EXCLUDED.is_virtual,
     works_for = EXCLUDED.works_for,
     work_role = EXCLUDED.work_role,
+    document = EXCLUDED.document,
+    document_hash = EXCLUDED.document_hash,
     updated_at = NOW()
 "#,
         &[
@@ -8961,6 +9694,8 @@ SET
             &ilk.is_virtual,
             &ilk.works_for,
             &ilk.work_role,
+            &ilk.document,
+            &ilk.document_hash,
         ],
     )
     .await?;
@@ -9182,7 +9917,9 @@ SELECT
     deleted_reason,
     is_virtual,
     works_for,
-    work_role
+    work_role,
+    document,
+    document_hash
 FROM identity_ilks
 ORDER BY created_at ASC
 "#,
@@ -9210,6 +9947,8 @@ ORDER BY created_at ASC
                 is_virtual: row.get("is_virtual"),
                 works_for: row.get("works_for"),
                 work_role: row.get("work_role"),
+                document: row.get("document"),
+                document_hash: row.get("document_hash"),
             },
         );
     }
@@ -10007,6 +10746,7 @@ mod tests {
                 identity_frontdesk: identity_frontdesk.map(str::to_string),
             }),
             identity: None,
+            blob: None,
         }
     }
 
@@ -10120,6 +10860,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         store.aliases.insert(
@@ -10347,6 +11089,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -10808,6 +11552,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -10847,6 +11593,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -10904,6 +11652,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -10975,6 +11725,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11025,6 +11777,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11060,6 +11814,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11098,6 +11854,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11138,6 +11896,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         store.ich_lookup.insert(
@@ -11310,6 +12070,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11380,6 +12142,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
 
@@ -11425,6 +12189,8 @@ mod tests {
                     is_virtual: false,
                     works_for: None,
                     work_role: None,
+                    document: None,
+                    document_hash: None,
                 },
             );
         }
@@ -11575,6 +12341,8 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document: None,
+            document_hash: None,
         }
     }
 
@@ -12158,6 +12926,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         let err = store
@@ -12239,6 +13009,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         let err = store
@@ -12501,6 +13273,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         let new_ilk = "ilk:77777777-7777-4777-8777-777777777777";
@@ -14396,6 +15170,8 @@ mod tests {
                 is_virtual: false,
                 works_for: None,
                 work_role: None,
+                document: None,
+                document_hash: None,
             },
         );
         let err = store
@@ -14450,6 +15226,8 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document: None,
+            document_hash: None,
         };
         let mut delta =
             serde_json::to_value(IdentityDelta::IlkUpsert { ilk: record }).expect("serialize");
@@ -15016,6 +15794,7 @@ mod tests {
             role: Some(role.to_string()),
             government: None,
             identity: None,
+            blob: None,
         }
     }
 
@@ -15046,6 +15825,8 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document: None,
+            document_hash: None,
         }
     }
 
@@ -15088,6 +15869,8 @@ mod tests {
             is_virtual: false,
             works_for: None,
             work_role: None,
+            document: None,
+            document_hash: None,
         };
         store.ilks.insert(person.ilk_id.clone(), person);
         store
@@ -16272,11 +17055,17 @@ mod tests {
         display_name: &str,
         company_name: Option<&str>,
     ) -> Result<Value, String> {
-        store.create_virtual_person(IlkCreateVirtualRequest {
-            tenant_id: tenant_id.to_string(),
-            display_name: display_name.to_string(),
-            company_name: company_name.map(str::to_string),
-        })
+        store
+            .create_virtual_person(IlkCreateVirtualRequest {
+                tenant_id: tenant_id.to_string(),
+                display_name: display_name.to_string(),
+                company_name: company_name.map(str::to_string),
+                ilk_id: None,
+            })
+            .map(|(ok, created)| {
+                assert!(created, "a person created without an id is always new");
+                ok
+            })
     }
 
     /// Laura, a Digital Executive of Acme (LC_TENANT).
@@ -17034,8 +17823,8 @@ mod tests {
         assert!(row(&alone.ilk_id).get("work_role").is_none());
     }
 
-    /// Nothing sets whom an ILK works for in this release (2A): every ILK identity makes works for
-    /// nobody.
+    /// Only ILK_SET_WORKS_FOR and ILK_SET_DOCUMENT set whom an ILK works for and a person's
+    /// document: every ILK the other paths make works for nobody and has none.
     #[test]
     fn no_ilk_identity_makes_works_for_anyone() {
         let mut store = rg_store();
@@ -17045,6 +17834,1144 @@ mod tests {
         for ilk_id in [&laura, &ana, &temp] {
             let record = &store.ilks[ilk_id];
             assert_eq!((&record.works_for, &record.work_role), (&None, &None));
+            assert_eq!((&record.document, &record.document_hash), (&None, &None));
+        }
+    }
+
+    // ---- The Digital Executive's stage 2, release 2C (docs/digital-executive-v1-stage-2.md §1) ----
+
+    const ED2_LAURA: &str = "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a";
+
+    fn ed2_create_with_id(
+        store: &mut IdentityStore,
+        tenant_id: &str,
+        display_name: &str,
+        company_name: Option<&str>,
+        ilk_id: &str,
+    ) -> Result<(Value, bool), String> {
+        store.create_virtual_person(IlkCreateVirtualRequest {
+            tenant_id: tenant_id.to_string(),
+            display_name: display_name.to_string(),
+            company_name: company_name.map(str::to_string),
+            ilk_id: Some(ilk_id.to_string()),
+        })
+    }
+
+    /// A node's ILK charged to `tenant_id`, as the orchestrator registers it.
+    fn ed2_node(store: &mut IdentityStore, node_name: &str, tenant_id: &str) -> String {
+        let ilk_id = t_ilk(node_name);
+        let mut node = ilk_for(node_name, &ilk_id);
+        node.tenant_id = tenant_id.to_string();
+        store.ilks.insert(ilk_id.clone(), node);
+        ilk_id
+    }
+
+    fn ed2_works_for(
+        store: &mut IdentityStore,
+        ilk_id: &str,
+        works_for: Option<&str>,
+        work_role: Option<&str>,
+    ) -> Result<(Value, bool), String> {
+        store.set_ilk_works_for(&IlkSetWorksForRequest {
+            ilk_id: ilk_id.to_string(),
+            works_for: works_for.map(str::to_string),
+            work_role: work_role.map(str::to_string),
+            change_reason: None,
+        })
+    }
+
+    /// Laura's layer 2, as SY.deploy writes it at her birth (§5.2 step 2).
+    fn ed2_laura_document() -> Value {
+        json!({
+            "schema": 1,
+            "display_name": "Laura Gómez",
+            "company_name": "Acme",
+            "personality": {"timezone": "America/Argentina/Buenos_Aires", "country_code": "AR"},
+            "channels": [{"type": "whatsapp", "io_node": "IO.wapp.ed4qm7k2xa@worker1",
+                          "address": "1234567890"}],
+        })
+    }
+
+    fn ed2_document(
+        store: &IdentityStore,
+        ilk_id: &str,
+        document: Value,
+    ) -> Result<PersonDocument, String> {
+        store.prepare_person_document(IlkSetDocumentRequest {
+            ilk_id: ilk_id.to_string(),
+            document,
+        })
+    }
+
+    fn ed2_temp_blob_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fluxbee-identity-{tag}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("a temp blob root");
+        root
+    }
+
+    /// The files in `dir`, sorted.
+    fn ed2_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn ed2_set_mtime(path: &Path, secs_ago: u64) {
+        let file = OpenOptions::new().write(true).open(path).expect("open");
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs_ago))
+            .expect("set its modification time");
+    }
+
+    #[test]
+    fn the_person_document_migration_adds_its_two_columns_and_stamps_v8() {
+        let sql = MIGRATION_V8_PERSON_DOCUMENT;
+        assert!(sql.contains(
+            "ALTER TABLE identity_ilks ADD COLUMN IF NOT EXISTS document JSONB NULL, \
+             ADD COLUMN IF NOT EXISTS document_hash TEXT NULL;"
+        ));
+        assert!(sql.contains(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (8, 'person_document') \
+             ON CONFLICT (version) DO NOTHING;"
+        ));
+        // The two statements, and nothing that rewrites a row or sets a default.
+        assert_eq!(sql.matches(';').count(), 2);
+        assert!(!sql.contains("UPDATE"));
+        assert!(!sql.contains("DEFAULT"));
+    }
+
+    /// ILK_CREATE_VIRTUAL with an `ilk_id`: born with it; the same call again answers the same and
+    /// changes nothing; any other holder of the id answers ILK_ID_TAKEN, and nothing changes.
+    #[test]
+    fn a_virtual_person_born_with_its_id_is_born_once() {
+        let mut store = rg_store();
+        let (ok, created) =
+            ed2_create_with_id(&mut store, LC_TENANT, " Laura ", Some("Acme"), ED2_LAURA)
+                .expect("born with its id");
+        assert!(created);
+        let expected =
+            json!({"status": "ok", "ilk_id": ED2_LAURA, "tenant_id": LC_TENANT, "virtual": true});
+        assert_eq!(ok, expected);
+        let record = store.ilks[ED2_LAURA].clone();
+        assert!(record.is_virtual);
+        assert_eq!(record.ilk_type, "human");
+        assert_eq!(
+            record.identification,
+            json!({"display_name": "Laura", "company_name": "Acme"})
+        );
+
+        // Again, with the same values (the names as the record trims them): the same, created
+        // nothing.
+        let before = store.ilks.clone();
+        for (name, company) in [("Laura", Some("Acme")), ("  Laura", Some(" Acme  "))] {
+            let (again, created) =
+                ed2_create_with_id(&mut store, LC_TENANT, name, company, ED2_LAURA)
+                    .expect("the same person");
+            assert!(!created);
+            assert_eq!(again, expected);
+        }
+        assert_eq!(store.ilks, before);
+
+        // Another tenant, other names, no company where she has one: the id is taken.
+        for (tenant_id, name, company) in [
+            (OTHER_TENANT, "Laura", Some("Acme")),
+            (LC_TENANT, "Laura G.", Some("Acme")),
+            (LC_TENANT, "Laura", Some("Acme Inc")),
+            (LC_TENANT, "Laura", None),
+        ] {
+            let (code, detail) = ed_refusal(
+                ed2_create_with_id(&mut store, tenant_id, name, company, ED2_LAURA)
+                    .expect_err("taken"),
+            );
+            assert_eq!(code, ILK_ID_TAKEN, "{tenant_id} {name} {company:?}");
+            // The detail repeats none of the request's values.
+            assert!(!detail.contains("Laura"), "{detail}");
+        }
+
+        // A real person's id, a node's, a system ILK's and a marked virtual person's are taken too.
+        let ana = rg_with_ana(&mut store);
+        let node = ed2_node(&mut store, "AI.ed4qm7k2xa@worker1", LC_TENANT);
+        let system = deterministic_system_ilk_id("SY.admin@motherbee");
+        store
+            .ilks
+            .insert(system.clone(), rt_seeded("SY.admin", "motherbee"));
+        let marked = "ilk:6b6b6b6b-6b6b-46b6-86b6-6b6b6b6b6b6b";
+        ed2_create_with_id(&mut store, LC_TENANT, "Pablo", None, marked).expect("Pablo");
+        store.ilks.get_mut(marked).unwrap().deleted_at_ms = Some(1);
+        for holder in [&ana, &node, &system, &marked.to_string()] {
+            let (code, _) = ed_refusal(
+                ed2_create_with_id(&mut store, LC_TENANT, "Pablo", None, holder)
+                    .expect_err("taken"),
+            );
+            assert_eq!(code, ILK_ID_TAKEN, "{holder}");
+        }
+        // And an id an alias still names, a merged temporary's.
+        let merged = "ilk:7c7c7c7c-7c7c-47c7-87c7-7c7c7c7c7c7c";
+        store.aliases.insert(
+            merged.to_string(),
+            AliasRecord {
+                canonical_ilk_id: ana.clone(),
+                expires_at_ms: u64::MAX,
+            },
+        );
+        let (code, _) = ed_refusal(
+            ed2_create_with_id(&mut store, LC_TENANT, "Pablo", None, merged).expect_err("taken"),
+        );
+        assert_eq!(code, ILK_ID_TAKEN);
+
+        // An id in another spelling is refused before anything else.
+        for spelling in [
+            ED2_LAURA.to_ascii_uppercase(),
+            ED2_LAURA.replace("ilk:", "tnt:"),
+            ED2_LAURA.trim_start_matches("ilk:").to_string(),
+            "ilk:not-a-uuid".to_string(),
+        ] {
+            let (code, _) = ed_refusal(
+                ed2_create_with_id(&mut store, LC_TENANT, "Pablo", None, &spelling)
+                    .expect_err("another spelling"),
+            );
+            assert_eq!(code, "INVALID_REQUEST", "{spelling}");
+        }
+        assert_eq!(store.ilks[ED2_LAURA], record);
+
+        // The request takes the id on the wire, and only the known keys.
+        let req: IlkCreateVirtualRequest = serde_json::from_value(json!({
+            "tenant_id": LC_TENANT, "display_name": "Laura", "ilk_id": ED2_LAURA
+        }))
+        .expect("with an id");
+        assert_eq!(req.ilk_id.as_deref(), Some(ED2_LAURA));
+        assert!(serde_json::from_value::<IlkCreateVirtualRequest>(json!({
+            "tenant_id": LC_TENANT, "display_name": "Laura", "id": ED2_LAURA
+        }))
+        .is_err());
+    }
+
+    /// ILK_SET_WORKS_FOR's rules: each refusal changes nothing; a set, the same again, a new role
+    /// and a clear, each changing the record only when it differs.
+    #[test]
+    fn whom_a_node_works_for_is_set_checked_and_cleared() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let conscious = ed2_node(&mut store, "AI.ed4qm7k2xa@worker1", LC_TENANT);
+        let other_node = ed2_node(&mut store, "IO.wapp.ed4qm7k2xa@worker1", LC_TENANT);
+        let foreigner = ed_create(&mut store, OTHER_TENANT, "Otto", None).expect("Otto")["ilk_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let system = deterministic_system_ilk_id("SY.admin@motherbee");
+        store
+            .ilks
+            .insert(system.clone(), rt_seeded("SY.admin", "motherbee"));
+        let gone_person = ed_create(&mut store, LC_TENANT, "Gone", None).expect("Gone")["ilk_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store.ilks.get_mut(&gone_person).unwrap().deleted_at_ms = Some(1);
+        let gone_node = ed2_node(&mut store, "AI.gone@worker1", LC_TENANT);
+        store.ilks.get_mut(&gone_node).unwrap().deleted_at_ms = Some(1);
+        let nobody = "ilk:9d9d9d9d-9d9d-49d9-89d9-9d9d9d9d9d9d";
+        let laura_upper = laura.to_ascii_uppercase();
+        let conscious_upper = conscious.to_ascii_uppercase();
+
+        let before = store.ilks.clone();
+        for (ilk_id, works_for, work_role, code) in [
+            // The ILK: a node's, active.
+            (
+                nobody,
+                Some(laura.as_str()),
+                Some("conscious"),
+                "ILK_NOT_FOUND",
+            ),
+            (
+                gone_node.as_str(),
+                Some(laura.as_str()),
+                Some("conscious"),
+                "ILK_NOT_FOUND",
+            ),
+            (
+                ana.as_str(),
+                Some(laura.as_str()),
+                Some("conscious"),
+                "INVALID_ILK_TYPE",
+            ),
+            (
+                system.as_str(),
+                Some(laura.as_str()),
+                Some("agent"),
+                "INVALID_ILK_TYPE",
+            ),
+            // The person: an active person of the ILK's own tenant.
+            (
+                conscious.as_str(),
+                Some(nobody),
+                Some("conscious"),
+                PERSON_NOT_FOUND,
+            ),
+            (
+                conscious.as_str(),
+                Some(gone_person.as_str()),
+                Some("conscious"),
+                PERSON_NOT_FOUND,
+            ),
+            (
+                conscious.as_str(),
+                Some(other_node.as_str()),
+                Some("conscious"),
+                "INVALID_ILK_TYPE",
+            ),
+            (
+                conscious.as_str(),
+                Some(foreigner.as_str()),
+                Some("conscious"),
+                TENANT_MISMATCH,
+            ),
+            // The pair: a known role, and a person and a role together.
+            (
+                conscious.as_str(),
+                Some(laura.as_str()),
+                Some("soul"),
+                "INVALID_REQUEST",
+            ),
+            (
+                conscious.as_str(),
+                Some(laura.as_str()),
+                Some("Conscious"),
+                "INVALID_REQUEST",
+            ),
+            (
+                conscious.as_str(),
+                Some(laura.as_str()),
+                None,
+                "INVALID_REQUEST",
+            ),
+            (
+                conscious.as_str(),
+                None,
+                Some("conscious"),
+                "INVALID_REQUEST",
+            ),
+            // Ids in their canonical spelling only.
+            (
+                conscious.as_str(),
+                Some(laura_upper.as_str()),
+                Some("conscious"),
+                "INVALID_REQUEST",
+            ),
+            (
+                conscious_upper.as_str(),
+                Some(laura.as_str()),
+                Some("conscious"),
+                "INVALID_REQUEST",
+            ),
+        ] {
+            let (code_seen, _) = ed_refusal(
+                ed2_works_for(&mut store, ilk_id, works_for, work_role).expect_err("refused"),
+            );
+            assert_eq!(code_seen, code, "{ilk_id} {works_for:?} {work_role:?}");
+        }
+        assert_eq!(store.ilks, before);
+
+        // Set: the record and its SHM entry name Laura and the role.
+        let (ok, changed) =
+            ed2_works_for(&mut store, &conscious, Some(&laura), Some("conscious")).expect("set");
+        assert!(changed);
+        assert_eq!(
+            ok,
+            json!({"status": "ok", "ilk_id": conscious, "works_for": laura,
+                   "work_role": "conscious"})
+        );
+        assert_eq!(
+            store.ilks[&conscious].works_for.as_deref(),
+            Some(laura.as_str())
+        );
+        assert_eq!(
+            store.ilks[&conscious].work_role.as_deref(),
+            Some("conscious")
+        );
+        let laura_bytes = *parse_prefixed_uuid(&laura, "ilk").unwrap().as_bytes();
+        let entry = ilk_entry_from_record(&store.ilks[&conscious]).expect("its entry");
+        assert_eq!(
+            (entry.works_for, entry.work_role),
+            (laura_bytes, json_router::shm::ILK_WORK_ROLE_CONSCIOUS)
+        );
+
+        // The same again changes nothing.
+        let set = store.ilks.clone();
+        let (again, changed) =
+            ed2_works_for(&mut store, &conscious, Some(&laura), Some("conscious")).expect("again");
+        assert!(!changed);
+        assert_eq!(again, ok);
+        assert_eq!(store.ilks, set);
+
+        // A real person is a person too, and another role is a change.
+        let (_, changed) =
+            ed2_works_for(&mut store, &other_node, Some(&ana), Some("channel")).expect("Ana's");
+        assert!(changed);
+        let (_, changed) =
+            ed2_works_for(&mut store, &other_node, Some(&ana), Some("agent")).expect("a new role");
+        assert!(changed);
+        assert_eq!(store.ilks[&other_node].work_role.as_deref(), Some("agent"));
+
+        // Two nulls clear it, and a clear again changes nothing.
+        let (cleared, changed) = ed2_works_for(&mut store, &conscious, None, None).expect("clear");
+        assert!(changed);
+        assert_eq!(
+            cleared,
+            json!({"status": "ok", "ilk_id": conscious, "works_for": null, "work_role": null})
+        );
+        assert_eq!(
+            (
+                &store.ilks[&conscious].works_for,
+                &store.ilks[&conscious].work_role
+            ),
+            (&None, &None)
+        );
+        let entry = ilk_entry_from_record(&store.ilks[&conscious]).expect("its entry");
+        assert_eq!(
+            (entry.works_for, entry.work_role),
+            ([0u8; 16], ILK_WORK_ROLE_NONE)
+        );
+        let (_, changed) = ed2_works_for(&mut store, &conscious, None, None).expect("clear again");
+        assert!(!changed);
+    }
+
+    /// ILK_SET_WORKS_FOR's request names `works_for` and `work_role` always, null to clear: a
+    /// request that leaves one out is refused, never read as a clear.
+    #[test]
+    fn whom_a_node_works_for_is_never_cleared_by_omission() {
+        let parse = |payload: Value| serde_json::from_value::<IlkSetWorksForRequest>(payload);
+        let req = parse(json!({"ilk_id": ED2_LAURA, "works_for": null, "work_role": null}))
+            .expect("a clear");
+        assert_eq!((req.works_for, req.work_role), (None, None));
+        let req = parse(json!({"ilk_id": ED2_LAURA, "works_for": ED2_LAURA,
+                               "work_role": "channel", "change_reason": "cd_deploy step 8"}))
+        .expect("a set");
+        assert_eq!(req.work_role.as_deref(), Some("channel"));
+        assert_eq!(req.change_reason.as_deref(), Some("cd_deploy step 8"));
+        for payload in [
+            json!({"ilk_id": ED2_LAURA}),
+            json!({"ilk_id": ED2_LAURA, "works_for": null}),
+            json!({"ilk_id": ED2_LAURA, "work_role": null}),
+            json!({"ilk_id": ED2_LAURA, "works_for": null, "work_role": null, "role": null}),
+            json!({"ilk_id": ED2_LAURA, "works_for": 7, "work_role": null}),
+        ] {
+            assert!(parse(payload.clone()).is_err(), "{payload}");
+        }
+    }
+
+    /// The document's checks, each `INVALID_REQUEST` naming what it takes; its canonical bytes
+    /// (keys sorted at every depth, compact) and their SHA-256.
+    #[test]
+    fn a_persons_document_is_checked_and_hashed_from_its_canonical_bytes() {
+        let (canonical, bytes) = check_person_document(&ed2_laura_document()).expect("valid");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            "{\"channels\":[{\"address\":\"1234567890\",\"io_node\":\"IO.wapp.ed4qm7k2xa@worker1\",\
+             \"type\":\"whatsapp\"}],\"company_name\":\"Acme\",\"display_name\":\"Laura Gómez\",\
+             \"personality\":{\"country_code\":\"AR\",\"timezone\":\"America/Argentina/Buenos_Aires\"},\
+             \"schema\":1}"
+        );
+        assert_eq!(canonical, ed2_laura_document());
+        assert_eq!(
+            sha256_hex_of(&bytes),
+            "6c54242967a8a947a071be4950046210f5af94c87369cf0edcc70fbca12451df"
+        );
+        // Every key of the list is taken.
+        let mut every = Map::new();
+        for key in PERSON_DOCUMENT_KEYS {
+            every.insert(key.to_string(), json!({}));
+        }
+        every.insert("schema".to_string(), json!(1));
+        check_person_document(&Value::Object(every)).expect("every key");
+
+        // Exactly 64 KiB once serialized is fine; one byte more is not.
+        let at_limit = |extra: usize| {
+            let base = serde_json::to_vec(&json!({"schema": 1, "public": ""}))
+                .unwrap()
+                .len();
+            json!({"schema": 1, "public": "x".repeat(PERSON_DOCUMENT_MAX_BYTES - base + extra)})
+        };
+        let (_, bytes) = check_person_document(&at_limit(0)).expect("64 KiB");
+        assert_eq!(bytes.len(), PERSON_DOCUMENT_MAX_BYTES);
+
+        for (document, reason) in [
+            (json!(["schema", 1]), "a JSON object"),
+            (json!("{}"), "a JSON object"),
+            (json!({"display_name": "Laura"}), "\"schema\": 1"),
+            (json!({"schema": 2}), "\"schema\": 1"),
+            (json!({"schema": "1"}), "\"schema\": 1"),
+            (json!({"schema": 1.5}), "\"schema\": 1"),
+            (
+                json!({"schema": 1, "email": "laura@acme.com"}),
+                "top-level keys",
+            ),
+            (at_limit(1), "65536 bytes"),
+        ] {
+            let (code, detail) = ed_refusal(check_person_document(&document).expect_err("refused"));
+            assert_eq!(code, "INVALID_REQUEST", "{document}");
+            assert!(detail.contains(reason), "{detail}");
+            // The detail names what the document takes, never what it held.
+            assert!(!detail.contains("laura@acme.com"), "{detail}");
+        }
+    }
+
+    /// The document is a person's, real or virtual, active: a node, a system ILK, a marked person
+    /// and an unknown id are refused. The same document again is no new version.
+    #[test]
+    fn only_an_active_person_has_a_document_and_the_same_one_is_no_new_version() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let node = ed2_node(&mut store, "AI.ed4qm7k2xa@worker1", LC_TENANT);
+        let system = deterministic_system_ilk_id("SY.admin@motherbee");
+        store
+            .ilks
+            .insert(system.clone(), rt_seeded("SY.admin", "motherbee"));
+        let gone = ed_create(&mut store, LC_TENANT, "Gone", None).expect("Gone")["ilk_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store.ilks.get_mut(&gone).unwrap().deleted_at_ms = Some(1);
+        let laura_upper = laura.to_ascii_uppercase();
+        for (ilk_id, code) in [
+            (node.as_str(), "INVALID_ILK_TYPE"),
+            (system.as_str(), "INVALID_ILK_TYPE"),
+            (gone.as_str(), "ILK_NOT_FOUND"),
+            ("ilk:9d9d9d9d-9d9d-49d9-89d9-9d9d9d9d9d9d", "ILK_NOT_FOUND"),
+            (laura_upper.as_str(), "INVALID_REQUEST"),
+        ] {
+            let (seen, _) = ed_refusal(
+                ed2_document(&store, ilk_id, ed2_laura_document()).expect_err("refused"),
+            );
+            assert_eq!(seen, code, "{ilk_id}");
+        }
+
+        for person in [&laura, &ana] {
+            let document = ed2_document(&store, person, ed2_laura_document()).expect("a person's");
+            assert!(document.changed);
+            assert_eq!(document.hash, sha256_hex_of(&document.bytes));
+            // Checking changes nothing; applying does.
+            assert_eq!(store.ilks[person].document_hash, None);
+            store.apply_person_document(&document);
+            assert_eq!(
+                store.ilks[person].document_hash.as_deref(),
+                Some(document.hash.as_str())
+            );
+            assert_eq!(
+                store.ilks[person].document.as_ref(),
+                Some(&ed2_laura_document())
+            );
+            // The same document, its keys in another order, is the same version.
+            let mut reordered = Map::new();
+            for (key, value) in ed2_laura_document().as_object().unwrap().iter().rev() {
+                reordered.insert(key.clone(), value.clone());
+            }
+            let again = ed2_document(&store, person, Value::Object(reordered)).expect("again");
+            assert!(!again.changed);
+            assert_eq!(again.hash, document.hash);
+            // Another is a new version.
+            let mut changed = ed2_laura_document();
+            changed["short_id"] = json!("ed4qm7k2xa");
+            assert!(
+                ed2_document(&store, person, changed)
+                    .expect("another")
+                    .changed
+            );
+        }
+        let uuid = laura.trim_start_matches("ilk:");
+        let document = ed2_document(&store, &laura, ed2_laura_document()).expect("Laura's");
+        assert_eq!(
+            document.file_name().as_deref(),
+            Some(format!("person-{uuid}_{}.json", &document.hash[..16]).as_str())
+        );
+    }
+
+    /// The file: exactly the canonical bytes, under its name, 0644, the folder made when missing,
+    /// no temp file left behind; each person keeps its newest three, and the current one always.
+    #[test]
+    fn a_persons_document_is_written_whole_and_its_newest_three_are_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let blob_root = ed2_temp_blob_root("people");
+        let people = blob_root.join(PEOPLE_DIR_NAME);
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let version = |store: &IdentityStore, person: &str, n: u64| {
+            let mut document = ed2_laura_document();
+            document["short_id"] = json!(format!("v{n}"));
+            ed2_document(store, person, document).expect("a version")
+        };
+
+        let first = version(&store, &laura, 1);
+        let name = write_person_document_file(&people, &first).expect("written");
+        assert_eq!(Some(name.clone()), first.file_name());
+        let path = people.join(&name);
+        assert_eq!(fs::read(&path).expect("read back"), first.bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        // Only the people folder in the blob root, and only the file in it.
+        assert_eq!(ed2_files(&blob_root), vec![PEOPLE_DIR_NAME.to_string()]);
+        assert_eq!(ed2_files(&people), vec![name.clone()]);
+        // Written again, it is the same file.
+        write_person_document_file(&people, &first).expect("again");
+        assert_eq!(fs::read(&path).unwrap(), first.bytes);
+
+        // Ana's file, and a file that is no person's, are never pruned with Laura's.
+        let anas = write_person_document_file(&people, &version(&store, &ana, 1)).expect("Ana's");
+        fs::write(people.join("README"), b"not a person's").unwrap();
+        let laura_prefix = format!("person-{}_", laura.trim_start_matches("ilk:"));
+        fs::write(people.join(format!("{laura_prefix}not-hex.json")), b"{}").unwrap();
+
+        // Laura's versions 2 to 4, each newer than the last.
+        let mut names = vec![name];
+        for n in 2..=4 {
+            let next = version(&store, &laura, n);
+            names.push(write_person_document_file(&people, &next).expect("a version"));
+        }
+        for (age, name) in names.iter().rev().enumerate() {
+            ed2_set_mtime(&people.join(name), 100 * (age as u64 + 1));
+        }
+        let removed = prune_person_documents(&people, &laura, &names[3]).expect("pruned");
+        assert_eq!(removed, vec![names[0].clone()]);
+        let left = ed2_files(&people);
+        for kept in &names[1..] {
+            assert!(left.contains(kept), "{left:?}");
+        }
+        assert!(left.contains(&anas));
+        assert!(left.contains(&"README".to_string()));
+        assert!(left.contains(&format!("{laura_prefix}not-hex.json")));
+
+        // The current file stays even when it is the oldest: version 2 named again.
+        ed2_set_mtime(&people.join(&names[1]), 10_000);
+        let removed = prune_person_documents(&people, &laura, &names[1]).expect("pruned");
+        assert!(removed.is_empty(), "{removed:?}");
+        let fifth = version(&store, &laura, 5);
+        let fifth_name = write_person_document_file(&people, &fifth).expect("v5");
+        let removed = prune_person_documents(&people, &laura, &names[1]).expect("pruned");
+        assert_eq!(
+            removed,
+            vec![names[2].clone()],
+            "v3 is the oldest but the current"
+        );
+        let left = ed2_files(&people);
+        for kept in [&names[1], &names[3], &fifth_name] {
+            assert!(left.contains(kept), "{left:?}");
+        }
+
+        // A people folder that cannot be made writes nothing and says so.
+        let blocked = blob_root.join("blocked");
+        fs::write(&blocked, b"a file").unwrap();
+        assert!(write_person_document_file(&blocked.join(PEOPLE_DIR_NAME), &first).is_err());
+        let _ = fs::remove_dir_all(&blob_root);
+    }
+
+    /// ILK_SET_DOCUMENT's write on the primary: the file, then the record and its delta; the same
+    /// document again is no delta, and rewrites a missing file; a file that cannot be written
+    /// changes nothing.
+    #[tokio::test]
+    async fn the_primary_writes_a_persons_document_and_its_record_together() {
+        let blob_root = ed2_temp_blob_root("primary");
+        let mut runtime = IdentityRuntime::new(
+            &test_hive(Some("SY.frontdesk.gov@motherbee")),
+            PathBuf::from("/tmp"),
+            true,
+            None,
+        );
+        assert_eq!(
+            runtime.people_dir,
+            PathBuf::from(DEFAULT_BLOB_ROOT).join(PEOPLE_DIR_NAME)
+        );
+        runtime.people_dir = blob_root.join(PEOPLE_DIR_NAME);
+        runtime.store = rg_store();
+        let laura = ed_laura(&mut runtime.store);
+
+        let document = runtime
+            .store
+            .prepare_person_document(IlkSetDocumentRequest {
+                ilk_id: laura.clone(),
+                document: ed2_laura_document(),
+            })
+            .expect("checked");
+        let hash = document.hash.clone();
+        let file = document.file_name().expect("its file");
+        let mut deltas = Vec::new();
+        let answer = runtime
+            .commit_person_document(&mut deltas, document.clone())
+            .await;
+        assert_eq!(
+            answer,
+            json!({"status": "ok", "ilk_id": laura, "document_hash": hash, "file": file})
+        );
+        assert_eq!(
+            fs::read(runtime.people_dir.join(&file)).expect("its file"),
+            document.bytes
+        );
+        assert_eq!(
+            runtime.store.ilks[&laura].document_hash.as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(deltas.len(), 1);
+        let IdentityDelta::IlkUpsert { ilk } = &deltas[0].delta else {
+            panic!("an ilk upsert");
+        };
+        assert_eq!(ilk.document_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(ilk.document.as_ref(), Some(&ed2_laura_document()));
+
+        // The same again: no delta. With its file removed by hand, the file comes back, no delta.
+        let again = runtime
+            .store
+            .prepare_person_document(IlkSetDocumentRequest {
+                ilk_id: laura.clone(),
+                document: ed2_laura_document(),
+            })
+            .expect("checked");
+        assert!(!again.changed);
+        let mut deltas = Vec::new();
+        assert_eq!(
+            runtime
+                .commit_person_document(&mut deltas, again.clone())
+                .await,
+            answer
+        );
+        assert!(deltas.is_empty());
+        fs::remove_file(runtime.people_dir.join(&file)).unwrap();
+        assert_eq!(
+            runtime.commit_person_document(&mut deltas, again).await,
+            answer
+        );
+        assert!(deltas.is_empty());
+        assert!(runtime.people_dir.join(&file).is_file());
+
+        // Five versions more: the newest three files are left.
+        let mut files = vec![file.clone()];
+        for n in 1..=5 {
+            let mut changed = ed2_laura_document();
+            changed["short_id"] = json!(format!("v{n}"));
+            let next = runtime
+                .store
+                .prepare_person_document(IlkSetDocumentRequest {
+                    ilk_id: laura.clone(),
+                    document: changed,
+                })
+                .expect("checked");
+            // Each file older than the next, whatever the clock's grain.
+            for (index, name) in files.iter().enumerate() {
+                let path = runtime.people_dir.join(name);
+                if path.exists() {
+                    ed2_set_mtime(&path, 1_000 - 10 * index as u64);
+                }
+            }
+            files.push(next.file_name().unwrap());
+            let mut deltas = Vec::new();
+            let answer = runtime.commit_person_document(&mut deltas, next).await;
+            assert_eq!(answer["status"], json!("ok"));
+            assert_eq!(deltas.len(), 1);
+        }
+        let mut newest = files[files.len() - PERSON_DOCUMENT_VERSIONS_KEPT..].to_vec();
+        newest.sort();
+        assert_eq!(ed2_files(&runtime.people_dir), newest);
+
+        // A people folder that cannot be written: DOCUMENT_WRITE_FAILED, nothing changed.
+        let held = runtime.store.ilks[&laura].clone();
+        let blocked = blob_root.join("blocked");
+        fs::write(&blocked, b"a file").unwrap();
+        runtime.people_dir = blocked.join(PEOPLE_DIR_NAME);
+        let mut changed = ed2_laura_document();
+        changed["short_id"] = json!("v6");
+        let next = runtime
+            .store
+            .prepare_person_document(IlkSetDocumentRequest {
+                ilk_id: laura.clone(),
+                document: changed,
+            })
+            .expect("checked");
+        let mut deltas = Vec::new();
+        let answer = runtime.commit_person_document(&mut deltas, next).await;
+        assert_eq!(answer["error_code"], json!(DOCUMENT_WRITE_FAILED));
+        assert!(deltas.is_empty());
+        assert_eq!(runtime.store.ilks[&laura], held);
+        let _ = fs::remove_dir_all(&blob_root);
+    }
+
+    /// The people folder follows `blob.path`, as the orchestrator's folders do.
+    #[test]
+    fn the_people_folder_is_under_the_configured_blob_root() {
+        let mut hive = rt_hive("motherbee", "motherbee");
+        assert_eq!(
+            configured_blob_root(&hive),
+            PathBuf::from("/var/lib/fluxbee/blob")
+        );
+        hive.blob = Some(BlobSection {
+            path: Some("  ".to_string()),
+        });
+        assert_eq!(
+            configured_blob_root(&hive),
+            PathBuf::from(DEFAULT_BLOB_ROOT)
+        );
+        hive.blob = Some(BlobSection {
+            path: Some(" /srv/fluxbee/blob ".to_string()),
+        });
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+        assert_eq!(
+            runtime.people_dir,
+            PathBuf::from("/srv/fluxbee/blob/people")
+        );
+        let parsed: HiveFile = serde_yaml::from_str(
+            "hive_id: motherbee\nrole: motherbee\nblob:\n  path: /data/blob\n  sync:\n    api_port: 8384\n",
+        )
+        .expect("a hive.yaml with a blob section");
+        assert_eq!(configured_blob_root(&parsed), PathBuf::from("/data/blob"));
+    }
+
+    /// The SHM entry carries the document hash's first 8 bytes, on both projection paths, zeros for
+    /// none or for a record whose hash is not 64 hex.
+    #[test]
+    fn the_shm_entry_carries_the_documents_hash_prefix() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let document = ed2_document(&store, &laura, ed2_laura_document()).expect("checked");
+        store.apply_person_document(&document);
+        let prefix: [u8; 8] = hex::decode(&document.hash[..16])
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let entry = ilk_entry_from_record(&store.ilks[&laura]).expect("Laura's entry");
+        assert_eq!(entry.document_hash, prefix);
+        let entry = ilk_entry_from_record(&store.ilks[&ana]).expect("Ana's entry");
+        assert_eq!(entry.document_hash, [0u8; 8]);
+        let mut broken = store.ilks[&laura].clone();
+        broken.document_hash = Some("not-a-hash".to_string());
+        assert_eq!(
+            ilk_entry_from_record(&broken)
+                .expect("an entry")
+                .document_hash,
+            [0u8; 8]
+        );
+
+        let entries = identity_shm_entries(&store).expect("region entries");
+        let hash_of = |ilk_id: &str| {
+            let uuid = *parse_prefixed_uuid(ilk_id, "ilk").unwrap().as_bytes();
+            entries
+                .ilks
+                .iter()
+                .find(|entry| entry.ilk_id == uuid)
+                .map(|entry| entry.document_hash)
+        };
+        assert_eq!(hash_of(&laura), Some(prefix));
+        assert_eq!(hash_of(&ana), Some([0u8; 8]));
+    }
+
+    /// What the two writes make reaches the region by the deltas they emit, and the Rust SDK reads
+    /// them back: whom the node works for and the person's document hash prefix.
+    #[test]
+    fn the_relation_and_the_document_move_the_shm() {
+        let name = format!("/jsid-ed2-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let limits = IdentityRegionLimits {
+            max_ilks: 16,
+            max_tenants: 4,
+            max_vocabulary: 1,
+            max_ilk_aliases: 4,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("identity region");
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let conscious = ed2_node(&mut store, "AI.ed4qm7k2xa@motherbee", LC_TENANT);
+        sync_identity_shm_mappings(&mut writer, &store).expect("the first snapshot");
+        let read = |ilk_id: &str| {
+            fluxbee_sdk::identity::find_ilk_by_id_from_shm_name(&name, ilk_id)
+                .expect("read the region")
+                .expect("the ILK")
+        };
+        assert_eq!(read(&conscious).works_for, None);
+        assert_eq!(read(&laura).document_hash, None);
+
+        ed2_works_for(&mut store, &conscious, Some(&laura), Some("conscious")).expect("set");
+        let document = ed2_document(&store, &laura, ed2_laura_document()).expect("checked");
+        store.apply_person_document(&document);
+        let deltas: Vec<IdentityDeltaEnvelope> = [&conscious, &laura]
+            .iter()
+            .map(|ilk_id| {
+                delta_envelope(IdentityDelta::IlkUpsert {
+                    ilk: store.ilks[*ilk_id].clone(),
+                })
+            })
+            .collect();
+        apply_identity_shm_deltas(&mut writer, &store, MSG_ILK_SET_WORKS_FOR, &deltas[..1])
+            .expect("the relation's delta");
+        apply_identity_shm_deltas(&mut writer, &store, MSG_ILK_SET_DOCUMENT, &deltas[1..])
+            .expect("the document's delta");
+        let node = read(&conscious);
+        assert_eq!(node.works_for.as_deref(), Some(laura.as_str()));
+        assert_eq!(node.work_role.as_deref(), Some("conscious"));
+        assert_eq!(
+            read(&laura).document_hash.as_deref(),
+            Some(&document.hash[..16])
+        );
+
+        // Cleared, it reads as nobody again.
+        ed2_works_for(&mut store, &conscious, None, None).expect("clear");
+        let delta = delta_envelope(IdentityDelta::IlkUpsert {
+            ilk: store.ilks[&conscious].clone(),
+        });
+        apply_identity_shm_deltas(&mut writer, &store, MSG_ILK_SET_WORKS_FOR, &[delta])
+            .expect("the clear's delta");
+        assert_eq!(read(&conscious).works_for, None);
+        assert_eq!(read(&conscious).work_role, None);
+
+        drop(writer);
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
+        }
+    }
+
+    /// The document rides the wire only when set, so an older binary's record reads as none; a
+    /// replica takes it from the primary's delta; ILK_GET carries it, and ILK_LIST its hash only.
+    #[test]
+    fn the_document_rides_the_wire_and_the_reads() {
+        let mut primary = rg_store();
+        let laura = ed_laura(&mut primary);
+        let ana = rg_with_ana(&mut primary);
+        let document = ed2_document(&primary, &laura, ed2_laura_document()).expect("checked");
+        primary.apply_person_document(&document);
+
+        let record = serde_json::to_value(&primary.ilks[&laura]).expect("record");
+        assert_eq!(record["document"], ed2_laura_document());
+        assert_eq!(record["document_hash"], json!(document.hash));
+        let without = serde_json::to_value(&primary.ilks[&ana]).expect("record");
+        assert!(without.get("document").is_none());
+        assert!(without.get("document_hash").is_none());
+        let old: IlkRecord = serde_json::from_value(without).expect("an old record");
+        assert_eq!((old.document, old.document_hash), (None, None));
+
+        let mut replica = rg_store();
+        let line = serde_json::to_string(&delta_envelope(IdentityDelta::IlkUpsert {
+            ilk: primary.ilks[&laura].clone(),
+        }))
+        .expect("encode");
+        let received: IdentityDeltaEnvelope = serde_json::from_str(&line).expect("decode");
+        replica.apply_delta(received.delta);
+        assert_eq!(replica.ilks[&laura], primary.ilks[&laura]);
+
+        let got = primary.get_ilk_payload(&laura, None).expect("get");
+        assert_eq!(got["ilk"]["document"], ed2_laura_document());
+        assert_eq!(got["ilk"]["document_hash"], json!(document.hash));
+        let got = primary.get_ilk_payload(&ana, None).expect("get");
+        assert!(got["ilk"].get("document").is_none());
+        let listed = primary.list_ilks_payload(false, false, &PageAsk::default());
+        let row = |ilk_id: &str| {
+            listed["ilks"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["ilk_id"] == ilk_id)
+                .cloned()
+                .expect("a row")
+        };
+        assert_eq!(row(&laura)["document_hash"], json!(document.hash));
+        assert!(row(&laura).get("document").is_none());
+        assert!(row(&ana).get("document_hash").is_none());
+    }
+
+    /// A replica's push never changes a document: the primary's stands on a delta and on a
+    /// snapshot, and an ILK the primary does not hold comes in with none.
+    #[test]
+    fn a_replica_push_never_changes_a_persons_document() {
+        let mut store = IdentityStore::with_default_tenant();
+        let held_id = t_ilk("w1-held");
+        let mut held = ilk_for("AI.held@worker1", &held_id);
+        held.document = Some(json!({"schema": 1}));
+        held.document_hash = Some("a".repeat(64));
+        store.ilks.insert(held_id.clone(), held.clone());
+
+        let mut forged = held.clone();
+        forged.document = Some(json!({"schema": 1, "public": "forged"}));
+        forged.document_hash = Some("b".repeat(64));
+        let kept = with_primary_owned_fields(forged.clone(), &store);
+        assert_eq!(kept.document, held.document);
+        assert_eq!(kept.document_hash, held.document_hash);
+        let mut stripped = held.clone();
+        stripped.document = None;
+        stripped.document_hash = None;
+        assert_eq!(with_primary_document(stripped, &store), held);
+        let new_id = t_ilk("w1-new");
+        let mut newcomer = ilk_for("AI.new@worker1", &new_id);
+        newcomer.document_hash = Some("c".repeat(64));
+        newcomer.document = Some(json!({"schema": 1}));
+        let came = with_primary_owned_fields(newcomer.clone(), &store);
+        assert_eq!((came.document, came.document_hash), (None, None));
+
+        // A snapshot with both: the held one keeps the primary's, the new one has none.
+        store.reconcile_hive_ilks("worker1", vec![forged, newcomer]);
+        assert_eq!(store.ilks[&held_id], held);
+        assert_eq!(store.ilks[&new_id].document_hash, None);
+        assert_eq!(store.ilks[&new_id].document, None);
+    }
+
+    /// ILK_SET_WORKS_FOR and ILK_SET_DOCUMENT are the motherbee's SY.admin's alone, on the primary
+    /// only: any other caller is refused before anything else, a replica answers NOT_PRIMARY, and a
+    /// primary without its database DB_NOT_READY.
+    #[tokio::test]
+    async fn only_sy_admin_at_motherbee_sets_the_relation_and_the_document_on_the_primary() {
+        let primary = IdentityRuntime::new(
+            &test_hive(Some("SY.frontdesk.gov@motherbee")),
+            PathBuf::from("/tmp"),
+            true,
+            None,
+        );
+        for (action, response) in [
+            (MSG_ILK_SET_WORKS_FOR, MSG_ILK_SET_WORKS_FOR_RESPONSE),
+            (MSG_ILK_SET_DOCUMENT, MSG_ILK_SET_DOCUMENT_RESPONSE),
+        ] {
+            assert!(primary.is_authorized(action, Some("SY.admin@motherbee")));
+            for caller in [
+                None,
+                Some("SY.admin@worker1"),
+                Some("SY.admin.relay@motherbee"),
+                Some("SY.architect@motherbee"),
+                Some("SY.frontdesk.gov@motherbee"),
+                Some("SY.orchestrator@motherbee"),
+                Some("SY.identity@motherbee"),
+                Some("SY.deploy@motherbee"),
+                Some("IO.cloud@motherbee"),
+                Some("AI.ed4qm7k2xa@worker1"),
+            ] {
+                assert!(
+                    !primary.is_authorized(action, caller),
+                    "{action} {caller:?}"
+                );
+            }
+            assert!(action_requires_primary(action));
+            assert!(!is_lifecycle_action(action));
+            assert_eq!(response_name(action), response);
+        }
+
+        let answer =
+            |hive_id: &str, is_primary: bool, caller: &str, action: &str, payload: Value| {
+                let hive = rt_hive(hive_id, if is_primary { "motherbee" } else { "worker" });
+                let caller = caller.to_string();
+                let action = action.to_string();
+                let identity = format!("SY.identity@{hive_id}");
+                async move {
+                    let mut runtime =
+                        IdentityRuntime::new(&hive, PathBuf::from("/tmp"), is_primary, None);
+                    runtime.store = rg_store();
+                    let laura = ed_laura(&mut runtime.store);
+                    let node = ed2_node(&mut runtime.store, "AI.ed4qm7k2xa@worker1", LC_TENANT);
+                    let before = runtime.store.ilks.clone();
+                    let mut payload = payload;
+                    payload["ilk_id"] = json!(if action == MSG_ILK_SET_WORKS_FOR {
+                        node
+                    } else {
+                        laura.clone()
+                    });
+                    if payload.get("works_for").is_some() {
+                        payload["works_for"] = json!(laura);
+                    }
+                    let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+                        &identity,
+                        build_identity_rpc_profile().expect("profile"),
+                    );
+                    let request = Message {
+                        routing: Routing {
+                            src: Uuid::new_v4().to_string(),
+                            src_l2_name: Some(caller),
+                            dst: Destination::Unicast(identity.clone()),
+                            ttl: 16,
+                            trace_id: Uuid::new_v4().to_string(),
+                        },
+                        meta: Meta {
+                            msg_type: SYSTEM_KIND.to_string(),
+                            msg: Some(action.clone()),
+                            ..Meta::default()
+                        },
+                        payload,
+                    };
+                    let mut control = IdentityControlState {
+                        schema_version: IDENTITY_CONFIG_SCHEMA_VERSION,
+                        config_version: 0,
+                        secret_source: IdentityDbSecretSource::Missing,
+                        db_ready: false,
+                        last_error: None,
+                    };
+                    let deltas = runtime
+                        .process_system_message(
+                            &client.sender_snapshot(),
+                            &request,
+                            None,
+                            &mut control,
+                            &identity,
+                        )
+                        .await
+                        .expect("handled");
+                    assert!(deltas.is_empty());
+                    assert_eq!(runtime.store.ilks, before);
+                    let reply = harness
+                        .next_outgoing_within(Duration::from_secs(1))
+                        .await
+                        .expect("an answer");
+                    assert_eq!(reply.meta.msg.as_deref(), Some(response_name(&action)));
+                    reply.payload["error_code"].clone()
+                }
+            };
+        for (action, payload) in [
+            (
+                MSG_ILK_SET_WORKS_FOR,
+                json!({"works_for": "", "work_role": "conscious"}),
+            ),
+            (
+                MSG_ILK_SET_DOCUMENT,
+                json!({"document": ed2_laura_document()}),
+            ),
+        ] {
+            for caller in [
+                "SY.admin@worker1",
+                "SY.architect@motherbee",
+                "SY.orchestrator@motherbee",
+            ] {
+                assert_eq!(
+                    answer("motherbee", true, caller, action, payload.clone()).await,
+                    json!("UNAUTHORIZED_REGISTRAR"),
+                    "{action} {caller}"
+                );
+            }
+            assert_eq!(
+                answer(
+                    "worker1",
+                    false,
+                    "SY.admin@motherbee",
+                    action,
+                    payload.clone()
+                )
+                .await,
+                json!("NOT_PRIMARY"),
+                "{action}"
+            );
+            // Past both checks: a primary without its database writes nothing.
+            assert_eq!(
+                answer(
+                    "motherbee",
+                    true,
+                    "SY.admin@motherbee",
+                    action,
+                    payload.clone()
+                )
+                .await,
+                json!("DB_NOT_READY"),
+                "{action}"
+            );
         }
     }
 }
