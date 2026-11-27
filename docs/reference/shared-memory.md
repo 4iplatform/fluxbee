@@ -36,7 +36,7 @@ The release lists SY.identity and SY.cognition for the motherbee and worker role
 | Config | `0x4A534343` "JSCC" (`CONFIG_MAGIC`) | `CONFIG_VERSION` 2 | 370,944 B |
 | LSA | `0x4A534C41` "JSLA" (`LSA_MAGIC`) | `LSA_VERSION` 3 | 672,000 B |
 | OPA | `0x4A534F50` "JSOP" (`OPA_MAGIC`) | `OPA_VERSION` 1 | 4,194,496 B (192 + 4 MiB) |
-| Identity | `0x4A534944` "JSID" (`IDENTITY_MAGIC`) | `IDENTITY_VERSION` 6 | by limits; 52,461,760 B with SY.identity's defaults |
+| Identity | `0x4A534944` "JSID" (`IDENTITY_MAGIC`) | `IDENTITY_VERSION` 7 | by limits; 52,658,368 B with SY.identity's defaults |
 | Memory | `0x4A534D4D` "JSMM" (`MEMORY_MAGIC`) | `MEMORY_VERSION` 1 | 4,194,496 B (192 + 4 MiB) |
 
 Sizes follow from the `#[repr(C)]` structs and the `layout_*` functions, which start every section
@@ -290,11 +290,11 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
 | --- | --- | --- | --- |
 | header | `IdentityHeader` (176 B) | 1 | 0 |
 | tenants | `TenantEntry` (320 B) | `max_tenants` | 192 |
-| ILKs | `IlkEntry` (1,160 B) | `max_ilks` | 327,872 |
-| channels (ICH) | `IchEntry` (488 B) | `max_ichs` = 4 × `max_ilks` | 9,830,592 |
-| ICH mappings | `IchMappingEntry` (384 B) | `max_ich_mappings` = 2 × `max_ichs` | 25,821,376 |
-| aliases | `IlkAliasEntry` (64 B) | `max_ilk_aliases` | 50,987,200 |
-| vocabulary | `VocabularyEntry` (232 B) | `max_vocabulary` | 51,511,488 |
+| ILKs | `IlkEntry` (1,184 B) | `max_ilks` | 327,872 |
+| channels (ICH) | `IchEntry` (488 B) | `max_ichs` = 4 × `max_ilks` | 10,027,200 |
+| ICH mappings | `IchMappingEntry` (384 B) | `max_ich_mappings` = 2 × `max_ichs` | 26,017,984 |
+| aliases | `IlkAliasEntry` (64 B) | `max_ilk_aliases` | 51,183,808 |
+| vocabulary | `VocabularyEntry` (232 B) | `max_vocabulary` | 51,708,096 |
 
 - **Limits.** SY.identity reads them from `hive.yaml` (`identity.max_ilks`, `max_tenants`,
   `max_vocabulary`, `max_ilk_aliases`); defaults 8,192, 1,024, 4,096 and `max_ilks`
@@ -322,7 +322,12 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `display_name`; `handler_node`, the serving node's L2 name (the ILK's `node_name`); `ich_offset`
   and `ich_count`, its channels, contiguous in the channel section; `role_hash`,
   `skill_hashes[16]` and `skill_count`, `handbook_hashes[8]` and `handbook_count`,
-  `personality_hash` (sha256; all zeros = none); `created_at`, `updated_at`.
+  `personality_hash` (sha256; all zeros = none); `created_at`, `updated_at`; since version 7,
+  `works_for`, the 16 bytes of the person's ILK the ILK works for (all zeros = nobody), and
+  `work_role`, its role to that person (`ILK_WORK_ROLE_*`: 0 none, 1 conscious, 2 channel,
+  3 agent), written together or not at all
+  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1); 8 reserved bytes
+  last. `flags` carries `FLAG_ACTIVE` and, for a virtual person, `ILK_FLAG_VIRTUAL` (0x0100).
 - `IchEntry`: `ich_id`, `ilk_id`, `tenant_id` (the channel's scope), `channel_type` (32 B) and
   `address` (256 B), both trimmed and lowercased, `flags`, `owner_l2_name`, `is_primary` (the first
   channel), `enabled`, `added_at`.
@@ -452,7 +457,9 @@ every other hive's SY.cognition write its own empty (`cognition_clear`).
 - Bump the region's version constant (§2.2).
 - Identity: update the `const _` size asserts in `src/shm/mod.rs`, the mirror structs and constants
   in `crates/fluxbee_sdk/src/identity.rs` (`IDENTITY_VERSION`, layout), and the sizes and offsets in
-  `go/fluxbee-go-sdk/identity_shm.go`, in step.
+  `go/fluxbee-go-sdk/identity_shm.go`, in step. The `IlkEntry` layout is also in
+  `go/fluxbee-go-sdk/testdata/identity_layout/ilk_entry.json`, which the tests of all three copies
+  read.
 - OPA and router header: `go/sy-opa-rules/main.go` hard-codes `opaHeaderSize = 192`, the offsets in
   `writeHeader`, the `RouterHeader` struct and `routerVersion = 2`.
 - Keep `compute_ich_hash` identical in Rust, the Rust SDK and Go.

@@ -52,7 +52,7 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    `VAULT_BOOT_WAIT` = 60 s, retrying only when the vault does not answer). The value is a URL
    string or `{"postgres_url": ...}` without a database name; SY.identity creates the database
    `fluxbee_identity` if it is missing (`IDENTITY_DB_NAME`, `ensure_database_exists`) and applies
-   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v5 in
+   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v7 in
    `identity_schema_migrations`). Without the secret, or if the database cannot be set up, it
    starts without a database (`sy.identity started without active DB backend`): reads work from
    memory and writes answer `DB_NOT_READY`.
@@ -131,8 +131,9 @@ Identity is created in two steps:
 - Name `/jsr-identity-<hive_id>` (`identity_shm_name`); each instance writes its own hive's
   region, with an `is_primary` flag in the header (`IdentityRegionWriter::open_or_create`).
 - Writes are seqlock-guarded; the heartbeat is refreshed every 5 s.
-- Contents: tenants, ILKs (with `handler_node`, the node an ILK belongs to), ICHs and their
-  lookup mappings, and unexpired aliases (`sync_identity_shm_mappings`). Marked (deleted)
+- Contents: tenants, ILKs (with `handler_node`, the node an ILK belongs to, and, since the
+  region's version 7, `works_for` and `work_role`, whom it works for and its role, empty until
+  something sets them), ICHs and their lookup mappings, and unexpired aliases (`sync_identity_shm_mappings`). Marked (deleted)
   tenants and ILKs are left out. The vocabulary region is part of the layout and always empty:
   nothing fills it.
 - Default limits: 8192 ILKs, 1024 tenants, 4096 vocabulary entries, aliases = the ILK limit
@@ -351,7 +352,8 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
 - PostgreSQL `fluxbee_identity` (primary): `identity_tenants`, `identity_ilks`,
   `identity_ilk_aliases`, `identity_ichs`, `identity_ilk_tenant_history`,
   `identity_schema_migrations`. Migration v5 drops `identity_vocabulary` and
-  `identity_tenants.approved_by`, which nothing used (FINDINGS A-218).
+  `identity_tenants.approved_by`, which nothing used (FINDINGS A-218); v6 adds
+  `identity_ilks.is_virtual`, and v7 `identity_ilks.works_for` and `work_role`.
 - A replica has no database: its state is in memory and in its SHM region, rebuilt from the
   primary at every start.
 - `/var/lib/fluxbee/identity/keys/<hive>.key`: sync HMAC keys (0600, directory 0700).

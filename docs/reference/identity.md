@@ -549,7 +549,10 @@ workers, so an agent with a definition runs on a worker too.
   - v3: the channel scope and `identity_ilk_tenant_history`;
   - v4: un-marks the people an old tenant delete had marked;
   - v5: drops `identity_vocabulary`, which nothing wrote or read, and `identity_tenants.approved_by`,
-    which nothing wrote (FINDINGS A-218). The identity SHM keeps its vocabulary region, empty (§6).
+    which nothing wrote (FINDINGS A-218). The identity SHM keeps its vocabulary region, empty (§6);
+  - v6: `identity_ilks.is_virtual`, the virtual person (a Digital Executive), false for every row;
+  - v7: `identity_ilks.works_for` and `work_role`, whom an ILK works for and its role, NULL for
+    every row.
 - `identity_ichs.tenant_id` stores the channel's scope; `UNIQUE(channel_type, address,
   tenant_id)` makes the key unique.
 - **At boot** the primary loads the whole store from the database
@@ -678,14 +681,16 @@ converges to the union of the mesh.
 
 ## 6. The identity SHM
 
-- **Name:** `/jsr-identity-<hive>` (`identity_shm_name`); magic `JSID`, version 6
+- **Name:** `/jsr-identity-<hive>` (`identity_shm_name`); magic `JSID`, version 7
   (`IDENTITY_MAGIC`, `IDENTITY_VERSION` in `src/shm/mod.rs`).
 - **One writer:** the SY.identity of that hive (`IdentityRegionWriter`). The primary writes the
   motherbee's region; each replica writes its own hive's region from what it synced.
 - **What it holds** (`sync_identity_shm_mappings`):
   - tenants not marked, with their real status;
-  - ILKs not marked, with tenant, type, status, display name, `handler_node` and definition
-    hashes;
+  - ILKs not marked, with tenant, type, status, display name, `handler_node`, definition
+    hashes, the virtual flag, and whom the ILK works for and its role (`works_for`,
+    `work_role`, empty for an ILK that works for nobody; nothing sets them yet,
+    [digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1);
   - channels with their scope, and the `(type, address, scope)` mappings;
   - aliases;
   - the vocabulary region, which nothing fills: it is always empty, and the layout keeps it.
