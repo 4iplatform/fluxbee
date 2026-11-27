@@ -587,6 +587,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-364 🔵 `externalize` with `fanout_family` defaults `inbound_family` to `user`, which io.wapp drops as a reply with no target: a WhatsApp fan-out made without it loses every event (low; SY.admin; found 2026-11-26 reading the code for the ED's stage 2).
 - A-365 🔵 io.wapp's contract lists `identity.*`, `io.blob.*`, `node.*` and `runtime.*` as optional fields it never reads (low; io.wapp; found 2026-11-26 reading the code for the ED's stage 2).
 - A-366 🔵 Archi's designer is told a resource without `ownership` defaults to `external`; the code defaults a node to `solution`, and the reconciler never reads a node's ownership (low; Archi; found 2026-11-26 reading the code for the ED's stage 2).
+- A-367 ✅ The Go SDK's `TestTheQueueHandsOverItsSystemMessagesFirst` raced the queue's forwarder: it read the lanes' depths right after the last message, before the forwarder's pop, and failed on GitHub's runner with `[0 1]`; the test waits for the pop now (low; Go SDK; found 2026-11-27 in the identity SHM v7 branch's CI; fixed in 0.1.157).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1663,6 +1664,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-367 [Go SDK] 🔵 low ✅ fixed in 0.1.157 (found 2026-11-27 in CI of `coa/shm-v7`, the identity SHM's version 7; a test's race, not the code's) — `TestTheQueueHandsOverItsSystemMessagesFirst` read the depths before the forwarder's last pop
+
+- **What:** the test (FINDINGS A-329, `go/fluxbee-go-sdk/command_queue_test.go`) reads the five
+  messages from the queue's output and then checks that both lanes are empty. The forwarder
+  (`commandQueue.run`, `command_queue.go`) takes a message out of its lane right after the consumer
+  received it (`q.out <- msg`, then `q.pop(lane)`), so the depths read at once can still count the
+  last one. GitHub's runner hit it: `the queue is empty once handed over, got [0 1]`.
+- **Effect:** a flaky failure of the Go SDK's tests, unrelated to the change under test. The queue
+  is right: a message leaves its lane once it was handed over.
+- **Fix (0.1.157):** the test waits up to 2 s for the last pop; run 20 times in a row on the Mac.
 
 ### A-366 [Archi] 🔵 low (found 2026-11-26 reading the code for the Digital Executive's stage 2; read in the code, not seen on 8.x) — a node's `ownership`: the designer is told `external` by default, the code says `solution`, and the reconciler reads neither
 
