@@ -17,7 +17,7 @@ import (
 
 const (
 	identityMagic            uint32 = 0x4A534944 // "JSID"
-	identityVersionCurrent   uint32 = 6
+	identityVersionCurrent   uint32 = 7
 	identityRegionAlign             = 64
 	identitySeqlockTimeoutMs        = 50
 
@@ -27,7 +27,7 @@ const (
 	// wrong offset and silently miss them.
 	identityHeaderSize  = 176
 	tenantEntrySize     = 320
-	ilkEntrySize        = 1160
+	ilkEntrySize        = 1184
 	ichEntrySize        = 488
 	ichMappingEntrySize = 384
 
@@ -40,17 +40,26 @@ const (
 	ichMapOffTenantID    = 328 // [u8; 16]
 	ichMapOffFlags       = 344 // u16
 
-	// Field offsets within IlkEntry (1160 bytes total).
+	// Field offsets within IlkEntry (1184 bytes total; testdata/identity_layout/ilk_entry.json holds
+	// them for the three copies).
 	ilkOffIlkID       = 0
-	ilkOffType        = 16  // u8: 0 human, 1 agent, 2 system
-	ilkOffFlags       = 18  // u16
-	ilkOffDisplayName = 36  // [u8; 128]
-	ilkOffHandlerNode = 164 // [u8; 128]
+	ilkOffType        = 16   // u8: 0 human, 1 agent, 2 system
+	ilkOffFlags       = 18   // u16
+	ilkOffDisplayName = 36   // [u8; 128]
+	ilkOffHandlerNode = 164  // [u8; 128]
+	ilkOffWorksFor    = 1152 // [u8; 16]: the person's ILK, zeros for nobody (version 7)
+	ilkOffWorkRole    = 1168 // u8: ilkWorkRole* (version 7)
 
 	// IlkEntry flags.
 	ilkFlagActive uint16 = 0x0001
 	// ilkFlagVirtual marks a virtual person, a Digital Executive (src/shm/mod.rs ILK_FLAG_VIRTUAL).
 	ilkFlagVirtual uint16 = 0x0100
+
+	// IlkEntry work_role bytes, what the ILK is to the person it works for (src/shm/mod.rs
+	// ILK_WORK_ROLE_*); 0 is none.
+	ilkWorkRoleConscious byte = 1
+	ilkWorkRoleChannel   byte = 2
+	ilkWorkRoleAgent     byte = 3
 
 	// Field offsets within IdentityHeader.
 	hdrOffMagic          = 0
@@ -304,8 +313,8 @@ func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error
 }
 
 // LookupIlk is what the identity memory of hiveID says of the active ILK ilkID ("ilk:<uuid>"): its
-// type (human, agent or system) and its display name. (_, false, nil) on a miss, and when the region
-// is absent.
+// type (human, agent or system), its display name, and whom it works for and in what role.
+// (_, false, nil) on a miss, and when the region is absent.
 func LookupIlk(hiveID, ilkID string) (IlkFacts, bool, error) {
 	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
 	return lookupIlkAt(shmFilePath(name), ilkID)
@@ -408,7 +417,8 @@ func readIlkEntries(path string, scan func(entries []byte, count int)) (bool, er
 	}
 }
 
-// scanIlkEntriesByID finds the active entry of id: its type and its display name.
+// scanIlkEntriesByID finds the active entry of id: its type, its display name, its virtual flag, and
+// whom it works for and in what role.
 func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
 	for i := 0; i < count; i++ {
 		off := i * ilkEntrySize
@@ -423,12 +433,39 @@ func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
 			continue
 		}
 		return IlkFacts{
-			Type:    ilkTypeName(entry[ilkOffType]),
-			Name:    identityFixedStr(entry[ilkOffDisplayName : ilkOffDisplayName+128]),
-			Virtual: binary.LittleEndian.Uint16(entry[ilkOffFlags:])&ilkFlagVirtual != 0,
+			Type:     ilkTypeName(entry[ilkOffType]),
+			Name:     identityFixedStr(entry[ilkOffDisplayName : ilkOffDisplayName+128]),
+			Virtual:  binary.LittleEndian.Uint16(entry[ilkOffFlags:])&ilkFlagVirtual != 0,
+			WorksFor: ilkWorksFor(entry[ilkOffWorksFor : ilkOffWorksFor+16]),
+			WorkRole: ilkWorkRoleName(entry[ilkOffWorkRole]),
 		}, true
 	}
 	return IlkFacts{}, false
+}
+
+// ilkWorksFor is the person an entry's works_for names, "ilk:<uuid>"; "" for zeros, nobody.
+func ilkWorksFor(raw []byte) string {
+	var id uuid.UUID
+	copy(id[:], raw)
+	if id == (uuid.UUID{}) {
+		return ""
+	}
+	return "ilk:" + id.String()
+}
+
+// ilkWorkRoleName is an entry's work_role as the identity names it (fluxbee_sdk work_role_from_shm):
+// "" for none and for a byte no writer of this version writes.
+func ilkWorkRoleName(value byte) string {
+	switch value {
+	case ilkWorkRoleConscious:
+		return "conscious"
+	case ilkWorkRoleChannel:
+		return "channel"
+	case ilkWorkRoleAgent:
+		return "agent"
+	default:
+		return ""
+	}
 }
 
 // ilkTypeName is an entry's ilk_type as the identity names it (fluxbee_sdk ilk_type_from_shm).

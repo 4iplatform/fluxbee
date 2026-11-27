@@ -29683,6 +29683,8 @@ mod tests {
                 handbook_hashes: Vec::new(),
                 personality_hash: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             }
         };
         let known = vec![
@@ -51019,6 +51021,8 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
             is_virtual,
+            works_for: None,
+            work_role: None,
         };
         let held = [person(laura, true), person(ana, false)];
         ctx.ilk_by_id = Arc::new(move |hive: &str, ilk_id: &str| {

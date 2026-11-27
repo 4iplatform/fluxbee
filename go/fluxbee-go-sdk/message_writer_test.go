@@ -128,6 +128,35 @@ func TestLookupIlkReadsTheVirtualFlag(t *testing.T) {
 	}
 }
 
+// An ILK that works for a person reads as that person's ILK and its role; one that works for
+// nobody, or whose role byte no writer of this version writes, reads as "".
+func TestLookupIlkReadsWhomAnIlkWorksFor(t *testing.T) {
+	laura := uuid.MustParse("5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a")
+	conscious, channel, agent, alone, odd := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	path := writeIdentityRegion(t, []testIlk{
+		{id: conscious, kind: 1, name: "AI.ed4qm7k2xa@worker1", active: true, worksFor: laura, workRole: ilkWorkRoleConscious},
+		{id: channel, kind: 1, name: "IO.wapp.ed4qm7k2xa@worker1", active: true, worksFor: laura, workRole: ilkWorkRoleChannel},
+		{id: agent, kind: 1, name: "AI.helper@worker1", active: true, worksFor: laura, workRole: ilkWorkRoleAgent},
+		{id: alone, kind: 1, name: "IO.slack@worker1", active: true},
+		{id: odd, kind: 1, name: "IO.odd@worker1", active: true, worksFor: laura, workRole: 9},
+	})
+	for _, want := range []struct {
+		id   uuid.UUID
+		role string
+	}{{conscious, "conscious"}, {channel, "channel"}, {agent, "agent"}} {
+		facts, ok, err := lookupIlkAt(path, "ilk:"+want.id.String())
+		if err != nil || !ok || facts.WorksFor != "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a" || facts.WorkRole != want.role || facts.Type != "agent" {
+			t.Fatalf("%s: %+v %v %v", want.role, facts, ok, err)
+		}
+	}
+	if facts, ok, err := lookupIlkAt(path, "ilk:"+alone.String()); err != nil || !ok || facts != (IlkFacts{Type: "agent", Name: "IO.slack@worker1"}) {
+		t.Fatalf("alone: %+v %v %v", facts, ok, err)
+	}
+	if facts, ok, err := lookupIlkAt(path, "ilk:"+odd.String()); err != nil || !ok || facts.WorkRole != "" {
+		t.Fatalf("odd: %+v %v %v", facts, ok, err)
+	}
+}
+
 func TestReadSelfIlkFromEnv(t *testing.T) {
 	t.Setenv(envSelfIlkID, " ilk:wf ")
 	if got := ReadSelfIlkFromEnv(); got != "ilk:wf" {
@@ -143,11 +172,13 @@ func TestReadSelfIlkFromEnv(t *testing.T) {
 }
 
 type testIlk struct {
-	id      uuid.UUID
-	kind    byte
-	name    string
-	active  bool
-	virtual bool
+	id       uuid.UUID
+	kind     byte
+	name     string
+	active   bool
+	virtual  bool
+	worksFor uuid.UUID
+	workRole byte
 }
 
 // writeIdentityRegion writes an identity region of this SDK's version with one tenant slot and
@@ -174,6 +205,8 @@ func writeIdentityRegion(t *testing.T, ilks []testIlk) string {
 			binary.LittleEndian.PutUint16(entry[ilkOffFlags:], flags)
 		}
 		copy(entry[ilkOffDisplayName:ilkOffDisplayName+128], ilk.name)
+		copy(entry[ilkOffWorksFor:ilkOffWorksFor+16], ilk.worksFor[:])
+		entry[ilkOffWorkRole] = ilk.workRole
 	}
 	path := filepath.Join(t.TempDir(), "jsr-identity-test")
 	if err := os.WriteFile(path, data, 0o600); err != nil {

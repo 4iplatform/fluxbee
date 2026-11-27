@@ -7944,6 +7944,8 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         }
     }
 

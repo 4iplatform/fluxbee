@@ -32,7 +32,10 @@ pub const OPA_VERSION: u32 = 1;
 pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-pub const IDENTITY_VERSION: u32 = 6;
+/// IDENTITY_VERSION = 7: `IlkEntry` gained `works_for` and `work_role`, the person an ILK works
+/// for and its role (docs/digital-executive-v1-stage-2.md §1.1), before its reserved bytes. A
+/// reader refuses another version, so writer and readers change together.
+pub const IDENTITY_VERSION: u32 = 7;
 pub const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
 pub const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
@@ -88,6 +91,14 @@ pub const HIVE_FLAG_SELF: u16 = 0x0010;
 /// reader that does not know this bit ignores it. Its copies: `crates/fluxbee_sdk/src/identity.rs`
 /// and `go/fluxbee-go-sdk/identity_shm.go`.
 pub const ILK_FLAG_VIRTUAL: u16 = 0x0100;
+/// An identity ILK entry's `work_role`, what the ILK is to the person its `works_for` names
+/// (docs/digital-executive-v1-stage-2.md §1.1): none (the ILK works for nobody), the person's
+/// conscious, one of its channels, or one of its agents. Its copies:
+/// `crates/fluxbee_sdk/src/identity.rs` and `go/fluxbee-go-sdk/identity_shm.go`.
+pub const ILK_WORK_ROLE_NONE: u8 = 0;
+pub const ILK_WORK_ROLE_CONSCIOUS: u8 = 1;
+pub const ILK_WORK_ROLE_CHANNEL: u8 = 2;
+pub const ILK_WORK_ROLE_AGENT: u8 = 3;
 pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 
@@ -430,6 +441,12 @@ pub struct IlkEntry {
     pub created_at: u64,
     pub updated_at: u64,
     pub personality_hash: [u8; 32],
+    /// The person this ILK works for: its ILK's 16 bytes, all zeros for nobody.
+    pub works_for: [u8; 16],
+    /// What this ILK is to that person (`ILK_WORK_ROLE_*`), `ILK_WORK_ROLE_NONE` for nobody.
+    pub work_role: u8,
+    pub _pad1: [u8; 7],
+    /// Kept for the person's document's hash (docs/digital-executive-v1-stage-2.md §1.2).
     pub _reserved: [u8; 8],
 }
 
@@ -479,10 +496,41 @@ pub struct IlkAliasEntry {
 const _: () = {
     assert!(std::mem::size_of::<IdentityHeader>() == 176);
     assert!(std::mem::size_of::<TenantEntry>() == 320);
-    assert!(std::mem::size_of::<IlkEntry>() == 1160);
+    assert!(std::mem::size_of::<IlkEntry>() == 1184);
+    // The fields the Go SDK reads, and the ones version 7 added (go/fluxbee-go-sdk/testdata/
+    // identity_layout/ilk_entry.json holds the same numbers for all three copies).
+    assert!(std::mem::offset_of!(IlkEntry, flags) == 18);
+    assert!(std::mem::offset_of!(IlkEntry, display_name) == 36);
+    assert!(std::mem::offset_of!(IlkEntry, handler_node) == 164);
+    assert!(std::mem::offset_of!(IlkEntry, personality_hash) == 1120);
+    assert!(std::mem::offset_of!(IlkEntry, works_for) == 1152);
+    assert!(std::mem::offset_of!(IlkEntry, work_role) == 1168);
+    assert!(std::mem::offset_of!(IlkEntry, _reserved) == 1176);
     assert!(std::mem::size_of::<IchEntry>() == 488);
     assert!(std::mem::size_of::<IchMappingEntry>() == 384);
 };
+
+/// The `work_role` byte of a role's name (`conscious`, `channel`, `agent`), as an ILK record holds
+/// it; `None` for any other name. An ILK that works for nobody has no role and is written
+/// `ILK_WORK_ROLE_NONE`.
+pub fn ilk_work_role_code(role: &str) -> Option<u8> {
+    match role {
+        "conscious" => Some(ILK_WORK_ROLE_CONSCIOUS),
+        "channel" => Some(ILK_WORK_ROLE_CHANNEL),
+        "agent" => Some(ILK_WORK_ROLE_AGENT),
+        _ => None,
+    }
+}
+
+/// The role's name of a `work_role` byte; `None` for `ILK_WORK_ROLE_NONE` and any unknown byte.
+pub fn ilk_work_role_name(code: u8) -> Option<&'static str> {
+    match code {
+        ILK_WORK_ROLE_CONSCIOUS => Some("conscious"),
+        ILK_WORK_ROLE_CHANNEL => Some("channel"),
+        ILK_WORK_ROLE_AGENT => Some("agent"),
+        _ => None,
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -3991,6 +4039,9 @@ fn empty_ilk_entry() -> IlkEntry {
         created_at: 0,
         updated_at: 0,
         personality_hash: [0u8; 32],
+        works_for: [0u8; 16],
+        work_role: 0,
+        _pad1: [0u8; 7],
         _reserved: [0u8; 8],
     }
 }
@@ -4513,6 +4564,9 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             personality_hash: [0u8; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0u8; 8],
         };
         writer.upsert_ilk_entry(ilk).expect("ilk upsert");
@@ -4576,6 +4630,122 @@ mod tests {
             writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id),
             None
         );
+
+        cleanup_shm(&name);
+    }
+
+    /// The layout shared with the Rust and Go SDKs (go/fluxbee-go-sdk/testdata/identity_layout).
+    #[test]
+    fn identity_ilk_entry_layout_matches_the_fixture_shared_with_the_sdks() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("go/fluxbee-go-sdk/testdata/identity_layout/ilk_entry.json");
+        let raw = std::fs::read_to_string(path).expect("read the layout");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("decode the layout");
+        assert_eq!(fixture["version"], serde_json::json!(IDENTITY_VERSION));
+        assert_eq!(
+            fixture["ilk_entry_size"],
+            serde_json::json!(size_of::<IlkEntry>())
+        );
+        let offsets = [
+            ("ilk_id", std::mem::offset_of!(IlkEntry, ilk_id)),
+            ("ilk_type", std::mem::offset_of!(IlkEntry, ilk_type)),
+            ("flags", std::mem::offset_of!(IlkEntry, flags)),
+            ("display_name", std::mem::offset_of!(IlkEntry, display_name)),
+            ("handler_node", std::mem::offset_of!(IlkEntry, handler_node)),
+            (
+                "personality_hash",
+                std::mem::offset_of!(IlkEntry, personality_hash),
+            ),
+            ("works_for", std::mem::offset_of!(IlkEntry, works_for)),
+            ("work_role", std::mem::offset_of!(IlkEntry, work_role)),
+            ("reserved", std::mem::offset_of!(IlkEntry, _reserved)),
+        ];
+        assert_eq!(
+            fixture["offsets"].as_object().expect("offsets").len(),
+            offsets.len()
+        );
+        for (field, offset) in offsets {
+            assert_eq!(
+                fixture["offsets"][field],
+                serde_json::json!(offset),
+                "{field}"
+            );
+        }
+        let roles = fixture["work_roles"].as_object().expect("work_roles");
+        assert_eq!(roles.len(), 4);
+        assert_eq!(roles["none"], serde_json::json!(ILK_WORK_ROLE_NONE));
+        for (name, code) in roles.iter().filter(|(name, _)| *name != "none") {
+            let code = code.as_u64().expect("a code") as u8;
+            assert_eq!(ilk_work_role_code(name), Some(code), "{name}");
+            assert_eq!(ilk_work_role_name(code), Some(name.as_str()), "{name}");
+        }
+    }
+
+    #[test]
+    fn identity_work_role_names_and_codes() {
+        assert_eq!(
+            ilk_work_role_code("conscious"),
+            Some(ILK_WORK_ROLE_CONSCIOUS)
+        );
+        assert_eq!(ilk_work_role_code("channel"), Some(ILK_WORK_ROLE_CHANNEL));
+        assert_eq!(ilk_work_role_code("agent"), Some(ILK_WORK_ROLE_AGENT));
+        // No other name has a code, not even a spelling of one.
+        assert_eq!(ilk_work_role_code(""), None);
+        assert_eq!(ilk_work_role_code("Conscious"), None);
+        assert_eq!(ilk_work_role_code("none"), None);
+        // No role, and a byte no writer of this version writes, read as none.
+        assert_eq!(ilk_work_role_name(ILK_WORK_ROLE_NONE), None);
+        assert_eq!(ilk_work_role_name(4), None);
+        assert_eq!(ilk_work_role_name(u8::MAX), None);
+    }
+
+    /// Whom an ILK works for goes into the region as it was written and reads back from it; an ILK
+    /// that works for nobody reads as zeros.
+    #[test]
+    fn identity_work_relation_round_trips_through_the_region() {
+        let name = format!("/jsid-w-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let limits = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 2,
+            max_vocabulary: 1,
+            max_ilk_aliases: 2,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("open identity region");
+        let laura = [0x11u8; 16];
+        let mut channel = empty_ilk_entry();
+        channel.ilk_id = [0x22u8; 16];
+        channel.flags = FLAG_ACTIVE;
+        channel.works_for = laura;
+        channel.work_role = ILK_WORK_ROLE_CHANNEL;
+        channel._reserved = [0xee; 8];
+        let mut alone = empty_ilk_entry();
+        alone.ilk_id = [0x33u8; 16];
+        alone.flags = FLAG_ACTIVE;
+        writer.upsert_ilk_entry(channel).expect("channel upsert");
+        writer.upsert_ilk_entry(alone).expect("alone upsert");
+
+        let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open reader");
+        let snap = reader.try_read_snapshot().expect("snapshot");
+        let entry_of = |ilk_id: [u8; 16]| {
+            *snap
+                .ilks
+                .iter()
+                .find(|entry| entry.ilk_id == ilk_id)
+                .expect("the entry")
+        };
+        let read = entry_of([0x22u8; 16]);
+        assert_eq!(read.works_for, laura);
+        assert_eq!(read.work_role, ILK_WORK_ROLE_CHANNEL);
+        assert_eq!(ilk_work_role_name(read.work_role), Some("channel"));
+        // The reserved bytes stay apart from the relation.
+        assert_eq!(read._reserved, [0xee; 8]);
+        let read = entry_of([0x33u8; 16]);
+        assert_eq!(read.works_for, [0u8; 16]);
+        assert_eq!(read.work_role, ILK_WORK_ROLE_NONE);
+        assert_eq!(ilk_work_role_name(read.work_role), None);
 
         cleanup_shm(&name);
     }
@@ -4740,6 +4910,9 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             personality_hash: [0u8; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0u8; 8],
         };
         let ich = IchEntry {

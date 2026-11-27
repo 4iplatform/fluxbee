@@ -4422,6 +4422,8 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         };
         let channel = |channel_type: &str, scope: &str, ilk: IdentityIlkOption| IdentityIchOption {
             ich_id: format!("ich:{}", uuid::Uuid::new_v4()),

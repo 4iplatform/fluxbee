@@ -30,10 +30,11 @@ use fluxbee_sdk::{
 use json_router::mesh_reply::{self, PageAsk};
 use json_router::release_settings::{self, HiveRole};
 use json_router::shm::{
-    copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
-    IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry,
-    VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
+    copy_bytes_with_len, ilk_work_role_code, now_epoch_ms, sha256_hex_to_bytes, IchEntry,
+    IdentityRegionLimits, IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry,
+    TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
     IDENTITY_DEFINITION_MAX_HANDBOOKS, IDENTITY_DEFINITION_MAX_SKILLS, ILK_FLAG_VIRTUAL,
+    ILK_WORK_ROLE_NONE,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -570,6 +571,16 @@ struct IlkRecord {
         skip_serializing_if = "std::ops::Not::not"
     )]
     is_virtual: bool,
+    /// The person this ILK works for, its ILK (`ilk:<uuid>`), and the ILK's role to that person:
+    /// `conscious`, `channel` or `agent` (docs/digital-executive-v1-stage-2.md §1.1). Replicated
+    /// from the primary like any field, and projected into the identity SHM (version 7). `None` for
+    /// an ILK that works for nobody, which is every ILK until `ILK_SET_WORKS_FOR` sets them. Absent
+    /// on the wire when `None`, so a record or a delta from a binary that predates them reads as
+    /// working for nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    works_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,10 +876,17 @@ impl IdentityStore {
                     "deleted_at_ms": ilk.deleted_at_ms,
                     "deleted_reason": ilk.deleted_reason,
                 }))
-                // `virtual` only on a virtual person's row, as its record carries it.
+                // `virtual` only on a virtual person's row, and whom it works for only on the row
+                // of an ILK that works for someone, as its record carries them.
                 .map(|mut row| {
                     if ilk.is_virtual {
                         row["virtual"] = Value::Bool(true);
+                    }
+                    if let Some(works_for) = &ilk.works_for {
+                        row["works_for"] = json!(works_for);
+                    }
+                    if let Some(work_role) = &ilk.work_role {
+                        row["work_role"] = json!(work_role);
                     }
                     row
                 })
@@ -1094,6 +1112,8 @@ impl IdentityStore {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             };
             let needs_upsert = self
                 .ilks
@@ -1283,6 +1303,8 @@ impl IdentityStore {
             deleted_at_ms: None,
             deleted_reason: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         };
         self.ich_lookup.insert(key, ilk_id.clone());
         self.ilks.insert(ilk_id.clone(), ilk);
@@ -1380,6 +1402,8 @@ impl IdentityStore {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: true,
+                works_for: None,
+                work_role: None,
             },
         );
         Ok(json!({
@@ -1527,6 +1551,8 @@ impl IdentityStore {
                         deleted_at_ms: None,
                         deleted_reason: None,
                         is_virtual: false,
+                        works_for: None,
+                        work_role: None,
                     },
                 );
             }
@@ -5571,9 +5597,13 @@ fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, Ide
             created_at: now_ms,
             updated_at: now_ms,
             personality_hash: [0u8; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0u8; 8],
         };
         apply_definition_to_ilk_entry(&mut ilk_entry, &ilk.definition)?;
+        apply_work_relation_to_ilk_entry(&mut ilk_entry, ilk);
         let display_name = identification_str(&ilk.identification, "display_name")
             .or_else(|| identification_str(&ilk.identification, "node_name"))
             .unwrap_or(ilk.ilk_id.as_str());
@@ -5779,6 +5809,25 @@ fn ilk_entry_flags(ilk: &IlkRecord) -> u16 {
     }
 }
 
+/// Whom an ILK works for, in its SHM entry: the person's ILK as its 16 bytes and the role's byte
+/// (docs/digital-executive-v1-stage-2.md §1.1). The two go in together or not at all, so a reader
+/// never sees a person without a role or a role without a person: an ILK that works for nobody, or
+/// whose record holds no canonical `ilk:<uuid>` and a known role, is written as zeros
+/// (`ILK_WORK_ROLE_NONE`).
+fn apply_work_relation_to_ilk_entry(entry: &mut IlkEntry, ilk: &IlkRecord) {
+    let person = ilk
+        .works_for
+        .as_deref()
+        .and_then(|works_for| parse_prefixed_uuid(works_for, "ilk").ok());
+    let role = ilk.work_role.as_deref().and_then(ilk_work_role_code);
+    let (works_for, work_role) = match (person, role) {
+        (Some(person), Some(role)) => (*person.as_bytes(), role),
+        _ => ([0u8; 16], ILK_WORK_ROLE_NONE),
+    };
+    entry.works_for = works_for;
+    entry.work_role = work_role;
+}
+
 fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
     let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
@@ -5802,9 +5851,13 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         created_at: now_ms,
         updated_at: now_ms,
         personality_hash: [0u8; 32],
+        works_for: [0u8; 16],
+        work_role: 0,
+        _pad1: [0u8; 7],
         _reserved: [0u8; 8],
     };
     apply_definition_to_ilk_entry(&mut entry, &ilk.definition)?;
+    apply_work_relation_to_ilk_entry(&mut entry, ilk);
     let display_name = identification_str(&ilk.identification, "display_name")
         .or_else(|| identification_str(&ilk.identification, "node_name"))
         .unwrap_or(ilk.ilk_id.as_str());
@@ -8298,6 +8351,15 @@ const MIGRATION_V6_VIRTUAL_PERSON: &str = "ALTER TABLE identity_ilks \
      INSERT INTO identity_schema_migrations (version, name) \
      VALUES (6, 'virtual_person') ON CONFLICT (version) DO NOTHING;";
 
+/// Migration v7 -- whom an ILK works for (docs/digital-executive-v1-stage-2.md §1.1): the person's
+/// ILK (`ilk:<uuid>`) and the ILK's role to it (`conscious`, `channel`, `agent`). NULL for every
+/// row that exists, since no ILK works for anyone yet. Every boot; idempotent.
+const MIGRATION_V7_WORKS_FOR: &str = "ALTER TABLE identity_ilks \
+     ADD COLUMN IF NOT EXISTS works_for TEXT NULL, \
+     ADD COLUMN IF NOT EXISTS work_role TEXT NULL;\n\
+     INSERT INTO identity_schema_migrations (version, name) \
+     VALUES (7, 'works_for') ON CONFLICT (version) DO NOTHING;";
+
 async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
     let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
@@ -8617,6 +8679,12 @@ RETURNING ilk_id::text
         tx.batch_execute(MIGRATION_V6_VIRTUAL_PERSON).await?;
         tx.commit().await?;
     }
+    // v7 -- whom an ILK works for, and its role (MIGRATION_V7_WORKS_FOR).
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(MIGRATION_V7_WORKS_FOR).await?;
+        tx.commit().await?;
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -8624,7 +8692,7 @@ RETURNING ilk_id::text
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (migrations through v6, virtual_person)");
+    tracing::info!("identity primary schema ensured (migrations through v7, works_for)");
     Ok(())
 }
 
@@ -8812,6 +8880,8 @@ INSERT INTO identity_ilks (
     deleted_at,
     deleted_reason,
     is_virtual,
+    works_for,
+    work_role,
     updated_at
 )
 VALUES (
@@ -8828,6 +8898,8 @@ VALUES (
     CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
     $12,
     $13,
+    $14,
+    $15,
     NOW()
 )
 ON CONFLICT (ilk_id) DO UPDATE
@@ -8844,6 +8916,8 @@ SET
     deleted_at = EXCLUDED.deleted_at,
     deleted_reason = EXCLUDED.deleted_reason,
     is_virtual = EXCLUDED.is_virtual,
+    works_for = EXCLUDED.works_for,
+    work_role = EXCLUDED.work_role,
     updated_at = NOW()
 "#,
         &[
@@ -8860,6 +8934,8 @@ SET
             &deleted_at_ms,
             &ilk.deleted_reason,
             &ilk.is_virtual,
+            &ilk.works_for,
+            &ilk.work_role,
         ],
     )
     .await?;
@@ -9079,7 +9155,9 @@ SELECT
         ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
     END AS deleted_at_ms,
     deleted_reason,
-    is_virtual
+    is_virtual,
+    works_for,
+    work_role
 FROM identity_ilks
 ORDER BY created_at ASC
 "#,
@@ -9105,6 +9183,8 @@ ORDER BY created_at ASC
                 deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
                 deleted_reason: row.get("deleted_reason"),
                 is_virtual: row.get("is_virtual"),
+                works_for: row.get("works_for"),
+                work_role: row.get("work_role"),
             },
         );
     }
@@ -10013,6 +10093,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         store.aliases.insert(
@@ -10238,6 +10320,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10697,6 +10781,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10734,6 +10820,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10789,6 +10877,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10858,6 +10948,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10906,6 +10998,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10939,6 +11033,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -10975,6 +11071,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -11013,6 +11111,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         store.ich_lookup.insert(
@@ -11183,6 +11283,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -11251,6 +11353,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
 
@@ -11294,6 +11398,8 @@ mod tests {
                     deleted_at_ms: None,
                     deleted_reason: None,
                     is_virtual: false,
+                    works_for: None,
+                    work_role: None,
                 },
             );
         }
@@ -11442,6 +11548,8 @@ mod tests {
             deleted_at_ms: None,
             deleted_reason: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         }
     }
 
@@ -11988,6 +12096,8 @@ mod tests {
                 deleted_at_ms: Some(7),
                 deleted_reason: Some(DELETED_REASON_DIRECT.to_string()),
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         let err = store
@@ -12067,6 +12177,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         let err = store
@@ -12327,6 +12439,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         let new_ilk = "ilk:77777777-7777-4777-8777-777777777777";
@@ -14220,6 +14334,8 @@ mod tests {
                 deleted_at_ms: None,
                 deleted_reason: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             },
         );
         let err = store
@@ -14272,6 +14388,8 @@ mod tests {
             deleted_at_ms: None,
             deleted_reason: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         };
         let mut delta =
             serde_json::to_value(IdentityDelta::IlkUpsert { ilk: record }).expect("serialize");
@@ -14866,6 +14984,8 @@ mod tests {
             deleted_at_ms: None,
             deleted_reason: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         }
     }
 
@@ -14906,6 +15026,8 @@ mod tests {
             deleted_at_ms: None,
             deleted_reason: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         };
         store.ilks.insert(person.ilk_id.clone(), person);
         store
@@ -16629,5 +16751,240 @@ mod tests {
             "worker1",
             &store
         ));
+    }
+
+    #[test]
+    fn the_works_for_migration_adds_its_two_columns_and_stamps_v7() {
+        let sql = MIGRATION_V7_WORKS_FOR;
+        assert!(sql.contains(
+            "ALTER TABLE identity_ilks ADD COLUMN IF NOT EXISTS works_for TEXT NULL, \
+             ADD COLUMN IF NOT EXISTS work_role TEXT NULL;"
+        ));
+        assert!(sql.contains(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (7, 'works_for') \
+             ON CONFLICT (version) DO NOTHING;"
+        ));
+        // The two statements, and nothing that rewrites a row or sets a default.
+        assert_eq!(sql.matches(';').count(), 2);
+        assert!(!sql.contains("UPDATE"));
+        assert!(!sql.contains("DEFAULT"));
+    }
+
+    /// An agent's ILK that works for Laura, as `ILK_SET_WORKS_FOR` will set it (2C).
+    fn wf_channel_of(person: &str) -> IlkRecord {
+        let mut channel = ilk_for(
+            "IO.wapp.ed4qm7k2xa@worker1",
+            "ilk:abababab-abab-4bab-8bab-abababababab",
+        );
+        channel.works_for = Some(person.to_string());
+        channel.work_role = Some("channel".to_string());
+        channel
+    }
+
+    #[test]
+    fn the_shm_entry_names_whom_an_ilk_works_for_and_its_role() {
+        use json_router::shm::{
+            ILK_WORK_ROLE_AGENT, ILK_WORK_ROLE_CHANNEL, ILK_WORK_ROLE_CONSCIOUS,
+        };
+        let laura = "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a";
+        let laura_bytes = *Uuid::parse_str(&laura[4..]).unwrap().as_bytes();
+        let channel = wf_channel_of(laura);
+        let entry = ilk_entry_from_record(&channel).expect("the channel's entry");
+        assert_eq!(entry.works_for, laura_bytes);
+        assert_eq!(entry.work_role, ILK_WORK_ROLE_CHANNEL);
+        // Each role its own byte.
+        for (role, code) in [
+            ("conscious", ILK_WORK_ROLE_CONSCIOUS),
+            ("channel", ILK_WORK_ROLE_CHANNEL),
+            ("agent", ILK_WORK_ROLE_AGENT),
+        ] {
+            let mut part = channel.clone();
+            part.work_role = Some(role.to_string());
+            let entry = ilk_entry_from_record(&part).expect("the part's entry");
+            assert_eq!((entry.works_for, entry.work_role), (laura_bytes, code));
+        }
+
+        // Nobody, and a pair that is not whole or not valid, is written as zeros.
+        let alone = ilk_for(
+            "IO.slack@worker1",
+            "ilk:cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+        );
+        let mut no_role = channel.clone();
+        no_role.work_role = None;
+        let mut no_person = channel.clone();
+        no_person.works_for = None;
+        let mut unknown_role = channel.clone();
+        unknown_role.work_role = Some("soul".to_string());
+        let mut not_an_ilk = channel.clone();
+        not_an_ilk.works_for = Some(laura.replace("ilk:", "tnt:"));
+        let mut other_spelling = channel.clone();
+        other_spelling.works_for = Some(laura.to_ascii_uppercase().replace("ILK:", "ilk:"));
+        for record in [
+            &alone,
+            &no_role,
+            &no_person,
+            &unknown_role,
+            &not_an_ilk,
+            &other_spelling,
+        ] {
+            let entry = ilk_entry_from_record(record).expect("an entry");
+            assert_eq!(entry.works_for, [0u8; 16], "{record:?}");
+            assert_eq!(entry.work_role, ILK_WORK_ROLE_NONE, "{record:?}");
+        }
+
+        // The full rebuild writes the same.
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            DEFAULT_ROOT_TENANT_ID.to_string(),
+            TenantRecord {
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                name: "fluxbee".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+                deleted_at_ms: None,
+            },
+        );
+        store.ilks.insert(channel.ilk_id.clone(), channel.clone());
+        store.ilks.insert(alone.ilk_id.clone(), alone.clone());
+        let entries = identity_shm_entries(&store).expect("region entries");
+        let relation_of = |ilk_id: &str| {
+            let uuid = *parse_prefixed_uuid(ilk_id, "ilk").unwrap().as_bytes();
+            entries
+                .ilks
+                .iter()
+                .find(|entry| entry.ilk_id == uuid)
+                .map(|entry| (entry.works_for, entry.work_role))
+        };
+        assert_eq!(
+            relation_of(&channel.ilk_id),
+            Some((laura_bytes, ILK_WORK_ROLE_CHANNEL))
+        );
+        assert_eq!(
+            relation_of(&alone.ilk_id),
+            Some(([0u8; 16], ILK_WORK_ROLE_NONE))
+        );
+    }
+
+    /// The writer's region, read by the Rust SDK's reader: `ilk:<uuid>` and the role's name for an
+    /// ILK that works for someone, and nothing for one that works for nobody.
+    #[test]
+    fn whom_an_ilk_works_for_reads_back_through_the_sdk() {
+        let name = format!("/jsid-wf-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let limits = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 2,
+            max_vocabulary: 1,
+            max_ilk_aliases: 2,
+        };
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
+                .expect("identity region");
+        let laura = "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a";
+        let channel = wf_channel_of(laura);
+        let alone = ilk_for(
+            "IO.slack@worker1",
+            "ilk:cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+        );
+        for record in [&channel, &alone] {
+            writer
+                .upsert_ilk_entry(ilk_entry_from_record(record).expect("an entry"))
+                .expect("upsert");
+        }
+
+        let read = |ilk_id: &str| {
+            fluxbee_sdk::identity::find_ilk_by_id_from_shm_name(&name, ilk_id)
+                .expect("read the region")
+                .expect("the ILK")
+        };
+        let option = read(&channel.ilk_id);
+        assert_eq!(option.works_for.as_deref(), Some(laura));
+        assert_eq!(option.work_role.as_deref(), Some("channel"));
+        let option = read(&alone.ilk_id);
+        assert_eq!(option.works_for, None);
+        assert_eq!(option.work_role, None);
+
+        drop(writer);
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
+        }
+    }
+
+    #[test]
+    fn works_for_rides_the_wire_and_the_list_only_when_set() {
+        let laura = "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a";
+        let channel = wf_channel_of(laura);
+        let alone = ilk_for(
+            "IO.slack@worker1",
+            "ilk:cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+        );
+        let record = serde_json::to_value(&channel).expect("record");
+        assert_eq!(record["works_for"], json!(laura));
+        assert_eq!(record["work_role"], json!("channel"));
+        let record = serde_json::to_value(&alone).expect("record");
+        assert!(record.get("works_for").is_none());
+        assert!(record.get("work_role").is_none());
+
+        // A record and a delta from a binary that predates them, which never name them, read as
+        // working for nobody.
+        let old = serde_json::to_value(&alone).expect("record");
+        let record: IlkRecord = serde_json::from_value(old.clone()).expect("an old record");
+        assert_eq!((record.works_for, record.work_role), (None, None));
+        let delta: IdentityDelta =
+            serde_json::from_value(json!({"type": "ilk_upsert", "ilk": old}))
+                .expect("an old delta");
+        let IdentityDelta::IlkUpsert { ilk } = delta else {
+            panic!("an ilk upsert");
+        };
+        assert_eq!((ilk.works_for, ilk.work_role), (None, None));
+
+        // A replica takes them from the primary's delta, as it goes over the wire.
+        let mut primary = IdentityStore::default();
+        primary.ilks.insert(channel.ilk_id.clone(), channel.clone());
+        primary.ilks.insert(alone.ilk_id.clone(), alone.clone());
+        let mut replica = IdentityStore::default();
+        let envelope = delta_envelope(IdentityDelta::IlkUpsert {
+            ilk: channel.clone(),
+        });
+        let line = serde_json::to_string(&envelope).expect("encode");
+        let received: IdentityDeltaEnvelope = serde_json::from_str(&line).expect("decode");
+        replica.apply_delta(received.delta);
+        assert_eq!(replica.ilks[&channel.ilk_id], channel);
+
+        // ILK_GET carries the record, ILK_LIST its row.
+        let got = primary.get_ilk_payload(&channel.ilk_id, None).expect("get");
+        assert_eq!(got["ilk"]["works_for"], json!(laura));
+        assert_eq!(got["ilk"]["work_role"], json!("channel"));
+        let got = primary.get_ilk_payload(&alone.ilk_id, None).expect("get");
+        assert!(got["ilk"].get("works_for").is_none());
+        let listed = primary.list_ilks_payload(false, false, &PageAsk::default());
+        let row = |ilk_id: &str| {
+            listed["ilks"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["ilk_id"] == ilk_id)
+                .cloned()
+                .expect("a row")
+        };
+        assert_eq!(row(&channel.ilk_id)["works_for"], json!(laura));
+        assert_eq!(row(&channel.ilk_id)["work_role"], json!("channel"));
+        assert!(row(&alone.ilk_id).get("works_for").is_none());
+        assert!(row(&alone.ilk_id).get("work_role").is_none());
+    }
+
+    /// Nothing sets whom an ILK works for in this release (2A): every ILK identity makes works for
+    /// nobody.
+    #[test]
+    fn no_ilk_identity_makes_works_for_anyone() {
+        let mut store = rg_store();
+        let laura = ed_laura(&mut store);
+        let ana = rg_with_ana(&mut store);
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U9");
+        for ilk_id in [&laura, &ana, &temp] {
+            let record = &store.ilks[ilk_id];
+            assert_eq!((&record.works_for, &record.work_role), (&None, &None));
+        }
     }
 }

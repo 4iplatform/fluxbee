@@ -1938,6 +1938,8 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         }];
         assert!(ilk_belongs_to_tenant(
             &ilks,
@@ -1970,6 +1972,8 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
             is_virtual: false,
+            works_for: None,
+            work_role: None,
         };
         let channel = |scope: &str| IdentityIchOption {
             ich_id: "ich:44444444-4444-4444-8444-444444444444".to_string(),

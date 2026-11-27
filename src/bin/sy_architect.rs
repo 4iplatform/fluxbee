@@ -29374,6 +29374,8 @@ mod tests {
                 handbook_hashes: vec![],
                 personality_hash: None,
                 is_virtual: false,
+                works_for: None,
+                work_role: None,
             };
         let other = "cd".repeat(32);
         let ilks = [

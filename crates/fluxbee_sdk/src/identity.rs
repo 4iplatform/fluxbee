@@ -31,7 +31,8 @@ pub const MSG_TNT_UPDATE: &str = "TNT_UPDATE";
 pub const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-const IDENTITY_VERSION: u32 = 6;
+/// `src/shm/mod.rs` `IDENTITY_VERSION`: 7 since `IlkEntry` carries `works_for` and `work_role`.
+const IDENTITY_VERSION: u32 = 7;
 const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
 const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 const REGION_ALIGNMENT: usize = 64;
@@ -42,6 +43,10 @@ const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 const FLAG_ACTIVE: u16 = 0x0001;
 /// A virtual person's ILK entry, a Digital Executive (`src/shm/mod.rs` `ILK_FLAG_VIRTUAL`).
 const ILK_FLAG_VIRTUAL: u16 = 0x0100;
+/// An ILK entry's `work_role` bytes (`src/shm/mod.rs` `ILK_WORK_ROLE_*`); 0 is none.
+const SHM_WORK_ROLE_CONSCIOUS: u8 = 1;
+const SHM_WORK_ROLE_CHANNEL: u8 = 2;
+const SHM_WORK_ROLE_AGENT: u8 = 3;
 const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 const SHM_ILK_TYPE_HUMAN: u8 = 0;
 const SHM_ILK_TYPE_AGENT: u8 = 1;
@@ -132,6 +137,14 @@ pub struct IdentityIlkOption {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub is_virtual: bool,
+    /// The person this ILK works for, `ilk:<uuid>`; `None` for nobody
+    /// (docs/digital-executive-v1-stage-2.md §1.1). Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub works_for: Option<String>,
+    /// What this ILK is to that person: `conscious`, `channel` or `agent`; `None` for nobody.
+    /// Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_role: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -345,8 +358,21 @@ struct IlkEntry {
     created_at: u64,
     updated_at: u64,
     personality_hash: [u8; 32],
+    works_for: [u8; 16],
+    work_role: u8,
+    _pad1: [u8; 7],
     _reserved: [u8; 8],
 }
+
+// The layout of `src/shm/mod.rs`'s `IlkEntry`, which asserts the same numbers
+// (go/fluxbee-go-sdk/testdata/identity_layout/ilk_entry.json holds them for all three copies).
+const _: () = {
+    assert!(std::mem::size_of::<IlkEntry>() == 1184);
+    assert!(std::mem::offset_of!(IlkEntry, personality_hash) == 1120);
+    assert!(std::mem::offset_of!(IlkEntry, works_for) == 1152);
+    assert!(std::mem::offset_of!(IlkEntry, work_role) == 1168);
+    assert!(std::mem::offset_of!(IlkEntry, _reserved) == 1176);
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1480,6 +1506,23 @@ fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
         handbook_hashes,
         personality_hash,
         is_virtual: ilk.flags & ILK_FLAG_VIRTUAL != 0,
+        works_for: ilk
+            .works_for
+            .iter()
+            .any(|byte| *byte != 0)
+            .then(|| prefixed_uuid_from_bytes("ilk", ilk.works_for)),
+        work_role: work_role_from_shm(ilk.work_role).map(str::to_string),
+    }
+}
+
+/// A `work_role` byte's name; `None` for none (0) and for any byte no writer of this version
+/// writes.
+fn work_role_from_shm(value: u8) -> Option<&'static str> {
+    match value {
+        SHM_WORK_ROLE_CONSCIOUS => Some("conscious"),
+        SHM_WORK_ROLE_CHANNEL => Some("channel"),
+        SHM_WORK_ROLE_AGENT => Some("agent"),
+        _ => None,
     }
 }
 
@@ -1762,6 +1805,114 @@ mod tests {
         assert_eq!(out, None);
     }
 
+    /// The layout shared with `src/shm` and the Go SDK (go/fluxbee-go-sdk/testdata/identity_layout).
+    #[test]
+    fn the_ilk_entry_layout_matches_the_fixture_shared_with_src_shm_and_go() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../go/fluxbee-go-sdk/testdata/identity_layout/ilk_entry.json");
+        let raw = std::fs::read_to_string(path).expect("read the layout");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("decode the layout");
+        assert_eq!(fixture["version"], serde_json::json!(IDENTITY_VERSION));
+        assert_eq!(
+            fixture["ilk_entry_size"],
+            serde_json::json!(size_of::<IlkEntry>())
+        );
+        let offsets = [
+            ("ilk_id", std::mem::offset_of!(IlkEntry, ilk_id)),
+            ("ilk_type", std::mem::offset_of!(IlkEntry, ilk_type)),
+            ("flags", std::mem::offset_of!(IlkEntry, flags)),
+            ("display_name", std::mem::offset_of!(IlkEntry, display_name)),
+            ("handler_node", std::mem::offset_of!(IlkEntry, handler_node)),
+            (
+                "personality_hash",
+                std::mem::offset_of!(IlkEntry, personality_hash),
+            ),
+            ("works_for", std::mem::offset_of!(IlkEntry, works_for)),
+            ("work_role", std::mem::offset_of!(IlkEntry, work_role)),
+            ("reserved", std::mem::offset_of!(IlkEntry, _reserved)),
+        ];
+        assert_eq!(
+            fixture["offsets"].as_object().expect("offsets").len(),
+            offsets.len()
+        );
+        for (field, offset) in offsets {
+            assert_eq!(
+                fixture["offsets"][field],
+                serde_json::json!(offset),
+                "{field}"
+            );
+        }
+        let roles = fixture["work_roles"].as_object().expect("work_roles");
+        assert_eq!(roles.len(), 4);
+        for (name, code) in roles {
+            let code = code.as_u64().expect("a code") as u8;
+            let expected = (name != "none").then_some(name.as_str());
+            assert_eq!(work_role_from_shm(code), expected, "{name}");
+        }
+        assert_eq!(work_role_from_shm(4), None);
+    }
+
+    #[test]
+    fn whom_an_ilk_works_for_reads_from_its_entry_and_is_absent_when_nobody() {
+        let entry = |works_for: [u8; 16], work_role: u8| IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440011")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_AGENT,
+            registration_status: SHM_REG_STATUS_COMPLETE,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("IO.wapp.ed4qm7k2xa@worker1"),
+            handler_node: encode_fixed::<128>("IO.wapp.ed4qm7k2xa@worker1"),
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
+            created_at: 0,
+            updated_at: 0,
+            personality_hash: [0; 32],
+            works_for,
+            work_role,
+            _pad1: [0; 7],
+            _reserved: [0; 8],
+        };
+        let laura = Uuid::parse_str("5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a").unwrap();
+        for (code, role) in [
+            (SHM_WORK_ROLE_CONSCIOUS, "conscious"),
+            (SHM_WORK_ROLE_CHANNEL, "channel"),
+            (SHM_WORK_ROLE_AGENT, "agent"),
+        ] {
+            let part = identity_ilk_option_from_entry(&entry(laura.into_bytes(), code));
+            assert_eq!(
+                part.works_for.as_deref(),
+                Some("ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a")
+            );
+            assert_eq!(part.work_role.as_deref(), Some(role));
+            let json = serde_json::to_value(&part).unwrap();
+            assert_eq!(
+                json["works_for"],
+                serde_json::json!("ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a")
+            );
+            assert_eq!(json["work_role"], serde_json::json!(role));
+        }
+        // Nobody: zeros and no role, absent on the wire, and so read back.
+        let alone = identity_ilk_option_from_entry(&entry([0; 16], 0));
+        assert_eq!(alone.works_for, None);
+        assert_eq!(alone.work_role, None);
+        let json = serde_json::to_value(&alone).unwrap();
+        assert!(json.get("works_for").is_none());
+        assert!(json.get("work_role").is_none());
+        let back: IdentityIlkOption = serde_json::from_value(json).unwrap();
+        assert_eq!(back, alone);
+        // A byte no writer of this version writes reads as no role.
+        let unknown = identity_ilk_option_from_entry(&entry(laura.into_bytes(), 9));
+        assert_eq!(unknown.work_role, None);
+    }
+
     #[test]
     fn the_virtual_bit_reads_as_a_virtual_person_and_nothing_else() {
         let entry = |flags: u16| IlkEntry {
@@ -1785,6 +1936,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             personality_hash: [0; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0; 8],
         };
         let person = identity_ilk_option_from_entry(&entry(FLAG_ACTIVE));
@@ -1828,6 +1982,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             personality_hash: [0; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0; 8],
         };
         let mut skill_hashes = [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
@@ -1855,6 +2012,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             personality_hash: [0; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0; 8],
         };
         let ich_primary = IchEntry {
@@ -1937,6 +2097,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             personality_hash: [0; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0; 8],
         };
         let ich = IchEntry {
@@ -2095,6 +2258,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             personality_hash: [0; 32],
+            works_for: [0u8; 16],
+            work_role: 0,
+            _pad1: [0u8; 7],
             _reserved: [0; 8],
         };
         let layout = layout_identity(IdentityRegionLimits {

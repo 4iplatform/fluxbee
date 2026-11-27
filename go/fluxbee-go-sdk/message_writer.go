@@ -87,6 +87,11 @@ type IlkFacts struct {
 	Name string
 	// Virtual is a virtual person, a Digital Executive: a human ILK with the virtual flag.
 	Virtual bool
+	// WorksFor is the person this ILK works for, "ilk:<uuid>", and WorkRole its role to that person:
+	// "conscious", "channel" or "agent" (docs/digital-executive-v1-stage-2.md §1.1). Both "" for an
+	// ILK that works for nobody.
+	WorksFor string
+	WorkRole string
 }
 
 // fillWriterName fills the name of msg's writer, when it names an ILK and no name, with what facts
