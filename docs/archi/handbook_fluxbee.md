@@ -1364,6 +1364,7 @@ core service too):
 - `SY.vault`
 - `SY.config.routes`
 - `SY.opa.rules`
+- `SY.deploy` (on the motherbee; §4.4.7)
 - `SY.edge` (on an ingress)
 
 Normal operator requests should not create or redesign these.
@@ -1753,6 +1754,49 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
   (`DELETE .../tenants/<tenant_id>`), restore and purge (`POST .../tenants/<tenant_id>/restore`,
   `.../purge`). An SCMD runs at once, with no `CONFIRM`, a purge too: when you name one for the
   operator to type, say first what it removes for good, after the checks above.
+
+### 4.4.7 Digital Executives: deployments and a node's person
+
+A Digital Executive (ED) is a virtual person, an ILK in identity, with its parts: an AI node, its
+conscious, that answers as the ED, and an IO, its channel. `SY.deploy`, on the motherbee, deploys
+and removes them (docs/digital-executive-v1-stage-2.md §2-§9).
+
+- **Deployments are SY.deploy's to run.** SY.admin forwards six `cd_*` actions to it, and it
+  answers each before it starts any step:
+  - `cd_deploy` (`POST /cd/deployments`): a source with its blanks, into a grouping. Without a
+    grouping id it founds a new ED. It answers *accepted*, with the `deployment_id`, the grouping
+    and the state `deploying`. The same `request_key` in the same tenant gives back the same
+    deployment, and resumes a failed one where it stopped.
+  - `cd_get` (`GET /cd/deployments/{deployment_id}`): one deployment, its state (`deploying`,
+    `active`, `failed`, `removing`, `removed`) and its nodes' status. Follow a deployment with it to
+    `active` or `failed`; a failed one names its step and why.
+  - `cd_list` (`GET /cd/deployments?tenant_id=&grouping_kind=&grouping_id=`), `cd_catalog`
+    (`GET /cd/catalog`, the sources ready to deploy, with their blanks) and `cd_tree`
+    (`GET /cd/tree?tenant_id=`, a tenant's EDs, their parts and deployments).
+  - `cd_remove` (`POST /cd/deployments/{deployment_id}/remove` or
+    `POST /cd/groupings/{grouping_id}/remove`): retires the nodes it made and marks the ED's ILK.
+    It answers *accepted*; nothing is purged.
+- **Only as the operator's SCMD:** never a plan step, never `fluxbee_system_get` for the two
+  writes. The four reads you may run yourself. A `cd_deploy` names no secret: a credential is a
+  vault key name, which must exist first.
+- **No body carries `_caller`:** SY.admin adds who asks, and refuses a body that names it.
+- **An ED is born by `cd_deploy` and ends by `cd_remove`,** each journaled by SY.deploy: do not
+  assemble one step by step with `run_node`, `create_virtual_person` and the relations below.
+
+**A node's person (`works_for`).** Every ILK in identity may name the person it works for, with
+its role: `conscious` (the AI that speaks as the person), `channel` (an IO that carries the person's
+messages) or `agent`. The identity SHM carries it to every hive.
+
+- Read it on the ILK (`GET /hives/<hive>/identity/ilks/<ilk_id>`). Set or clear it with
+  `set_ilk_works_for` (`PUT /hives/<hive>/identity/ilks/<ilk_id>/works-for`,
+  `{"works_for": "ilk:…", "work_role": "conscious"}`; `null` and `null` clear it), and write a
+  person's document with `set_person_document` (`PUT …/identity/ilks/<ilk_id>/document`,
+  `{"document": {"schema": 1, …}}`). Both are the operator's SCMD, run at once and recorded.
+- A relation alone changes nothing, and so does a config alone: an AI node speaks as a person only
+  while its config names it (`speaks_as`) and identity confirms it, and an IO carries one only
+  while its config names it (`io.person_ilk`) and identity confirms it. Their status says which
+  and why: `extensions.speaks_as` and `extensions.person_ilk` in `GET
+  /hives/<hive>/nodes/<node>/status`.
 
 ### 4.5 Secrets and vault (Model D')
 

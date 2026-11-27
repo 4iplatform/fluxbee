@@ -145,7 +145,21 @@ A change outside that list is recorded all the same: an ILK's charge to a tenant
 (`set_ilk_tenant`) and its purge, a tenant's creation, update, sponsor and purge, a tap's add and
 delete, and the user policy's clear (`opa_clear`). Before 0.1.152 the change was that list, so the
 operator's `update_tenant`, `set_tenant_sponsor`, `add_tap`, `delete_tap` and `opa_clear` ran
-unrecorded, as reads.
+unrecorded, as reads. Since the Digital Executive's release 2D (its stage 2) the list adds
+whom an ILK works for (`set_ilk_works_for`), a person's document (`set_person_document`), and a
+deployment and its removal (`cd_deploy`, `cd_remove`).
+
+**The Digital Executive's actions** (docs/digital-executive-v1-stage-2.md §1, §2):
+`PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for` (`set_ilk_works_for`, the body
+`{works_for, work_role}`) and `PUT .../ilks/{ilk_id}/document` (`set_person_document`, the body
+`{document}`), each with the path's ILK, as SY.admin's routes send them; and SY.deploy's six,
+which SY.admin forwards to `SY.deploy@motherbee` and which go to the motherbee's SY.admin with no
+hive: `POST /cd/deployments` (`cd_deploy`, the body as it came), `GET /cd/deployments/{id}`
+(`cd_get`), `GET /cd/deployments?tenant_id=&grouping_kind=&grouping_id=` (`cd_list`, those query
+keys alone), `POST /cd/deployments/{id}/remove` and `POST /cd/groupings/{id}/remove` (`cd_remove`,
+the path's id, refused when the body names the other), `GET /cd/catalog` (`cd_catalog`) and
+`GET /cd/tree?tenant_id=` (`cd_tree`). The two writes are the operator's SCMD only, never the AI's
+(`admin_action_allows_ai_write` leaves them out); the four reads are reads.
 
 **An identity's lifecycle** (since 0.1.152, the operator's ask) has SY.admin's own routes, each
 translated as SY.admin's route sends it ([SY.identity](sy-identity.md)):
@@ -207,8 +221,9 @@ gone, and the summary says both. A log that cannot be read leaves it open. The l
 recorded mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a
 node's run, start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN
 rule, a tap, an ILK's or a tenant's change (a purge included, since 0.1.152), a node's config, a
-message to a node, the storage, a WF instance's cancel. `update`, `sync_hint` and the OPA and
-wf-rules writes (`opa_clear` among them) go another way in SY.admin
+message to a node, the storage, a WF instance's cancel. `update`, `sync_hint` and the OPA,
+wf-rules and deployment writes (`opa_clear` among them; `cd_deploy` and `cd_remove`, which SY.admin
+forwards to SY.deploy as it forwards the wf-rules ones) go another way in SY.admin
 and are not in it, so a timed-out one stays open in that chat, as before: Archi waits for each as
 long as SY.admin does, or longer. An identical request there is refused with a text that says so
 (`operation_error_message`, `open_operation_is_read`): the record cannot be settled in that chat;
@@ -518,6 +533,14 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   - Validation is strict when a manifest is saved and before a run reconciles. Reading one is not:
     `get_manifest_current` returns a manifest saved before a rule changed with its
     `validation_error`, so the designer can fix it, and a run made from it is blocked.
+  - **Versions kept** (docs/digital-executive-v1-stage-2.md §3.3; the operator: three): after each
+    save, Archi keeps the solution's three newest versions (`v<epoch ms>.json`) and always its newest
+    executed one (the one with a `.executed` marker, which owns what runs), and removes the others
+    with their markers, and any marker left with no manifest (`prune_saved_manifests`,
+    `manifest_retention`). A version is marked only once its plan ran, and that plan's reconcile read
+    the older executed versions, so pruning them loses no running WF's or policy's owner. Their
+    `manifest_refs` rows go too (`prune_manifest_records_with_db`). Files that are not a saved
+    version stay. A prune that fails is a warning; the save stands.
 - **reconcile**: the actual state is read through SY.admin and compared with the manifest by
   `reconciler.rs`, which is deterministic (no LLM). The result is a delta and build tasks.
   - The snapshot (`build_actual_state_snapshot`) reads Archi's own hive and every hive the

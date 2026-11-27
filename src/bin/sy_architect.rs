@@ -1024,7 +1024,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/deployments?category=&limit= and /hives/{hive}/drift-alerts?category=&severity=&kind=&limit= (newest first, 50 without a limit, at most 500: filter in the query; /deployments and /drift-alerts read every hive's, ?hive= one hive's), /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000), next_cursor while timers follow and no total; a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/deployments?category=&limit= and /hives/{hive}/drift-alerts?category=&severity=&kind=&limit= (newest first, 50 without a limit, at most 500: filter in the query; /deployments and /drift-alerts read every hive's, ?hive= one hive's), /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /cd/catalog, /cd/deployments?tenant_id=&grouping_kind=&grouping_id=, /cd/deployments/{deployment_id} and /cd/tree?tenant_id= (SY.deploy's sources, its deployments with their state, and a tenant's Digital Executives), /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000), next_cursor while timers follow and no total; a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -11659,7 +11659,10 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /hives/motherbee/timer/timers?status_filter=pending&limit=20",
                 "SCMD: curl -X GET /hives/motherbee/timer/timers/9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001",
                 "SCMD: curl -X GET /hives/motherbee/timer/now",
-                "SCMD: curl -X GET /config/storage"
+                "SCMD: curl -X GET /config/storage",
+                "SCMD: curl -X GET /cd/catalog",
+                "SCMD: curl -X GET /cd/deployments?tenant_id=tnt:550e8400-e29b-41d4-a716-446655440000",
+                "SCMD: curl -X GET /cd/tree?tenant_id=tnt:550e8400-e29b-41d4-a716-446655440000"
             ],
             "mutation_examples": [
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\",\"ssh_user\":\"administrator\"}'",
@@ -11669,6 +11672,8 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "An ILK's purge removes for good one already marked deleted: mark it, then purge it (a tenant the same way, under /identity/tenants/{tenant_id}). Each runs at once, as typed.",
                 "SCMD: curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge",
+                "A node's ILK works for a person (a Digital Executive's part), with its role, conscious, channel or agent; null and null clear it. A deployment is SY.deploy's to run: cd_deploy answers accepted, and GET /cd/deployments/{deployment_id} follows it to active or failed.",
+                "SCMD: curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/works-for -d '{\"works_for\":\"ilk:550e8400-e29b-41d4-a716-446655440001\",\"work_role\":\"conscious\"}'",
                 "The installation's ai.default_provider and ai.providers.<provider>.model are in its installation file (docs/hive-config-update-v1.md §4); SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
             ]
         }
@@ -12111,14 +12116,18 @@ const COMMAND_LOG_MAX_PAGES: usize = 5;
 
 /// Whether SY.admin's command log keeps a tracked mutation of `action` (FINDINGS A-320): the ones
 /// SY.admin runs as commands (`handle_admin_command`), each with its outcome once it ends. Of the
-/// actions an SCMD records, `update`, `sync_hint` and the OPA and wf-rules writes go another way in
-/// SY.admin and are not in it, so a timed-out one stays open, as before: Archi waits for each of
-/// them as long as SY.admin does, or longer. `add_hive` is read in the hive registry instead.
+/// actions an SCMD records, `update`, `sync_hint` and the OPA, wf-rules and deployment (`cd_*`)
+/// writes go another way in SY.admin and are not in it, so a timed-out one stays open, as before:
+/// Archi waits for each of them as long as SY.admin does, or longer. SY.admin forwards a `cd_*`
+/// order to SY.deploy as it forwards a wf-rules one to SY.wf-rules, and waits 10 s for its answer
+/// (a deployment's steps run after it); `cd_get` reads where one stands. `add_hive` is read in the
+/// hive registry instead.
 fn action_in_command_log(action: &str) -> bool {
     is_mutating_admin_action(action)
         && !matches!(action, "add_hive" | "update" | "sync_hint")
         && !action.starts_with("opa_")
         && !action.starts_with("wf_rules_")
+        && !action.starts_with("cd_")
 }
 
 /// Whether a read can settle an open record of `action` (`settle_open_operation`): an `add_hive`'s
@@ -12405,8 +12414,10 @@ fn system_get_may_run(method: &str, action: &str) -> bool {
 /// come (`action_in_command_log`), and `fluxbee_system_get` never runs it (`system_get_may_run`).
 /// It is a question of its own, apart from `admin_action_allows_ai_write`, which leaves the purges
 /// out and stays as it was: every action that list names, and the changes an SCMD maps outside
-/// it: an ILK's charge to a tenant and its purge, a virtual person's creation, a tenant's creation,
-/// its update, its sponsor and its purge, a tap, and the global user policy's clear.
+/// it: an ILK's charge to a tenant and its purge, a virtual person's creation, whom an ILK works
+/// for, a person's document, a tenant's creation, its update, its sponsor and its purge, a tap,
+/// the global user policy's clear, and a deployment and its removal (SY.deploy's `cd_deploy` and
+/// `cd_remove`, docs/digital-executive-v1-stage-2.md §2).
 fn is_mutating_admin_action(action: &str) -> bool {
     admin_action_allows_ai_write(action)
         || matches!(
@@ -12414,6 +12425,10 @@ fn is_mutating_admin_action(action: &str) -> bool {
             "set_ilk_tenant"
                 | "purge_ilk"
                 | "create_virtual_person"
+                | "set_ilk_works_for"
+                | "set_person_document"
+                | "cd_deploy"
+                | "cd_remove"
                 | "create_tenant"
                 | "update_tenant"
                 | "set_tenant_sponsor"
@@ -12520,6 +12535,16 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
         params.insert(key.to_string(), Value::String(percent_decode(value)));
     }
     params
+}
+
+/// The params of a read whose query names texts alone: each of `keys` the query gives, decoded
+/// once (`scmd_query_params`), as text; any other key is left out.
+fn scmd_text_params(raw_query: Option<&str>, keys: &[&str]) -> Value {
+    let params = scmd_query_params(raw_query)
+        .into_iter()
+        .filter(|(key, _)| keys.contains(&key.as_str()))
+        .collect::<serde_json::Map<_, _>>();
+    Value::Object(params)
 }
 
 /// `GET /hives/{hive}/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`, read as the
@@ -13666,6 +13691,36 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({ "ilk_id": ilk_id }),
         }),
+        // Whom a node's ILK works for, and a person's document (docs/digital-executive-v1-stage-2.md
+        // §1.1, §1.2), as SY.admin's routes take them: the body ({works_for, work_role}, or
+        // {document}) and the path's ILK. The operator's SCMD runs each at once, recorded like the
+        // other identity writes (`is_mutating_admin_action`).
+        ("PUT", ["hives", hive_id, "identity", "ilks", ilk_id, "works-for"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for set_ilk_works_for must be a JSON object".into());
+            }
+            params["ilk_id"] = Value::String((*ilk_id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_ilk_works_for".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("PUT", ["hives", hive_id, "identity", "ilks", ilk_id, "document"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for set_person_document must be a JSON object".into());
+            }
+            params["ilk_id"] = Value::String((*ilk_id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_person_document".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "versions"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_versions".to_string(),
@@ -14200,6 +14255,72 @@ fn translate_scmd(
                 params,
             })
         }
+        // The deployments (docs/digital-executive-v1-stage-2.md §2), as SY.admin's routes take them:
+        // SY.admin forwards each to SY.deploy@motherbee, so they name no hive and go to the
+        // motherbee's SY.admin. A write's body goes as it came, and a read's query as its fields;
+        // SY.admin adds who asks (`_caller`), which no body may carry.
+        ("POST", ["cd", "deployments"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for cd_deploy must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "cd_deploy".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
+        ("GET", ["cd", "deployments"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "cd_list".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: scmd_text_params(raw_query, &["tenant_id", "grouping_kind", "grouping_id"]),
+        }),
+        ("GET", ["cd", "deployments", deployment_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "cd_get".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({ "deployment_id": deployment_id }),
+        }),
+        // A removal names exactly one of a deployment or a grouping: the path's.
+        ("POST", ["cd", kind @ ("deployments" | "groupings"), id, "remove"]) => {
+            let (field, other) = if *kind == "deployments" {
+                ("deployment_id", "grouping_id")
+            } else {
+                ("grouping_id", "deployment_id")
+            };
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for cd_remove must be a JSON object".into());
+            }
+            if params.get(other).is_some() {
+                return Err(format!(
+                    "SCMD for cd_remove names one of deployment_id or grouping_id, the path's: \
+                     its body must not name {other}"
+                )
+                .into());
+            }
+            params[field] = Value::String((*id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "cd_remove".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
+        ("GET", ["cd", "catalog"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "cd_catalog".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["cd", "tree"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "cd_tree".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: scmd_text_params(raw_query, &["tenant_id"]),
+        }),
         ("PUT", ["config", "storage"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
@@ -22011,7 +22132,158 @@ async fn save_manifest_from_context(
         .map_err(|e| -> ArchitectError { e.to_string().into() })?;
     fs::write(&path, json)?;
     save_manifest_record_with_context(context, solution_id, &version, &path).await?;
+    prune_saved_manifests_with_context(context, solution_id).await;
     Ok(path)
+}
+
+/// How many of a solution's latest saved manifest versions Archi keeps (docs/digital-executive-
+/// v1-stage-2.md §3.3; the operator: three, not more than five). The newest executed version is
+/// kept beside them (`manifest_retention`).
+const MANIFEST_VERSIONS_KEPT: usize = 3;
+
+/// A solution's saved manifest versions, split into the ones kept and the ones to prune.
+#[derive(Debug, Default, PartialEq)]
+struct ManifestRetention {
+    kept: Vec<String>,
+    pruned: Vec<String>,
+}
+
+/// Which of a solution's saved versions (`v<epoch ms>`, each with whether a plan made from it
+/// executed) stay: the `MANIFEST_VERSIONS_KEPT` newest, and always the newest executed one, which
+/// owns what runs (`executed_manifests`: who declared a running WF or the user policy). Every
+/// other one goes, an older executed one too. That is safe because a version is marked executed
+/// only once its plan ran (`mark_manifest_executed`), and that plan's reconcile read the older
+/// executed versions: what they deployed and the newer one stopped declaring, it removed. Newest
+/// first, by when each was saved.
+fn manifest_retention(versions: &[(String, bool)]) -> ManifestRetention {
+    let mut ordered: Vec<&(String, bool)> = versions.iter().collect();
+    ordered.sort_by(|a, b| {
+        manifest_saved_at(&b.0)
+            .cmp(&manifest_saved_at(&a.0))
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    let newest_executed = ordered
+        .iter()
+        .find(|(_, executed)| *executed)
+        .map(|(version, _)| version.clone());
+    let mut retention = ManifestRetention::default();
+    for (place, (version, _)) in ordered.iter().enumerate() {
+        if place < MANIFEST_VERSIONS_KEPT || newest_executed.as_ref() == Some(version) {
+            retention.kept.push(version.clone());
+        } else {
+            retention.pruned.push(version.clone());
+        }
+    }
+    retention
+}
+
+/// A version's name as Archi saves one (`manifest_version_string`): `v` and the epoch ms. Any
+/// other file in a solution's directory is not Archi's to prune.
+fn is_saved_manifest_version(stem: &str) -> bool {
+    stem.strip_prefix('v')
+        .is_some_and(|ms| !ms.is_empty() && ms.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Prunes a solution's saved manifests (`manifests/<solution>/v<ms>.json`) to the versions
+/// `manifest_retention` keeps, each pruned version's `.executed` marker with it, and any marker
+/// left with no manifest (a version pruned while a plan made from it waited, then ran). Files that
+/// are not a saved version are left alone. What it kept and pruned.
+fn prune_saved_manifests(
+    state_dir: &Path,
+    solution_id: &str,
+) -> std::io::Result<ManifestRetention> {
+    let dir = state_dir.join("manifests").join(solution_id);
+    let mut versions = Vec::new();
+    let mut markers = Vec::new();
+    for entry in fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !is_saved_manifest_version(stem) {
+            continue;
+        }
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("json") => {
+                versions.push((stem.to_string(), path.with_extension("executed").exists()))
+            }
+            Some("executed") => markers.push(path.clone()),
+            _ => {}
+        }
+    }
+    let retention = manifest_retention(&versions);
+    let remove = |path: PathBuf| match fs::remove_file(&path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    };
+    for version in &retention.pruned {
+        let path = manifest_path(state_dir, solution_id, version);
+        remove(path.with_extension("executed"))?;
+        remove(path)?;
+    }
+    for marker in markers {
+        if !marker.with_extension("json").exists() {
+            remove(marker)?;
+        }
+    }
+    Ok(retention)
+}
+
+/// The `manifest_refs` rows of a solution whose version is not among `kept`: each points at a
+/// file pruned (`prune_saved_manifests`), so they go with it. Nothing reads the table back yet;
+/// it never names a file that is gone.
+async fn prune_manifest_records_with_db(
+    db: &Connection,
+    solution_id: &str,
+    kept: &[String],
+) -> Result<(), ArchitectError> {
+    let table = ensure_manifest_refs_table(db).await?;
+    let mut filter = format!("solution_id = '{}'", escape_sql_literal(solution_id));
+    if !kept.is_empty() {
+        let kept = kept
+            .iter()
+            .map(|version| format!("'{}'", escape_sql_literal(version)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        filter.push_str(&format!(" AND version NOT IN ({kept})"));
+    }
+    table
+        .delete(&filter)
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    Ok(())
+}
+
+/// After a save, prunes the solution's saved manifests and the `manifest_refs` rows of the ones
+/// pruned. The save stands either way: a prune that fails is a warning, and the next save tries
+/// again.
+async fn prune_saved_manifests_with_context(
+    context: &ArchitectAdminToolContext,
+    solution_id: &str,
+) {
+    let retention = match prune_saved_manifests(&context.state_dir, solution_id) {
+        Ok(retention) => retention,
+        Err(err) => {
+            tracing::warn!(error = %err, solution_id, "could not prune the solution's saved manifests");
+            return;
+        }
+    };
+    if retention.pruned.is_empty() {
+        return;
+    }
+    tracing::info!(
+        solution_id,
+        kept = ?retention.kept,
+        pruned = ?retention.pruned,
+        "pruned the solution's older saved manifests"
+    );
+    let pruned_records = match open_architect_db_for_hive(&context.hive_id).await {
+        Ok(db) => prune_manifest_records_with_db(&db, solution_id, &retention.kept).await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = pruned_records {
+        tracing::warn!(error = %err, solution_id, "could not prune the solution's manifest_refs rows");
+    }
 }
 
 /// A saved manifest as it is stored, with its version (`v<epoch ms>`) and what the current rules
@@ -35036,6 +35308,21 @@ mod tests {
                         "display_name": "Laura", "company_name": "Client Co" }),
             ),
             (
+                format!(
+                    r#"curl -X PUT /hives/motherbee/identity/ilks/{ilk}/works-for -d '{{"works_for":"ilk:550e8400-e29b-41d4-a716-446655440001","work_role":"conscious"}}'"#
+                ),
+                "set_ilk_works_for",
+                json!({ "ilk_id": ilk, "works_for": "ilk:550e8400-e29b-41d4-a716-446655440001",
+                        "work_role": "conscious" }),
+            ),
+            (
+                r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440001/document -d '{"document":{"schema":1,"display_name":"Laura","company_name":"Client Co"}}'"#
+                    .to_string(),
+                "set_person_document",
+                json!({ "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440001",
+                        "document": { "schema": 1, "display_name": "Laura", "company_name": "Client Co" } }),
+            ),
+            (
                 r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
                     .to_string(),
                 "create_tenant",
@@ -35165,6 +35452,17 @@ mod tests {
             ),
             ("PUT", format!("/hives/worker1/identity/ilks/{ilk}/tenant")),
             ("POST", format!("/hives/worker1/identity/ilks/{ilk}/purge")),
+            (
+                "PUT",
+                format!("/hives/worker1/identity/ilks/{ilk}/works-for"),
+            ),
+            (
+                "PUT",
+                format!("/hives/worker1/identity/ilks/{ilk}/document"),
+            ),
+            ("POST", "/cd/deployments".to_string()),
+            ("POST", "/cd/deployments/dp7xk3m2qa/remove".to_string()),
+            ("POST", format!("/cd/groupings/{ilk}/remove")),
             ("POST", "/hives/worker1/nodes".to_string()),
             ("POST", format!("{node}/start")),
             ("POST", format!("{node}/restart")),
@@ -35226,6 +35524,10 @@ mod tests {
             "purge_tenant",
             "set_ilk_tenant",
             "create_virtual_person",
+            "set_ilk_works_for",
+            "set_person_document",
+            "cd_deploy",
+            "cd_remove",
             "create_tenant",
             "update_tenant",
             "set_tenant_sponsor",
@@ -35252,6 +35554,8 @@ mod tests {
             "purge_tenant",
             "set_ilk_tenant",
             "create_virtual_person",
+            "set_ilk_works_for",
+            "set_person_document",
             "create_tenant",
             "update_tenant",
             "set_tenant_sponsor",
@@ -35262,6 +35566,294 @@ mod tests {
             assert!(open_operation_is_read(action), "{action}");
         }
         assert!(!action_in_command_log("opa_clear"));
+        // A deployment's order goes to SY.deploy as a wf-rules one goes to SY.wf-rules, outside
+        // SY.admin's command log.
+        for action in ["cd_deploy", "cd_remove"] {
+            assert!(!action_in_command_log(action), "{action}");
+            assert!(!open_operation_is_read(action), "{action}");
+        }
+    }
+
+    /// The deployments' SCMD (docs/digital-executive-v1-stage-2.md §2, the contract of release
+    /// 2D): the six `cd_*` actions on SY.admin's paths, sent to the motherbee's SY.admin, which
+    /// forwards them to SY.deploy. A write's body goes as it came; a read's query gives its fields,
+    /// decoded, and nothing else. The two writes are recorded, never the AI's to stage, and never
+    /// run by `fluxbee_system_get`; the four reads are reads. Their examples are not read from
+    /// SY.admin's catalog here: SY.admin's side lands on its own branch.
+    #[test]
+    fn the_deployments_translate_as_sy_admins_cd_routes() {
+        let tenant = "tnt:550e8400-e29b-41d4-a716-446655440000";
+        let grouping = "ilk:550e8400-e29b-41d4-a716-446655440001";
+        let order = json!({
+            "tenant_id": tenant,
+            "request_key": "cloud-ed-7f3a",
+            "source": { "id": "plain-ed", "version": "1" },
+            "grouping": { "kind": "ed" },
+            "blanks": { "display_name": "Laura", "company_name": "Acme",
+                        "whatsapp": { "phone_number_id": "1234567890", "waba_id": "2",
+                                      "credential_key": "acme-laura-wapp" } },
+            "hive": "worker1"
+        });
+        for (method, raw, action, params) in [
+            (
+                "POST",
+                format!("curl -X POST /cd/deployments -d '{order}'"),
+                "cd_deploy",
+                order.clone(),
+            ),
+            (
+                "GET",
+                "curl -X GET /cd/deployments/dp7xk3m2qa".to_string(),
+                "cd_get",
+                json!({ "deployment_id": "dp7xk3m2qa" }),
+            ),
+            (
+                "GET",
+                format!(
+                    "curl -X GET '/cd/deployments?tenant_id={}&grouping_kind=ed&grouping_id={grouping}&limit=5'",
+                    tenant.replace(':', "%3A")
+                ),
+                "cd_list",
+                json!({ "tenant_id": tenant, "grouping_kind": "ed", "grouping_id": grouping }),
+            ),
+            (
+                "GET",
+                "curl -X GET /cd/deployments".to_string(),
+                "cd_list",
+                json!({}),
+            ),
+            (
+                "POST",
+                "curl -X POST /cd/deployments/dp7xk3m2qa/remove".to_string(),
+                "cd_remove",
+                json!({ "deployment_id": "dp7xk3m2qa" }),
+            ),
+            (
+                "POST",
+                format!("curl -X POST /cd/groupings/{grouping}/remove"),
+                "cd_remove",
+                json!({ "grouping_id": grouping }),
+            ),
+            (
+                "GET",
+                "curl -X GET /cd/catalog".to_string(),
+                "cd_catalog",
+                json!({}),
+            ),
+            (
+                "GET",
+                format!("curl -X GET /cd/tree?tenant_id={tenant}"),
+                "cd_tree",
+                json!({ "tenant_id": tenant }),
+            ),
+        ] {
+            let translated = translate_scmd("worker1", parse(&raw))
+                .unwrap_or_else(|err| panic!("{raw}: {err}"));
+            assert_eq!(translated.action, action, "{raw}");
+            assert_eq!(translated.admin_target, "SY.admin@worker1", "{raw}");
+            assert_eq!(translated.target_hive, "worker1", "{raw}");
+            assert_eq!(translated.params, params, "{raw}");
+            assert!(!admin_action_allows_ai_write(action), "{action}");
+            let write = method == "POST";
+            assert_eq!(is_mutating_admin_action(action), write, "{action}");
+            assert_eq!(system_get_may_run(method, action), !write, "{action}");
+        }
+
+        // A removal names exactly one of the two, the path's.
+        for raw in [
+            format!(
+                r#"curl -X POST /cd/deployments/dp7xk3m2qa/remove -d '{{"grouping_id":"{grouping}"}}'"#
+            ),
+            r#"curl -X POST /cd/groupings/ed4qm7k2xa/remove -d '{"deployment_id":"dp7xk3m2qa"}'"#
+                .to_string(),
+            "curl -X POST /cd/deployments -d '[]'".to_string(),
+        ] {
+            assert!(translate_scmd("motherbee", parse(&raw)).is_err(), "{raw}");
+        }
+    }
+
+    /// The pruning rule of Archi's saved manifests (docs/digital-executive-v1-stage-2.md §3.3):
+    /// the three newest saves of a solution, and always its newest executed one, older or not.
+    #[test]
+    fn a_solution_keeps_its_three_newest_saves_and_its_newest_executed_one() {
+        let versions = |list: &[(&str, bool)]| {
+            list.iter()
+                .map(|(version, executed)| (version.to_string(), *executed))
+                .collect::<Vec<_>>()
+        };
+        let names = |list: &[&str]| list.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+        // Three or fewer: all kept.
+        assert_eq!(
+            manifest_retention(&versions(&[
+                ("v100", false),
+                ("v300", true),
+                ("v200", false)
+            ])),
+            ManifestRetention {
+                kept: names(&["v300", "v200", "v100"]),
+                pruned: vec![]
+            }
+        );
+        // The newest executed one is among the three newest: the rest go, an older executed too.
+        assert_eq!(
+            manifest_retention(&versions(&[
+                ("v100", true),
+                ("v200", false),
+                ("v300", true),
+                ("v400", false),
+                ("v500", false),
+            ])),
+            ManifestRetention {
+                kept: names(&["v500", "v400", "v300"]),
+                pruned: names(&["v200", "v100"])
+            }
+        );
+        // The newest executed one is older than the three newest: it stays beside them.
+        assert_eq!(
+            manifest_retention(&versions(&[
+                ("v100", true),
+                ("v200", true),
+                ("v300", false),
+                ("v400", false),
+                ("v500", false),
+                ("v600", false),
+            ])),
+            ManifestRetention {
+                kept: names(&["v600", "v500", "v400", "v200"]),
+                pruned: names(&["v300", "v100"])
+            }
+        );
+        // None executed: the three newest. Ordered by the saved time, not by the name's length.
+        assert_eq!(
+            manifest_retention(&versions(&[
+                ("v99", false),
+                ("v1000", false),
+                ("v200", false),
+                ("v3000", false),
+            ])),
+            ManifestRetention {
+                kept: names(&["v3000", "v1000", "v200"]),
+                pruned: names(&["v99"])
+            }
+        );
+        assert_eq!(manifest_retention(&[]), ManifestRetention::default());
+    }
+
+    /// The pruning on disk: each pruned version's manifest and marker go, a marker left with no
+    /// manifest goes, and what is not a saved version stays. The executed versions Archi still
+    /// reads (`executed_manifests`) are the kept ones.
+    #[test]
+    fn pruning_a_solutions_saved_manifests_removes_their_files_and_markers() {
+        let state_dir = test_temp_dir("manifest-prune");
+        let desired = || json!({ "nodes": [] });
+        write_saved_manifest(&state_dir, "sol-a", "v1000000000100", desired());
+        write_saved_manifest(&state_dir, "sol-a", "v1000000000200", desired());
+        for version in ["v1000000000300", "v1000000000400", "v1000000000500"] {
+            write_unexecuted_manifest(&state_dir, "sol-a", version, desired());
+        }
+        let dir = state_dir.join("manifests/sol-a");
+        std::fs::write(dir.join("notes.txt"), "not a manifest").expect("write");
+        std::fs::write(dir.join("draft.json"), "{}").expect("write");
+        // A marker whose manifest was pruned before its plan ran.
+        std::fs::write(dir.join("v1000000000050.executed"), b"").expect("write");
+        write_saved_manifest(&state_dir, "sol-b", "v1000000000100", desired());
+
+        let retention = prune_saved_manifests(&state_dir, "sol-a").expect("prune");
+        assert_eq!(
+            retention.kept,
+            [
+                "v1000000000500",
+                "v1000000000400",
+                "v1000000000300",
+                "v1000000000200"
+            ]
+        );
+        assert_eq!(retention.pruned, ["v1000000000100"]);
+        let mut left = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "draft.json",
+                "notes.txt",
+                "v1000000000200.executed",
+                "v1000000000200.json",
+                "v1000000000300.json",
+                "v1000000000400.json",
+                "v1000000000500.json",
+            ]
+        );
+        let executed = executed_manifests(&state_dir)
+            .into_iter()
+            .map(|(solution, version, _)| format!("{solution}/{version}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            executed,
+            ["sol-a/v1000000000200", "sol-b/v1000000000100"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        // Once a newer version executed, the next save's prune lets the older one go.
+        write_unexecuted_manifest(&state_dir, "sol-a", "v1000000000600", desired());
+        mark_manifest_executed(&state_dir, "sol-a", "v1000000000500").expect("mark");
+        let retention = prune_saved_manifests(&state_dir, "sol-a").expect("prune");
+        assert_eq!(
+            retention.kept,
+            ["v1000000000600", "v1000000000500", "v1000000000400"]
+        );
+        assert_eq!(retention.pruned, ["v1000000000300", "v1000000000200"]);
+        assert!(!dir.join("v1000000000200.executed").exists());
+        assert!(prune_saved_manifests(&state_dir, "missing").is_err());
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// `manifest_refs` never names a pruned file: the prune takes the solution's other rows out,
+    /// and another solution's rows stay.
+    #[tokio::test]
+    async fn pruning_a_solutions_manifests_prunes_its_manifest_refs_rows() {
+        let root = test_temp_dir("manifest-refs-prune");
+        let db = lancedb::connect(root.join("architect.lance").to_string_lossy().as_ref())
+            .execute()
+            .await
+            .expect("db");
+        for (solution, version) in [
+            ("sol-a", "v100"),
+            ("sol-a", "v200"),
+            ("sol-a", "v300"),
+            ("sol-a", "v400"),
+            ("sol-o'brien", "v100"),
+        ] {
+            save_manifest_record_with_db(
+                &db,
+                solution,
+                version,
+                &manifest_path(&root, solution, version),
+            )
+            .await
+            .expect("record");
+        }
+        prune_manifest_records_with_db(&db, "sol-a", &["v400".to_string(), "v300".to_string()])
+            .await
+            .expect("prune");
+        let table = ensure_manifest_refs_table(&db).await.expect("table");
+        let rows = |filter: &str| {
+            let table = table.clone();
+            let filter = filter.to_string();
+            async move { table.count_rows(Some(filter)).await.expect("count") }
+        };
+        assert_eq!(rows("solution_id = 'sol-a'").await, 2);
+        assert_eq!(
+            rows("solution_id = 'sol-a' AND version IN ('v100', 'v200')").await,
+            0
+        );
+        assert_eq!(rows("solution_id = 'sol-o''brien'").await, 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An operator's purge that outlasted Archi's wait is settled as any recorded change
