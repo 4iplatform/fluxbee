@@ -1,11 +1,26 @@
 # The Digital Executive v1, stage 1: the base of identity and security
 
-**Status:** the build design, 2026-11-25, agreed with the operator the same day (§6). Building.
+**Status:** the build design, 2026-11-25, agreed with the operator the same day (§6). Built and
+live in 0.1.153 (release A) and 0.1.154 (release B).
+
+**Withdrawn in part, 2026-11-26** (the operator): the security path went ahead of the flow it was to
+protect, and its rule bent the next stage's design. What comes out of the code:
+
+- §3, the router's binding of a person's `src_ilk`, whole (release B);
+- in §2.1, the refusals of a channel added to a virtual ILK and of an IO's provision onto one (with
+  them goes the `cloud` channel's own refusal: in this respect an ED is a person again);
+- §4's io.api refusal of a virtual `by_ilk`;
+- §7's first and third items.
+
+What stays: the flag (§1), the virtual person's birth (§1.2), its merge refusals (§2.1), and
+SY.admin's rules for IO.cloud (§2.2). Which node is an ED's, and what identity keeps of it, is to
+be talked once the new path is built ([stage 2](digital-executive-v1-stage-2.md)).
 
 **What it builds:** stage 1 of [digital-executive-v1-design](digital-executive-v1-design.md) §15.
 - **The ED's ILK:** a person's ILK with the `virtual` flag.
-- **What an ED refuses:** merges, a Cloud account, and Cloud's person actions (design §3.1).
-- **The router binds a person's `src_ilk`** (design §7.2).
+- **What an ED refuses:** merges, a Cloud account, and Cloud's person actions (design §3.1). The
+  Cloud account's refusal is withdrawn (2026-11-26).
+- **The router binds a person's `src_ilk`** (design §7.2). Withdrawn (2026-11-26).
 
 Nothing of SY.deploy, channels, the conscious or the profile comes in this stage: they are stages
 2 and 4.
@@ -59,10 +74,14 @@ Each refusal answers a new code, **`ILK_VIRTUAL`**, with the action's name in it
   - `merge_registration`, when the holder of the vouched email is virtual: an `ILK_REGISTER` from
     the frontdesk, which is also Cloud's `register_human` path;
   - `ILK_ADD_CHANNEL` with `merge_from_ilk_id` whose target is virtual;
-  - the provision of a `cloud` account channel, when its key would land on a virtual ILK.
+  - the provision of a `cloud` account channel, when its key would land on a virtual ILK
+    (withdrawn, 2026-11-26).
 - **No channel added to a virtual ILK** by any caller, by `ILK_ADD_CHANNEL` or `ILK_UPDATE`. Its
-  channels arrive in stage 2, through SY.deploy and SY.admin.
-- **No `cloud` channel on a virtual ILK,** ever: an ED holds no Fluxbee Cloud account.
+  channels arrive in stage 2, through SY.deploy and SY.admin. **Withdrawn (2026-11-26):** a virtual
+  ILK takes channels as any person does.
+- **No `cloud` channel on a virtual ILK,** ever: an ED holds no Fluxbee Cloud account. **Withdrawn
+  (2026-11-26)** with the one above.
+- **No provision onto a virtual ILK** (§7). **Withdrawn (2026-11-26).**
 - **No `set_ilk_tenant` of a virtual ILK** from Cloud's relay (§2.2).
 
 ### 2.2 In SY.admin's rules for IO.cloud
@@ -75,6 +94,9 @@ this stage, for tests and cleanup. In stage 2, an ED's life moves to SY.deploy.
 ---
 
 ## 3. The router binds a person's `src_ilk` (design §7.2)
+
+**Withdrawn (2026-11-26), and out of the code.** Kept here as the record of what was built and why
+it was taken out (the status above).
 
 ### 3.1 Who sends a person's ILK today
 
@@ -137,7 +159,7 @@ to `enforce`. Each change of mode is a release, explicit and recorded, with no n
 
 ## 4. Smaller items in this stage
 
-- **io.api's `by_ilk` refuses a virtual ILK** with `ilk_virtual` (io.api's codes are lowercase),
+- **Withdrawn (2026-11-26):** io.api's `by_ilk` refuses a virtual ILK with `ilk_virtual` (io.api's codes are lowercase),
   after its tenant check (`validate_explicit_subject_ilk`, `nodes/io/io-api/src/main.rs`): an ILK
   the tenant does not know answers `subject_not_found`, virtual or not, so another tenant learns
   nothing.
@@ -193,13 +215,14 @@ SHM's layout, so none should.
 
 ## 7. Carried forward, from the review round (2026-11-25)
 
-- **To stage 2, an ED's channels in the IOs' own lookup.** An IO resolves a sender's address in the
+- **Withdrawn (2026-11-26): to stage 2, an ED's channels in the IOs' own lookup.** An IO resolves a sender's address in the
   identity SHM first, and provisions only on a miss. SY.identity's refusal to provision onto a
   virtual person is the fallback. Once an ED holds channels, the IOs' lookup must leave them out,
   or check `ILK_FLAG_VIRTUAL`: otherwise mail *from* an ED's address would carry the ED's ILK.
 - **To stage 2, an idempotency key on a virtual person's creation.** In this stage only the operator
   creates one, and a retry after a timeout makes a second one, cleaned by hand. Cloud's path
   (design §4.1) carries its own id for the ED.
-- **Before `enforce` (release C), two ways around the router's rule:**
+- **Withdrawn (2026-11-26) with the router's rule: before `enforce` (release C), two ways around
+  it:**
   - a bare UUID with no `ilk:` prefix, which some consumers also resolve to the person;
   - an active alias, which the pre-resolve turns back into its person.

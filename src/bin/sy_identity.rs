@@ -1214,19 +1214,6 @@ impl IdentityStore {
             return Err("ACCOUNT_AMBIGUOUS".to_string());
         }
         if let Some(existing) = self.ich_lookup.get(&key).cloned() {
-            // A provision never lands on a virtual person: the IO would stamp the ED's ILK on what
-            // a stranger wrote from that address, and a `cloud` key would hand the stranger a
-            // Fluxbee Cloud account on it, which an ED never holds
-            // (docs/digital-executive-v1-design.md §3.1). This is the fallback only: an IO resolves
-            // an address in the identity SHM first and provisions on a miss, so once an ED holds
-            // channels (stage 2) the IOs' own lookup must leave them out too
-            // (docs/digital-executive-v1-stage-1.md §7).
-            if self.ilks.get(&existing).is_some_and(|ilk| ilk.is_virtual) {
-                return Err(virtual_refusal(
-                    MSG_ILK_PROVISION,
-                    "the channel belongs to a virtual person, which no IO provisions",
-                ));
-            }
             let mut change = None;
             if let Some(ilk) = self.ilks.get_mut(&existing) {
                 // A node's own `cloud` channel answers no signup of a person.
@@ -1726,14 +1713,8 @@ impl IdentityStore {
             .get(&req.ilk_id)
             .map(|ilk| ilk.tenant_id.clone())
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        // A virtual person's channels come through SY.admin in a later stage, never from an IO or
-        // a frontdesk, and no merge joins it, in or out (docs/digital-executive-v1-stage-1.md §2.1).
-        if self.ilks.get(&req.ilk_id).is_some_and(|ilk| ilk.is_virtual) {
-            return Err(virtual_refusal(
-                MSG_ILK_ADD_CHANNEL,
-                "no channel is added to a virtual person",
-            ));
-        }
+        // A virtual person takes channels as any person does, but no merge joins it, in or out
+        // (docs/digital-executive-v1-stage-1.md §2.1).
         if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
             if self.ilks.get(old_ilk).is_some_and(|ilk| ilk.is_virtual) {
                 return Err(virtual_refusal(
@@ -1822,15 +1803,6 @@ impl IdentityStore {
             Some(entry) if entry.deleted_at_ms.is_none() => entry.tenant_id.clone(),
             _ => return Err("ILK_NOT_FOUND".to_string()),
         };
-        // The same rule as ILK_ADD_CHANNEL's: no channel is added to a virtual person here.
-        if !req.add_channels.is_empty()
-            && self.ilks.get(&req.ilk_id).is_some_and(|ilk| ilk.is_virtual)
-        {
-            return Err(virtual_refusal(
-                MSG_ILK_UPDATE,
-                "no channel is added to a virtual person",
-            ));
-        }
         // The orchestrator adds a node's own channels: they live in the node's tenant, a Fluxbee
         // Cloud account is never one of them, and none is another ILK's. All checked before
         // anything changes.
@@ -16131,27 +16103,6 @@ mod tests {
         ok["ilk_id"].as_str().expect("ilk_id").to_string()
     }
 
-    /// A channel of a virtual person, as a later stage gives it through SY.admin: on its record and
-    /// in the lookup, which is what an IO's provision of that address would find.
-    fn ed_give_channel(
-        store: &mut IdentityStore,
-        ilk_id: &str,
-        channel_type: &str,
-        address: &str,
-        scope: &str,
-    ) {
-        let channel = sc_channel(
-            &format!("ich:{}", Uuid::new_v4()),
-            channel_type,
-            address,
-            scope,
-        );
-        store
-            .ich_lookup
-            .insert(channel_key(&channel), ilk_id.to_string());
-        store.ilks.get_mut(ilk_id).unwrap().channels.push(channel);
-    }
-
     /// The code of a refusal and its detail, as the caller reads them.
     fn ed_refusal(err: String) -> (String, String) {
         let payload = op_error_payload(&err, "fallback");
@@ -16534,13 +16485,11 @@ mod tests {
     }
 
     #[test]
-    fn no_channel_is_added_to_a_virtual_person_from_any_caller_nor_any_merge() {
+    fn a_virtual_person_takes_channels_as_a_person_but_no_merge() {
         let mut store = rg_store();
         let laura = ed_laura(&mut store);
         let ana = rg_with_ana(&mut store);
         let temp = rg_provision(&mut store, LC_TENANT, "slack", "U31");
-        let ilks = store.ilks.clone();
-        let lookup = store.ich_lookup.clone();
         let request =
             |target: &str, channel: ChannelInput, merge_from: Option<&str>| IlkAddChannelRequest {
                 ilk_id: target.to_string(),
@@ -16548,115 +16497,51 @@ mod tests {
                 merge_from_ilk_id: merge_from.map(str::to_string),
                 change_reason: None,
             };
-        let account = ChannelInput {
-            ich_id: format!("ich:{}", Uuid::new_v4()),
-            channel_type: "cloud".to_string(),
-            address: "laura@acme.com".to_string(),
-            scope: Some(INSTALLATION_SCOPE.to_string()),
-        };
 
-        for (caller, channel) in [
-            (Some("IO.slack@motherbee"), sc_slack_channel("U77")),
-            (Some("SY.frontdesk.gov@motherbee"), sc_slack_channel("U78")),
-            (None, sc_slack_channel("U79")),
-            // Never a Fluxbee Cloud account, even from the relay.
-            (Some(TEST_CLOUD_RELAY), account.clone()),
-        ] {
-            let err = store
-                .add_channel(
-                    request(&laura, channel, None),
-                    caller,
-                    MERGE_TTL_SECS,
-                    TEST_CLOUD_RELAY,
-                )
-                .expect_err("no channel on Laura");
-            ed_assert_virtual_refusal(err, MSG_ILK_ADD_CHANNEL);
-        }
-        // A merge into her, and a merge of her into a person.
-        for (target, source) in [
-            (laura.as_str(), temp.as_str()),
-            (ana.as_str(), laura.as_str()),
-        ] {
-            let err = store
-                .add_channel(
-                    request(target, sc_slack_channel("U80"), Some(source)),
-                    Some("SY.frontdesk.gov@motherbee"),
-                    MERGE_TTL_SECS,
-                    TEST_CLOUD_RELAY,
-                )
-                .expect_err("no merge");
-            ed_assert_virtual_refusal(err, MSG_ILK_ADD_CHANNEL);
-        }
-        // ILK_UPDATE adds none either.
-        let err = store
+        // A channel, from an IO or through ILK_UPDATE, as any person takes one.
+        store
+            .add_channel(
+                request(&laura, sc_slack_channel("U77"), None),
+                Some("IO.slack@motherbee"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect("Laura's channel");
+        store
             .update_ilk(IlkUpdateRequest {
                 ilk_id: laura.clone(),
                 add_channels: vec![sc_slack_channel("U81")],
                 change_reason: None,
             })
-            .expect_err("no channel through an update");
-        ed_assert_virtual_refusal(err, MSG_ILK_UPDATE);
-        assert_eq!(store.ilks, ilks);
-        assert_eq!(store.ich_lookup, lookup);
-        assert!(store.aliases.is_empty());
+            .expect("Laura's channel through an update");
+        assert_eq!(store.ilks[&laura].channels.len(), 2);
+        assert!(store.ilks[&laura].is_virtual);
 
-        // A person still takes a channel.
-        store
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+        // A merge into her, refused by the net every merge passes.
+        let err = store
             .add_channel(
-                request(&ana, sc_slack_channel("U82"), None),
-                Some("IO.slack@motherbee"),
+                request(&laura, sc_slack_channel("U80"), Some(&temp)),
+                Some("SY.frontdesk.gov@motherbee"),
                 MERGE_TTL_SECS,
                 TEST_CLOUD_RELAY,
             )
-            .expect("Ana's channel");
-    }
-
-    #[test]
-    fn no_io_provisions_a_virtual_persons_address_nor_a_cloud_account_on_it() {
-        let mut store = sc_store();
-        let laura = ed_laura(&mut store);
-        ed_give_channel(&mut store, &laura, "whatsapp", "+5491100000088", LC_TENANT);
-        ed_give_channel(
-            &mut store,
-            &laura,
-            "cloud",
-            "laura@acme.com",
-            INSTALLATION_SCOPE,
-        );
-        let ilks = store.ilks.clone();
-        let lookup = store.ich_lookup.clone();
-
-        // A stranger writing from her number would be stamped as her.
-        let err = sc_provision(
-            &mut store,
-            Some("IO.wapp@motherbee"),
-            "whatsapp",
-            "+5491100000088",
-            LC_TENANT,
-            None,
-        )
-        .expect_err("her number");
-        ed_assert_virtual_refusal(err, MSG_ILK_PROVISION);
-        // A Cloud signup of her email, from any tenant: no account lands on her.
-        for tenant_id in [LC_TENANT, SC_OTHER] {
-            let err = sc_account_provision(&mut store, tenant_id, "laura@acme.com")
-                .expect_err("her email");
-            ed_assert_virtual_refusal(err, MSG_ILK_PROVISION);
-        }
+            .expect_err("no merge into her");
+        ed_assert_virtual_refusal(err, "merge");
+        // A merge of her into a person, refused by ILK_ADD_CHANNEL itself.
+        let err = store
+            .add_channel(
+                request(&ana, sc_slack_channel("U82"), Some(&laura)),
+                Some("SY.frontdesk.gov@motherbee"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect_err("no merge of her");
+        ed_assert_virtual_refusal(err, MSG_ILK_ADD_CHANNEL);
         assert_eq!(store.ilks, ilks);
         assert_eq!(store.ich_lookup, lookup);
-
-        // Anyone else's address provisions as before.
-        let (ok, _) = sc_provision(
-            &mut store,
-            Some("IO.wapp@motherbee"),
-            "whatsapp",
-            "+5491100000089",
-            LC_TENANT,
-            None,
-        )
-        .expect("a stranger's own number");
-        assert_eq!(ok["created"], json!(true));
+        assert!(store.aliases.is_empty());
     }
 
     /// Stage 1 leaves the operator's lifecycle of a virtual person as a person's: SY.admin refuses

@@ -523,7 +523,9 @@ hand that wrote.**
     agents never stamp it, and no node ever replies as a real person.
   - **The rule changed** (§2.2, 4) and its contract test change on purpose.
 - **A person's `src_ilk` is accepted only from the person's IO, or from that person's registered
-  hand.** **Decided.**
+  hand.** Decided on 2026-11-25; **withdrawn on 2026-11-26** by the operator, and its stage-1 code
+  taken out: the security path went ahead of the flow, and it bent the next stage's design into a
+  "hand" kept as a channel. Which node speaks as an ED is part of open question 16.
   - **Why.** Once an ED acts on who is talking (its boss asks it to approve a refund), an unbound
     `src_ilk` is a hole: any node, in any tenant, could write as the boss.
   - **The model.** SY.vault's binding of a caller to its node (`check_caller_binding`,
@@ -1040,6 +1042,10 @@ The operator brought two methods and a combination, as ideas to adapt.
     One candidate is the tasks on timers (notes §1.2).
 15. **The line between infra and an ED's deployments** (§6.4).
 16. **Where the ED's list of ILKs lives,** and whether nodes read it in the shared memory (§4.2).
+    The operator, 2026-11-26: SY.deploy as the only keeper of what an ED is made of is fragile, and
+    identity may have to keep more. If every node needs to know which ED stands behind a node, the
+    structure belongs in identity and its SHM, built once and properly, not by halves. To be talked
+    once the new path is built; stage 1's binding of `src_ilk` came out on the way (§7.2).
 17. **Roles and capabilities, to review better** (notes §15), and **identity v3's claims** when
     simple is not enough (§10).
 18. **Cloud's flow for hiring:**
