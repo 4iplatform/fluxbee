@@ -5487,6 +5487,11 @@ enum InternalActionRoute {
     /// SY.admin's view of the installation file and the operator's change of its `ai`
     /// (docs/hive-config-update-v1.md §4, stage 3c).
     Installation,
+    /// One of SY.deploy's writes (docs/digital-executive-v1-stage-2.md §2), forwarded to
+    /// `SY.deploy@motherbee` as an L2 `command` (`handle_deploy_order`).
+    DeployCommand,
+    /// One of SY.deploy's reads, forwarded to `SY.deploy@motherbee` as an L2 `query`.
+    DeployQuery,
 }
 
 #[derive(Clone, Copy)]
@@ -5497,7 +5502,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "29";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "30";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -6302,6 +6307,44 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: false,
         allow_legacy_hive_id: false,
     },
+    // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): the motherbee's SY.deploy
+    // answers them, whatever hive a caller names.
+    InternalActionSpec {
+        action: "cd_deploy",
+        route: InternalActionRoute::DeployCommand,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_get",
+        route: InternalActionRoute::DeployQuery,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_list",
+        route: InternalActionRoute::DeployQuery,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_remove",
+        route: InternalActionRoute::DeployCommand,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_catalog",
+        route: InternalActionRoute::DeployQuery,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_tree",
+        route: InternalActionRoute::DeployQuery,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 /// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
@@ -6309,7 +6352,8 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 /// whose handlers refuse every other origin). Over the mesh, `SY.architect@motherbee` (Archi, the
 /// operator's agent) may ask for every action listed in `mesh_access` but those closed to the
 /// mesh (`Nobody`) and Cloud's (`Cloud`), `IO.cloud@motherbee` for each of
-/// `CLOUD_EXPOSED_ACTIONS`, and the access of the action names who else may. A caller on an ingress
+/// `CLOUD_EXPOSED_ACTIONS`, `SY.deploy@motherbee` for the steps of its deployments
+/// (`DEPLOY_STEP_ACTIONS`), and the access of the action names who else may. A caller on an ingress
 /// or egress hive may ask for nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeshAccess {
@@ -6493,7 +6537,15 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "acme_reload"
         | "web_status"
         // The exposures: Archi reads them, and IO.cloud once Cloud's catalog lists the read.
-        | "list_exposures" => MeshAccess::Archi,
+        | "list_exposures"
+        // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): Archi's, and Fluxbee
+        // Cloud's through IO.cloud's relay, each in `CLOUD_EXPOSED_ACTIONS`.
+        | "cd_deploy"
+        | "cd_get"
+        | "cd_list"
+        | "cd_remove"
+        | "cd_catalog"
+        | "cd_tree" => MeshAccess::Archi,
         _ => return None,
     };
     Some(access)
@@ -6588,8 +6640,9 @@ enum MeshAdmission {
 /// never a field of the params, and `caller_hive` the role of its hive (`caller_hive_role`). In
 /// order: a caller on an ingress or egress hive, or on a hive the registry does not hold, gets
 /// nothing; nobody gets an action closed to the mesh (`MeshAccess::Nobody`); Archi gets every other
-/// listed action but Fluxbee Cloud's (`MeshAccess::Cloud`); IO.cloud the Cloud-exposed ones; then
-/// the action's own `MeshAccess`.
+/// listed action but Fluxbee Cloud's (`MeshAccess::Cloud`); IO.cloud the Cloud-exposed ones;
+/// SY.deploy the steps of its deployments and nothing else (`authorize_deploy_step`); then the
+/// action's own `MeshAccess`.
 fn authorize_mesh_caller(
     caller: &str,
     caller_hive: Option<CallerHive>,
@@ -6633,6 +6686,11 @@ fn authorize_mesh_caller(
     {
         return Ok(MeshAdmission::Admitted);
     }
+    // SY.deploy, on the motherbee alone: its own row, whatever the action's access says.
+    if caller == format!("{DEPLOY_NODE_ROLE}@{admin_hive}") {
+        authorize_deploy_step(caller, action, params)?;
+        return Ok(MeshAdmission::Admitted);
+    }
     match access {
         MeshAccess::WorkflowNode if name == "SY.wf-rules" => {
             authorize_wf_rules_node(caller, hive, action, target, params)?;
@@ -6655,6 +6713,65 @@ fn authorize_mesh_caller(
         }
         _ => Err(format!("{caller} may not ask for '{action}' over the mesh")),
     }
+}
+
+/// SY.deploy's role, `SY.deploy@<the motherbee>` its one node (docs/digital-executive-v1-stage-2.md
+/// §3): SY.admin forwards it the `cd_*` orders, and admits it for the steps of its deployments.
+const DEPLOY_NODE_ROLE: &str = "SY.deploy";
+
+/// SY.deploy's row (docs/digital-executive-v1-stage-2.md §8, agreed by the operator on 2026-11-26):
+/// the SY.admin actions its deployments' steps take, by classes, so that the next solutions need
+/// no new row. Out: the purges, of a node or of an ILK, which stay the operator's, and what the
+/// whole installation shares (routes, VPN rules, the user OPA policy, hives, runtimes), each with
+/// the first source that needs it. Its bounds (which nodes, which tenants) come later (§12).
+const DEPLOY_STEP_ACTIONS: [&str; 16] = [
+    // A node's whole life.
+    "run_node",
+    "start_node",
+    "restart_node",
+    "kill_node",
+    "get_node_status",
+    "get_node_config",
+    "set_node_config",
+    "node_control_config_set",
+    // A deployment's people.
+    "create_virtual_person",
+    "set_person_document",
+    "set_ilk_works_for",
+    "set_ilk_definition",
+    "delete_ilk",
+    "restore_ilk",
+    // Its tenant's keys.
+    "vault_list",
+    "vault_assign",
+];
+
+/// SY.deploy@motherbee's row in the A-62 table: the actions of `DEPLOY_STEP_ACTIONS`, a node's
+/// `kill_node` plain or with `retire_instance` (docs/digital-executive-v1-stage-2.md §9), never
+/// with `purge_instance`, whatever its value says but `false`. Every other action is refused.
+fn authorize_deploy_step(
+    caller: &str,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    if !DEPLOY_STEP_ACTIONS.contains(&action) {
+        return Err(format!(
+            "{caller} may not ask for '{action}': SY.deploy's row holds a node's life, a \
+             deployment's people and its tenant's keys (docs/digital-executive-v1-stage-2.md §8)"
+        ));
+    }
+    if action == "kill_node"
+        && !matches!(
+            params.get("purge_instance"),
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false))
+        )
+    {
+        return Err(format!(
+            "{caller} stops or retires a node, never purges one: kill_node without purge_instance \
+             (a purge is the operator's)"
+        ));
+    }
+    Ok(())
 }
 
 /// The base runtime every workflow package runs on: the WF engine's code.
@@ -11179,6 +11296,14 @@ async fn dispatch_internal_admin_command(
             }
         }
     }
+    // SY.deploy's orders carry the caller SY.admin stamps (`stamp_relay_facts`), never one the
+    // request names (docs/digital-executive-v1-stage-2.md §2).
+    if DEPLOY_ORDERS.contains(&action) && params.get(DEPLOY_CALLER_FIELD).is_some() {
+        return Ok(internal_invalid_request(
+            action,
+            "_caller is SY.admin's to stamp, from the router-stamped caller: a request may not carry it",
+        ));
+    }
     // What a handler does on a mesh caller's behalf goes by its router-stamped name, never by
     // anything in `params`; the trusted paths have none.
     let caller_l2_name = origin.caller();
@@ -11590,6 +11715,23 @@ async fn dispatch_internal_admin_command(
                 append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             }
             (status, body)
+        }
+        // SY.deploy's writes, in the audit log with the caller SY.admin stamped on them; its reads
+        // are not (docs/digital-executive-v1-stage-2.md §2).
+        InternalActionRoute::DeployCommand => {
+            let started = Instant::now();
+            let logged_params = admin_command_log_params(&params);
+            let (status, body) =
+                handle_deploy_order(client, &ctx.hive_id, action, "command", params).await;
+            let result = Ok(InternalAdminDispatchResult {
+                http_status: status,
+                envelope: parse_internal_response_envelope(action, status, &body),
+            });
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
+            (status, body)
+        }
+        InternalActionRoute::DeployQuery => {
+            handle_deploy_order(client, &ctx.hive_id, action, "query", params).await
         }
     };
 
@@ -12035,6 +12177,27 @@ fn stamp_relay_facts(
             object.insert("include_deleted".to_string(), serde_json::Value::Bool(true));
             object.insert("exclude_root".to_string(), serde_json::Value::Bool(true));
         }
+        // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): who asks, and the tenant
+        // Fluxbee Cloud claims, which enforce_cloud_relay_content checked: SY.deploy answers
+        // NOT_FOUND for anything of another tenant and lists only that one. The operator (over
+        // HTTP and through the executor) and Archi name no tenant: their orders see every one.
+        _ if DEPLOY_ORDERS.contains(&action) => {
+            let tenant_id = if cloud_relay {
+                object
+                    .get("tenant_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
+            object.insert(
+                DEPLOY_CALLER_FIELD.to_string(),
+                serde_json::json!({
+                    "by": launched_by_for_caller(caller_l2_name, admin_hive),
+                    "tenant_id": tenant_id,
+                }),
+            );
+        }
         _ => {}
     }
     params
@@ -12288,6 +12451,16 @@ fn enforce_cloud_relay_content(
                     .unwrap_or_default(),
             )?;
             only_fields(Some(params), &["key", "tenant_id"])?;
+        }
+        // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): each for the tenant Cloud
+        // claims, which SY.admin carries to SY.deploy as `_caller.tenant_id`, and with the params
+        // the SDK lists for it, the list IO.cloud's translation reads (each op relays to the
+        // action of its own name).
+        _ if fluxbee_sdk::cloud::cloud_deploy_op_params(action).is_some() => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            let mut allowed = vec!["tenant_id"];
+            allowed.extend(fluxbee_sdk::cloud::cloud_deploy_op_params(action).unwrap_or(&[]));
+            only_fields(Some(params), &allowed)?;
         }
         // io.web's exposures (docs/io-web-v2-stage-2-1.md §5.1 (3)): each action's own fields,
         // and never a tenant: an exposure is the installation's, not a tenant's.
@@ -13158,6 +13331,12 @@ async fn handle_http(
         respond_json(stream, status, &resp).await?;
         return Ok(());
     }
+    if let Some((status, resp)) =
+        handle_cd_paths(method.as_str(), path, &query, &body, ctx, client).await?
+    {
+        respond_json(stream, status, &resp).await?;
+        return Ok(());
+    }
     if let Some((status, resp, content_type)) =
         handle_modules_paths(method.as_str(), path, &body).await?
     {
@@ -13641,6 +13820,115 @@ async fn handle_http(
         }
     }
     Ok(())
+}
+
+/// SY.deploy's orders on the operator's HTTP API (docs/digital-executive-v1-stage-2.md §2), each
+/// through `dispatch_internal_admin_command` as Archi's and Fluxbee Cloud's over the mesh: the
+/// body of a write, or the query's params as fields, and the path's id. Kept between `handle_http`
+/// and `handle_inventory_http`, where the catalog guard reads the HTTP routes
+/// (scripts/admin_action_catalog_parity_check.sh).
+async fn handle_cd_paths(
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    body: &[u8],
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+) -> Result<Option<(u16, String)>, AdminError> {
+    let Some(rest) = path.strip_prefix("/cd/") else {
+        return Ok(None);
+    };
+    let segments: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    let fields = || -> serde_json::Value {
+        serde_json::Value::Object(
+            query
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+                .collect(),
+        )
+    };
+    let internal = match (method, segments.as_slice()) {
+        ("POST", ["deployments"]) => {
+            let payload = if body.iter().all(u8::is_ascii_whitespace) {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_deploy",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("GET", ["deployments"]) => {
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_list",
+                None,
+                fields(),
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("GET", ["deployments", deployment_id]) => {
+            let payload = serde_json::json!({ "deployment_id": decode_percent(deployment_id) });
+            dispatch_internal_admin_command(ctx, client, "cd_get", None, payload, AdminOrigin::Http)
+                .await?
+        }
+        ("POST", ["deployments", deployment_id, "remove"]) => {
+            let payload = serde_json::json!({ "deployment_id": decode_percent(deployment_id) });
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_remove",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("POST", ["groupings", grouping_id, "remove"]) => {
+            let payload = serde_json::json!({ "grouping_id": decode_percent(grouping_id) });
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_remove",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("GET", ["catalog"]) => {
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_catalog",
+                None,
+                fields(),
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("GET", ["tree"]) => {
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_tree",
+                None,
+                fields(),
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((internal.http_status, internal.envelope.to_string())))
 }
 
 /// The body of an ACME POST: none, or a JSON object (which must be empty: the actions take no
@@ -15426,6 +15714,21 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "DB_NOT_READY" | "DOCUMENT_WRITE_FAILED" => 503,
         // A cursor its listing did not give (FINDINGS A-198): another listing's, or none at all.
         "INVALID_CURSOR" => 400,
+        // SY.deploy's (docs/digital-executive-v1-stage-2.md §2, §5.1): a blank its source
+        // refuses; a source or a version it does not hold; a request_key the tenant gave before
+        // with other content, no usable key of an agent's provider or no credential of the
+        // channel's in the tenant's vault, a phone number another deployment holds, the founding
+        // deployment's removal while its grouping has others; a hive it cannot reach now, and
+        // SY.deploy not answering (both retryable). Its BUSY is a 503 too
+        // (`deploy_error_http_status`).
+        "BLANK_INVALID" => 400,
+        "SOURCE_NOT_FOUND" => 404,
+        "REQUEST_KEY_REUSED"
+        | "AI_KEY_MISSING"
+        | "CREDENTIAL_MISSING"
+        | "NUMBER_TAKEN"
+        | "DEPLOYMENT_NOT_REMOVABLE" => 409,
+        "HIVE_UNAVAILABLE" | "DEPLOY_UNAVAILABLE" => 503,
         "UNAUTHORIZED"
         | "SYSTEM_ILK_PROTECTED"
         | "TENANT_ROOT_PROTECTED"
@@ -16216,6 +16519,157 @@ fn normalize_wf_rules_target(target: Option<String>, fallback_hive: &str) -> Str
             }
         })
         .unwrap_or_else(|| fallback_hive.to_string())
+}
+
+/// SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): `cd_deploy` and `cd_remove`
+/// (writes, `InternalActionRoute::DeployCommand`), `cd_get`, `cd_list`, `cd_catalog` and `cd_tree`
+/// (reads, `InternalActionRoute::DeployQuery`).
+const DEPLOY_ORDERS: [&str; 6] = [
+    "cd_deploy",
+    "cd_get",
+    "cd_list",
+    "cd_remove",
+    "cd_catalog",
+    "cd_tree",
+];
+
+/// The field of an order SY.admin stamps, `{by, tenant_id}` (`stamp_relay_facts`), and refuses in
+/// a request.
+const DEPLOY_CALLER_FIELD: &str = "_caller";
+
+/// SY.admin's answer when SY.deploy does not answer an order in time, or cannot be reached.
+const DEPLOY_UNAVAILABLE: &str = "DEPLOY_UNAVAILABLE";
+
+/// SY.deploy's answers that changed nothing and may pass when asked again: a hive it cannot reach
+/// now, another deployment of the grouping under way, and no answer at all. Each carries
+/// `payload.retryable: true`; a write asked again with its `request_key` gives back the same
+/// deployment.
+const DEPLOY_RETRYABLE_CODES: [&str; 3] = ["HIVE_UNAVAILABLE", "BUSY", DEPLOY_UNAVAILABLE];
+
+/// How long SY.admin waits for SY.deploy's answer: 10 s, since SY.deploy answers an order before it
+/// starts any step (docs/digital-executive-v1-stage-2.md §2).
+fn deploy_request_timeout() -> Duration {
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_DEPLOY_TIMEOUT_SECS").unwrap_or(10))
+}
+
+/// Why an order cannot go to SY.deploy as it is: it is no JSON object, or a `cd_remove` names
+/// other than exactly one of a deployment and a grouping (docs/digital-executive-v1-stage-2.md
+/// §2). SY.deploy checks the rest: the source, the blanks, the ids and the tenant.
+fn deploy_order_request_error(action: &str, payload: &serde_json::Value) -> Option<String> {
+    let Some(object) = payload.as_object() else {
+        return Some(format!("{action} takes a JSON object"));
+    };
+    if action != "cd_remove" {
+        return None;
+    }
+    let named = |field: &str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+    };
+    let given = |field: &str| object.get(field).is_some_and(|value| !value.is_null());
+    match (named("deployment_id"), named("grouping_id")) {
+        (true, false) if !given("grouping_id") => None,
+        (false, true) if !given("deployment_id") => None,
+        _ => Some(
+            "cd_remove names exactly one of deployment_id (one deployment) and grouping_id (a \
+             whole grouping), a non-empty string"
+                .to_string(),
+        ),
+    }
+}
+
+/// The HTTP status of SY.deploy's refusal: SY.admin's for every code but `BUSY`, which from
+/// SY.deploy (another deployment of the grouping under way) is a 503 to ask again, where
+/// SY.wf-rules' is a 409.
+fn deploy_error_http_status(error_code: &str) -> u16 {
+    if error_code.trim().eq_ignore_ascii_case("BUSY") {
+        503
+    } else {
+        error_code_to_http_status(error_code)
+    }
+}
+
+/// SY.deploy's answer as SY.admin's (docs/digital-executive-v1-stage-2.md §2.1): an accepted write
+/// (`accepted: true`) is a 202 with its status `ok`, any other ok a 200, a refusal SY.deploy's code
+/// with its HTTP status (`deploy_error_http_status`) and, for the codes that changed nothing,
+/// `payload.retryable`; no answer at all is `503 DEPLOY_UNAVAILABLE`, retryable.
+fn deploy_order_answer(
+    action: &str,
+    target: &str,
+    answer: Result<serde_json::Value, AdminError>,
+) -> (u16, String) {
+    let payload = match answer {
+        Ok(payload) => payload,
+        Err(err) => {
+            return (
+                error_code_to_http_status(DEPLOY_UNAVAILABLE),
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": { "retryable": true },
+                    "error_code": DEPLOY_UNAVAILABLE,
+                    "error_detail": format!(
+                        "{target} did not answer within {} s: {err}",
+                        deploy_request_timeout().as_secs()
+                    ),
+                })
+                .to_string(),
+            )
+        }
+    };
+    let ok = payload_is_ok(&payload);
+    let accepted = ok
+        && payload
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let refusal = if ok {
+        None
+    } else {
+        payload_error_code(&payload)
+    };
+    let (status, body) = with_retryable_codes(
+        build_admin_http_response(action, Ok(payload)),
+        &DEPLOY_RETRYABLE_CODES,
+    );
+    match refusal {
+        _ if accepted => (202, body),
+        Some(code) if code != REPLY_TOO_LARGE => (deploy_error_http_status(&code), body),
+        _ => (status, body),
+    }
+}
+
+/// Forward one of SY.deploy's orders (`DEPLOY_ORDERS`) to `SY.deploy@<the motherbee>`, as the
+/// `wf_rules_*` reads go to SY.wf-rules: the action's name, its payload (the request with the
+/// `_caller` SY.admin stamped), as a `command` or a `query`, and SY.deploy's answer
+/// (`deploy_order_answer`). A field of the request that is null reads as absent and is not sent:
+/// the executor passes null for an optional field its plan leaves out.
+async fn handle_deploy_order(
+    client: &RouterDispatcher,
+    admin_hive: &str,
+    action: &str,
+    kind: &str,
+    mut payload: serde_json::Value,
+) -> (u16, String) {
+    if let Some(detail) = deploy_order_request_error(action, &payload) {
+        return admin_invalid_request_response(action, &detail);
+    }
+    if let Some(fields) = payload.as_object_mut() {
+        fields.retain(|_, value| !value.is_null());
+    }
+    let target = format!("{DEPLOY_NODE_ROLE}@{admin_hive}");
+    let answer = send_l2_action_request(
+        client,
+        &target,
+        kind,
+        action,
+        payload,
+        deploy_request_timeout(),
+    )
+    .await;
+    deploy_order_answer(action, &target, answer)
 }
 
 async fn send_l2_action_request(
@@ -17071,6 +17525,8 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::Acme => ("acme", None),
         InternalActionRoute::WebStatus => ("web_status", None),
         InternalActionRoute::Installation => ("installation", None),
+        InternalActionRoute::DeployCommand => ("deploy_command", None),
+        InternalActionRoute::DeployQuery => ("deploy_query", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -17259,6 +17715,10 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "unpublish_exposure"
             // It mints a one-time way in to an exposure.
             | "issue_exposure_link"
+            // SY.deploy's writes: a deployment made, or ended (docs/digital-executive-v1-stage-2.md
+            // §2).
+            | "cd_deploy"
+            | "cd_remove"
     )
 }
 
@@ -17326,6 +17786,9 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             // A worker's default route and IPv6 change, and its agents' internet with them.
             | "set_hive_egress"
             | "clear_hive_egress"
+            // A Digital Executive born (a person, its nodes, its keys assigned), or retired.
+            | "cd_deploy"
+            | "cd_remove"
     )
 }
 
@@ -17527,6 +17990,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         "unpublish_exposure" => "Fluxbee Cloud's alone (IO.cloud's relay): remove an exposure: the edge's route goes and its host answers 404; the name stays on the certificate until its renewal.",
         "issue_exposure_link" => "Fluxbee Cloud's alone (IO.cloud's relay): a one-time link to an enabled exposure, minted by io.web, opened once top-level within about 120 s; never logged.",
         "list_exposures" => "List the exposures: each one's id, label, host, url, upstream, state (closed or enabled, with enabled_until), certificate, route and io.web states.",
+        "cd_deploy" => "Deploy a source, with its blanks, into a grouping through SY.deploy: a grouping of kind ed with no id is a new Digital Executive (the source plain-ed). Answers accepted (202) at once; cd_get follows it to active or failed.",
+        "cd_get" => "Read one deployment from SY.deploy: its state (deploying, active, failed, removing, removed), grouping, source, blanks and nodes with their status; a failed one names its step and code.",
+        "cd_list" => "List SY.deploy's deployments, by tenant, grouping kind or grouping.",
+        "cd_remove" => "Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed.",
+        "cd_catalog" => "List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks.",
+        "cd_tree" => "Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret.",
         _ => "Admin action.",
     }
 }
@@ -17783,6 +18252,15 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "web_status" => vec!["GET /web/status"],
         // The exposures' changes have no route: Fluxbee Cloud's alone, over the mesh.
         "list_exposures" => vec!["GET /web/exposures"],
+        "cd_deploy" => vec!["POST /cd/deployments"],
+        "cd_get" => vec!["GET /cd/deployments/{deployment_id}"],
+        "cd_list" => vec!["GET /cd/deployments"],
+        "cd_remove" => vec![
+            "POST /cd/deployments/{deployment_id}/remove",
+            "POST /cd/groupings/{grouping_id}/remove",
+        ],
+        "cd_catalog" => vec!["GET /cd/catalog"],
+        "cd_tree" => vec!["GET /cd/tree"],
         _ => Vec::new(),
     }
 }
@@ -17922,6 +18400,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "Admin action name, for example add_hive.",
         )],
         "publish_runtime_package" => Vec::new(),
+        "cd_get" => vec![admin_action_path_param(
+            "deployment_id",
+            "string",
+            "The deployment, as cd_deploy answered it.",
+        )],
         // The name the route stores and the orchestrator reads (A-172's family).
         "get_hive" | "remove_hive" => vec![admin_action_path_param(
             "hive_id",
@@ -18209,6 +18692,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "disable_exposure"
             | "unpublish_exposure"
             | "issue_exposure_link"
+            | "cd_deploy"
     )
 }
 
@@ -18478,6 +18962,38 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "definition",
             "object",
             "Cognitive definition object with role_hash, skill_hashes, handbook_hashes, and optional personality_hash (single 64-hex string).",
+        )],
+        "cd_deploy" => vec![
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "The tenant of the deployment, tnt:<uuid>: active, never the root one.",
+            ),
+            admin_action_body_field(
+                "request_key",
+                "string",
+                "The caller's id for the deployment, at most 64 characters of [A-Za-z0-9._:-]: the same key in the tenant gives back the same deployment, and resumes a failed one; with other content, REQUEST_KEY_REUSED (409).",
+            ),
+            admin_action_body_field(
+                "source",
+                "object",
+                "{id, version}: a source of cd_catalog (plain-ed in this stage); without a version, the newest.",
+            ),
+            admin_action_body_field(
+                "grouping",
+                "object",
+                "{kind, id}: kind ed; without an id, a new grouping, a new ED.",
+            ),
+            admin_action_body_field(
+                "blanks",
+                "object",
+                "Exactly the source's blanks, as cd_catalog lists them, each checked by its type (BLANK_INVALID, 400). A credential is its vault key's name, never its value.",
+            ),
+        ],
+        "cd_tree" => vec![admin_action_body_field(
+            "tenant_id",
+            "string",
+            "The tenant, tnt:<uuid>; over HTTP ?tenant_id=.",
         )],
         _ => Vec::new(),
     }
@@ -19157,6 +19673,28 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional: the next_cursor of the page before, <fire_at_utc_ms>:<uuid>, passed back as it came. A page ends at limit or where one frame (128 KiB) fills, and has next_cursor while timers follow, whichever cut it (since 0.1.133, FINDINGS A-266); the answer has no total. A cursor that is not one is refused, TIMER_INVALID_PAYLOAD (400).",
             ),
         ],
+        "cd_deploy" => vec![admin_action_body_field(
+            "hive",
+            "string",
+            "Optional: the worker of a new grouping; without it, the worker with the most room. A grouping's later deployments go to its hive.",
+        )],
+        "cd_list" => vec![
+            admin_action_body_field("tenant_id", "string", "Optional filter: the tenant, tnt:<uuid>."),
+            admin_action_body_field("grouping_kind", "string", "Optional filter: the grouping's kind, ed."),
+            admin_action_body_field("grouping_id", "string", "Optional filter: one grouping, an ED's ILK."),
+        ],
+        "cd_remove" => vec![
+            admin_action_body_field(
+                "deployment_id",
+                "string",
+                "One deployment (the path's in POST /cd/deployments/{deployment_id}/remove). Exactly one of the two.",
+            ),
+            admin_action_body_field(
+                "grouping_id",
+                "string",
+                "A whole grouping, an ED's ILK (the path's in POST /cd/groupings/{grouping_id}/remove). Exactly one of the two.",
+            ),
+        ],
         _ => Vec::new(),
     }
 }
@@ -19458,6 +19996,23 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "disable_exposure" | "unpublish_exposure" | "issue_exposure_link" => serde_json::json!({
             "exposure_id": "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
         }),
+        "cd_deploy" => serde_json::json!({
+            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+            "request_key": "ed-laura-1",
+            "source": { "id": "plain-ed", "version": "1" },
+            "grouping": { "kind": "ed" },
+            "blanks": {
+                "display_name": "Laura",
+                "company_name": "Client Co",
+                "personality": { "timezone": "America/Argentina/Buenos_Aires", "country_code": "AR", "primary_language": "es" },
+                "whatsapp": { "phone_number_id": "1234567890", "waba_id": "9876543210", "credential_key": "client-laura-wapp" }
+            },
+            "hive": "worker1"
+        }),
+        "cd_list" | "cd_tree" => serde_json::json!({
+            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111"
+        }),
+        "cd_remove" => serde_json::json!({ "deployment_id": "dp7xk3m2qa" }),
         _ => serde_json::Value::Null,
     }
 }
@@ -19787,6 +20342,16 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "acme_reload" => "curl -X POST /acme/reload",
         "web_status" => "curl -X GET /web/status",
         "list_exposures" => "curl -X GET /web/exposures",
+        "cd_deploy" => {
+            r#"curl -X POST /cd/deployments -d '{"tenant_id":"tnt:11111111-1111-4111-8111-111111111111","request_key":"ed-laura-1","source":{"id":"plain-ed","version":"1"},"grouping":{"kind":"ed"},"blanks":{"display_name":"Laura","company_name":"Client Co","personality":{"timezone":"America/Argentina/Buenos_Aires","country_code":"AR","primary_language":"es"},"whatsapp":{"phone_number_id":"1234567890","waba_id":"9876543210","credential_key":"client-laura-wapp"}},"hive":"worker1"}'"#
+        }
+        "cd_get" => "curl -X GET /cd/deployments/dp7xk3m2qa",
+        // One filter each, unquoted: Archi's SCMD routes for /cd/* come with its own release, and
+        // every quoted GET example is one Archi's translation is held to.
+        "cd_list" => "curl -X GET /cd/deployments?grouping_kind=ed",
+        "cd_remove" => "curl -X POST /cd/deployments/dp7xk3m2qa/remove",
+        "cd_catalog" => "curl -X GET /cd/catalog",
+        "cd_tree" => "curl -X GET /cd/tree?tenant_id=tnt:11111111-1111-4111-8111-111111111111",
         _ => return None,
     };
     Some(text.to_string())
@@ -19816,6 +20381,10 @@ const INVALID_HIVE_ID_NOTE: &str = "A hive_id that is not a hive id (1 to 64 let
 /// The sentence the help of each Fluxbee Cloud person action gives a virtual person
 /// (docs/digital-executive-v1-stage-1.md §2.2, `refuse_cloud_action_on_a_virtual_ilk`).
 const VIRTUAL_PERSON_CLOUD_NOTE: &str = "Fluxbee Cloud's call on a virtual person (a Digital Executive, create_virtual_person) answers ILK_VIRTUAL, or IDENTITY_UNAVAILABLE (retryable) while SY.admin cannot read whether the ILK is one (identity's shared memory, or SY.identity's record for a restore); the operator and Archi keep it in this stage.";
+
+/// What every one of SY.deploy's orders says of its path, its callers and its codes
+/// (docs/digital-executive-v1-stage-2.md §2).
+const DEPLOY_ORDER_NOTE: &str = "Forwarded to SY.deploy@motherbee (docs/digital-executive-v1-stage-2.md §2) with _caller {by, tenant_id} stamped by SY.admin: a request that carries _caller is refused (INVALID_REQUEST), and a null field is not sent. Only Fluxbee Cloud's names a tenant, the one it claims: SY.deploy answers NOT_FOUND for another tenant's. Codes: 400 INVALID_REQUEST, BLANK_INVALID; 404 NOT_FOUND, SOURCE_NOT_FOUND; 409 REQUEST_KEY_REUSED, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, DEPLOYMENT_NOT_REMOVABLE; 503 HIVE_UNAVAILABLE, BUSY and, with no answer in 10 s, DEPLOY_UNAVAILABLE, each with payload.retryable true.";
 
 /// What every removal says of the public pages it leaves up (`pages_left_up`, FINDINGS A-242).
 const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDINGS A-242): a page outlives its publisher, its tenant and its hive, and stays up until its expires_at (24 h after its publish by default, 30 days at most, never renewed; the edge then serves it no more and SY.admin's sweep retires it) or until it is taken down. The ok answer names the pages it leaves up in payload.pages_left_up: {count, pages: [{publication_id, expires_at (epoch seconds), status, filename_original, publisher_l2_name, tenant_id, edge_node}], more}, soonest to expire first, at most 20 of them in 8 KiB (more counts the rest), never a link's key. A ledger SY.admin cannot read gives {count: null, error}, and refuses nothing. GET /artifacts lists every page that is up; POST /artifacts/unpublish takes one down by its publication_id.";
@@ -20595,6 +21164,32 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "state is closed or enabled (enabled_until set). certificate.state: covered (the served leaf names the host), pending (an order is due or running), waiting_dns (the host's DNS name does not answer the main name's addresses yet; resolved again every 5 min), failed (the CA refused it: detail, retry_at), held (the ACME budget or a hold: retry_at, or the operator's POST /acme/renew) or off (no ACME: the operator certifies by hand).",
             "route.state: acknowledged (the edge holds the host), pending, or no_edge. io_web.state: acknowledged (io.web answered ok at the current generation), pending (it has not: stopped, after kill_node IO.web@motherbee, restarting, or slow), or absent (IO.web@motherbee has no identity: never launched, run_node IO.web@motherbee in the root tenant; what enable_exposure answers IO_WEB_ABSENT for).",
             "Read by IO.cloud and Archi over the mesh, the operator over HTTP. The changes are Fluxbee Cloud's alone.",
+        ],
+        "cd_deploy" => vec![
+            "SY.deploy checks everything first (the tenant, the request_key, the source, the grouping, every blank, the AI key and the credential in the tenant's vault, the hive), writes the record and answers before any step: 202, {status: ok, accepted: true, deployment_id, grouping: {kind, id, short_id}, state: deploying}. cd_get follows it to active or failed.",
+            "A failed deployment stays failed, with its step and code: cd_deploy again with the same request_key resumes it; cd_remove ends what was made.",
+            DEPLOY_ORDER_NOTE,
+        ],
+        "cd_remove" => vec![
+            "Exactly one of deployment_id and grouping_id (over HTTP, the path's): anything else is refused with INVALID_REQUEST before SY.deploy is asked.",
+            "A grouping's deployments go newest first, each node retired (kill_node with retire_instance: its ILK marked, its secrets kept), then the ED marked (delete_ilk); the records go to removed. The founding deployment alone, while its grouping has others, answers DEPLOYMENT_NOT_REMOVABLE (409). Answers 202 {accepted: true}; cd_get follows it.",
+            DEPLOY_ORDER_NOTE,
+        ],
+        "cd_get" => vec![
+            "The deployment's record: grouping, tenant, request_key, source {id, version, hash}, blanks, hive, nodes with their status, vault key names, state and history; a failed one names its step, code and detail. NOT_FOUND for one SY.deploy does not hold.",
+            DEPLOY_ORDER_NOTE,
+        ],
+        "cd_list" => vec![
+            "Each filter is optional; over HTTP the query's ?tenant_id=&grouping_kind=&grouping_id=.",
+            DEPLOY_ORDER_NOTE,
+        ],
+        "cd_catalog" => vec![
+            "Each source: its id, kind, versions and blanks, the fields cd_deploy's blanks take. In this stage, SY.deploy's native plain-ed.",
+            DEPLOY_ORDER_NOTE,
+        ],
+        "cd_tree" => vec![
+            "Read when asked: the tenant's infra deployments, its EDs (virtual persons) with their documents, each ED's parts (the ILKs whose works_for names it) with role, node and status, and its deployments with source, version, state, each agent's assets and each IO's credential key names.",
+            DEPLOY_ORDER_NOTE,
         ],
         _ => vec![],
     }
@@ -24807,6 +25402,12 @@ const IDENTITY_RETRYABLE_CODES: [&str; 2] = ["DB_NOT_READY", "DOCUMENT_WRITE_FAI
 /// `payload.retryable`, as the other answers that changed nothing do; any other answer is as it
 /// came.
 fn with_identity_retryable(answer: (u16, String)) -> (u16, String) {
+    with_retryable_codes(answer, &IDENTITY_RETRYABLE_CODES)
+}
+
+/// An answer whose error is one of `codes` says so in `payload.retryable`; any other answer is as
+/// it came.
+fn with_retryable_codes(answer: (u16, String), codes: &[&str]) -> (u16, String) {
     let (status, body) = answer;
     let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&body) else {
         return (status, body);
@@ -24814,7 +25415,7 @@ fn with_identity_retryable(answer: (u16, String)) -> (u16, String) {
     let retryable = envelope
         .get("error_code")
         .and_then(|code| code.as_str())
-        .is_some_and(|code| IDENTITY_RETRYABLE_CODES.contains(&code));
+        .is_some_and(|code| codes.contains(&code));
     if !retryable {
         return (status, body);
     }
@@ -31449,10 +32050,10 @@ mod tests {
         assert!(!owner_node_has_deterministic_ilk("AI.demo@motherbee"));
     }
 
-    /// The Cloud-exposed surface: these twenty, and io.web's exposure actions once the SDK's
-    /// catalog lists them (docs/io-web-v2-stage-2-1.md §8, R4, a later release of the SDK alone).
-    /// Every exposed action is in the registry, and `list_cloud_actions` projects exactly the
-    /// exposed set.
+    /// The Cloud-exposed surface: these twenty, io.web's exposure actions once the SDK's catalog
+    /// lists them (docs/io-web-v2-stage-2-1.md §8, R4, a later release of the SDK alone), and
+    /// SY.deploy's six orders (docs/digital-executive-v1-stage-2.md §2). Every exposed action is in
+    /// the registry, and `list_cloud_actions` projects exactly the exposed set.
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
         let expected_surface: std::collections::HashSet<&str> = [
@@ -31481,14 +32082,16 @@ mod tests {
         .collect();
         let configured_surface: std::collections::HashSet<&str> =
             IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
-        let exposure_actions: std::collections::HashSet<&str> = exposures::EXPOSURE_CLOUD_ACTIONS
-            .iter()
-            .chain([&exposures::LIST_EXPOSURES])
-            .copied()
-            .collect();
+        let exposure_and_deploy_actions: std::collections::HashSet<&str> =
+            exposures::EXPOSURE_CLOUD_ACTIONS
+                .iter()
+                .chain([&exposures::LIST_EXPOSURES])
+                .chain(DEPLOY_ORDERS.iter())
+                .copied()
+                .collect();
         assert_eq!(
             configured_surface
-                .difference(&exposure_actions)
+                .difference(&exposure_and_deploy_actions)
                 .copied()
                 .collect::<std::collections::HashSet<&str>>(),
             expected_surface
@@ -41031,7 +41634,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "29");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "30");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -51822,6 +52425,703 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(100))
             .await
             .is_none());
+    }
+
+    /// SY.deploy@motherbee's row (docs/digital-executive-v1-stage-2.md §8): every action of its three
+    /// classes, a node's kill_node plain or retiring, and nothing else, never a purge; its own name
+    /// exactly, on the motherbee alone.
+    #[test]
+    fn sy_deploy_on_the_motherbee_asks_for_its_row_alone() {
+        let deploy = "SY.deploy@motherbee";
+        let row = [
+            "run_node",
+            "start_node",
+            "restart_node",
+            "kill_node",
+            "get_node_status",
+            "get_node_config",
+            "set_node_config",
+            "node_control_config_set",
+            "create_virtual_person",
+            "set_person_document",
+            "set_ilk_works_for",
+            "set_ilk_definition",
+            "delete_ilk",
+            "restore_ilk",
+            "vault_list",
+            "vault_assign",
+        ];
+        assert_eq!(DEPLOY_STEP_ACTIONS, row);
+        // What a step names, as SY.deploy sends it (§5.2, §9).
+        let params = |action: &str| match action {
+            "run_node" => json!({
+                "node_name": "AI.ed4qm7k2xa@worker1",
+                "runtime": "ai.generic",
+                "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+                "ilk_id": TEST_ILK,
+            }),
+            "kill_node" => {
+                json!({ "node_name": "IO.wapp.ed4qm7k2xa@worker1", "retire_instance": true })
+            }
+            _ => json!({}),
+        };
+        for action in row {
+            assert_eq!(
+                mesh_admits(deploy, action, None, &params(action)),
+                Ok(MeshAdmission::Admitted),
+                "{action}"
+            );
+        }
+        // kill_node stops or retires a node, and never purges one.
+        let node = "IO.wapp.ed4qm7k2xa@worker1";
+        for stop in [
+            json!({ "node_name": node }),
+            json!({ "node_name": node, "purge_instance": false }),
+            json!({ "node_name": node, "purge_instance": null, "retire_instance": true }),
+        ] {
+            assert!(
+                mesh_admits(deploy, "kill_node", None, &stop).is_ok(),
+                "{stop}"
+            );
+        }
+        for purge in [
+            json!({ "node_name": node, "purge_instance": true }),
+            json!({ "node_name": node, "purge_instance": "true" }),
+            json!({ "node_name": node, "purge_instance": 1 }),
+            json!({ "node_name": node, "purge_instance": true, "retire_instance": false }),
+        ] {
+            let refused = mesh_admits(deploy, "kill_node", None, &purge).expect_err("a purge");
+            assert!(refused.contains("never purges"), "{purge}: {refused}");
+        }
+        // Every other action, the purges and what the whole installation shares among them.
+        for action in every_mesh_action() {
+            if !row.contains(&action) {
+                assert!(
+                    mesh_admits(deploy, action, None, &json!({})).is_err(),
+                    "{action}"
+                );
+            }
+        }
+        for action in [
+            "purge_ilk",
+            "purge_tenant",
+            "teardown_node",
+            "remove_node_instance",
+            "add_route",
+            "add_vpn",
+            "opa_compile_apply",
+            "add_hive",
+            "publish_runtime_package",
+            "vault_put",
+            "vault_delete",
+            "cd_deploy",
+        ] {
+            assert!(!row.contains(&action), "{action}");
+            assert!(
+                mesh_admits(deploy, action, None, &json!({})).is_err(),
+                "{action}"
+            );
+        }
+        // SY.admin stamps SY.deploy as the launcher of the nodes it runs, as for any caller.
+        let launch = stamp_relay_facts(
+            "run_node",
+            params("run_node"),
+            Some(deploy),
+            PRIMARY_HIVE_ID,
+        );
+        assert_eq!(launch["launched_by"], json!(deploy));
+        // Another name, or SY.deploy on another hive, has no row.
+        for other in [
+            "SY.deploy@worker1",
+            "SY.deployx@motherbee",
+            "SY.deploy.x@motherbee",
+            "XSY.deploy@motherbee",
+            "SY.deploy@ingress1",
+        ] {
+            for action in row {
+                assert!(
+                    mesh_admits(other, action, None, &params(action)).is_err(),
+                    "{other} {action}"
+                );
+            }
+        }
+    }
+
+    /// SY.deploy's six orders are actions of the catalog (docs/digital-executive-v1-stage-2.md §2):
+    /// their routes, the help the executor and Archi read, a write's confirmation, and who may ask
+    /// for them over the mesh: Archi and IO.cloud@motherbee, nobody else, SY.deploy included.
+    #[test]
+    fn sy_deploys_orders_are_actions_of_the_catalog() {
+        for (action, write, patterns, path, methods, required) in [
+            (
+                "cd_deploy",
+                true,
+                json!(["POST /cd/deployments"]),
+                "/cd/deployments",
+                vec!["GET", "POST"],
+                json!(["tenant_id", "request_key", "source", "grouping", "blanks"]),
+            ),
+            (
+                "cd_get",
+                false,
+                json!(["GET /cd/deployments/{deployment_id}"]),
+                "/cd/deployments/dp7xk3m2qa",
+                vec!["GET"],
+                json!(["deployment_id"]),
+            ),
+            (
+                "cd_list",
+                false,
+                json!(["GET /cd/deployments"]),
+                "/cd/deployments",
+                vec!["GET", "POST"],
+                json!([]),
+            ),
+            (
+                "cd_remove",
+                true,
+                json!([
+                    "POST /cd/deployments/{deployment_id}/remove",
+                    "POST /cd/groupings/{grouping_id}/remove"
+                ]),
+                "/cd/groupings/ilk:550e8400-e29b-41d4-a716-446655440000/remove",
+                vec!["POST"],
+                json!([]),
+            ),
+            (
+                "cd_catalog",
+                false,
+                json!(["GET /cd/catalog"]),
+                "/cd/catalog",
+                vec!["GET"],
+                json!([]),
+            ),
+            (
+                "cd_tree",
+                false,
+                json!(["GET /cd/tree"]),
+                "/cd/tree",
+                vec!["GET"],
+                json!(["tenant_id"]),
+            ),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect("registered");
+            assert_eq!(
+                matches!(spec.route, InternalActionRoute::DeployCommand),
+                write,
+                "{action}"
+            );
+            assert_eq!(
+                matches!(spec.route, InternalActionRoute::DeployQuery),
+                !write,
+                "{action}"
+            );
+            assert!(!spec.requires_target, "{action}");
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], json!(!write), "{action}");
+            assert_eq!(doc["confirmation_required"], json!(write), "{action}");
+            assert_eq!(doc["executor_available"], json!(true), "{action}");
+            let handler = if write {
+                "deploy_command"
+            } else {
+                "deploy_query"
+            };
+            assert_eq!(doc["handler"], json!(handler), "{action}");
+            assert_eq!(doc["path_patterns"], patterns, "{action}");
+            assert_eq!(admin_methods_allowed_for_path(path), methods, "{action}");
+            let schema = &doc["executor_contract"]["function_schema"];
+            assert_eq!(schema["required"], required, "{action}: {schema}");
+            assert!(admin_action_example_scmd(action).is_some(), "{action}");
+            assert!(
+                admin_action_request_notes(action).contains(&DEPLOY_ORDER_NOTE),
+                "{action}"
+            );
+            assert!(DEPLOY_ORDERS.contains(&action), "{action}");
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            assert!(IO_CLOUD_EXPOSED_ACTIONS.contains(&action), "{action}");
+            for caller in ["SY.architect@motherbee", "IO.cloud@motherbee"] {
+                assert!(
+                    mesh_admits(caller, action, None, &json!({})).is_ok(),
+                    "{caller} {action}"
+                );
+            }
+            for caller in [
+                "SY.deploy@motherbee",
+                "IO.cloud@worker1",
+                "SY.architect@worker1",
+                "SY.orchestrator@motherbee",
+                "SY.wf-rules@worker1",
+                "AI.ed4qm7k2xa@worker1",
+                "IO.wapp.ed4qm7k2xa@worker1",
+                "WF.invoice@motherbee",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, None, &json!({})).is_err(),
+                    "{caller} {action}"
+                );
+            }
+        }
+        let routed: Vec<&str> = INTERNAL_ACTION_REGISTRY
+            .iter()
+            .filter(|spec| {
+                matches!(
+                    spec.route,
+                    InternalActionRoute::DeployCommand | InternalActionRoute::DeployQuery
+                )
+            })
+            .map(|spec| spec.action)
+            .collect();
+        assert_eq!(routed, DEPLOY_ORDERS.to_vec());
+        for words in [
+            "SY.deploy@motherbee",
+            "_caller",
+            "NOT_FOUND for another tenant's",
+            "DEPLOY_UNAVAILABLE",
+        ] {
+            assert!(DEPLOY_ORDER_NOTE.contains(words), "{words}");
+        }
+        // SY.deploy's codes, as HTTP statuses; SY.wf-rules' BUSY stays a 409.
+        for (code, status) in [
+            ("INVALID_REQUEST", 400),
+            ("BLANK_INVALID", 400),
+            ("NOT_FOUND", 404),
+            ("SOURCE_NOT_FOUND", 404),
+            ("REQUEST_KEY_REUSED", 409),
+            ("AI_KEY_MISSING", 409),
+            ("CREDENTIAL_MISSING", 409),
+            ("NUMBER_TAKEN", 409),
+            ("DEPLOYMENT_NOT_REMOVABLE", 409),
+            ("HIVE_UNAVAILABLE", 503),
+            ("BUSY", 503),
+            ("DEPLOY_UNAVAILABLE", 503),
+        ] {
+            assert_eq!(deploy_error_http_status(code), status, "{code}");
+        }
+        assert_eq!(error_code_to_http_status("BUSY"), 409);
+    }
+
+    /// What Fluxbee Cloud's relay may send of an order: the tenant it claims, canonical and never
+    /// the root one, and the params the SDK lists for the op, nothing else; and the caller SY.admin
+    /// stamps on every origin's (docs/digital-executive-v1-stage-2.md §2).
+    #[test]
+    fn an_order_names_its_caller_and_clouds_names_the_claimed_tenant() {
+        let io = Some("IO.cloud@motherbee");
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |action: &str, params: Value| {
+            enforce_cloud_relay_content(io, action, "motherbee", &params)
+        };
+        let mut order = admin_action_example_payload("cd_deploy");
+        order["tenant_id"] = json!(tenant);
+        assert!(check("cd_deploy", order.clone()).is_ok());
+        for (action, params) in [
+            (
+                "cd_get",
+                json!({ "tenant_id": tenant, "deployment_id": "dp7xk3m2qa" }),
+            ),
+            (
+                "cd_list",
+                json!({ "tenant_id": tenant, "grouping_kind": "ed" }),
+            ),
+            (
+                "cd_remove",
+                json!({ "tenant_id": tenant, "grouping_id": TEST_ILK }),
+            ),
+            ("cd_catalog", json!({ "tenant_id": tenant })),
+            ("cd_tree", json!({ "tenant_id": tenant })),
+        ] {
+            assert!(check(action, params.clone()).is_ok(), "{action} {params}");
+        }
+        for (action, params) in [
+            ("cd_tree", json!({})),
+            (
+                "cd_list",
+                json!({ "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID }),
+            ),
+            (
+                "cd_get",
+                json!({ "tenant_id": "tnt:11111111-1111-4111-8111-11111111111X", "deployment_id": "dp7xk3m2qa" }),
+            ),
+            (
+                "cd_get",
+                json!({ "tenant_id": tenant, "deployment_id": "dp7xk3m2qa", "hive": "worker1" }),
+            ),
+            ("cd_catalog", json!({ "tenant_id": tenant, "kind": "ed" })),
+        ] {
+            assert!(check(action, params.clone()).is_err(), "{action} {params}");
+        }
+        let mut forged = order.clone();
+        forged["_caller"] = json!({ "by": "operator", "tenant_id": null });
+        assert!(check("cd_deploy", forged).is_err());
+        // Another caller's orders are not Cloud's to check.
+        assert!(enforce_cloud_relay_content(
+            Some("SY.architect@motherbee"),
+            "cd_tree",
+            "motherbee",
+            &json!({})
+        )
+        .is_ok());
+
+        // The caller, from the router-stamped name: the tenant only for Cloud's.
+        let stamped = |caller: Option<&str>| {
+            stamp_relay_facts(
+                "cd_list",
+                json!({ "tenant_id": tenant }),
+                caller,
+                "motherbee",
+            )["_caller"]
+                .clone()
+        };
+        assert_eq!(
+            stamped(Some("IO.cloud@motherbee")),
+            json!({ "by": "cloud", "tenant_id": tenant })
+        );
+        assert_eq!(
+            stamped(Some("SY.architect@motherbee")),
+            json!({ "by": "archi", "tenant_id": null })
+        );
+        assert_eq!(
+            stamped(None),
+            json!({ "by": "operator", "tenant_id": null })
+        );
+        for action in DEPLOY_ORDERS {
+            let params = stamp_relay_facts(action, json!({}), None, "motherbee");
+            assert_eq!(params["_caller"]["by"], json!("operator"), "{action}");
+        }
+        assert!(
+            stamp_relay_facts("list_nodes", json!({}), None, "motherbee")
+                .get("_caller")
+                .is_none()
+        );
+
+        // cd_remove names exactly one of a deployment and a grouping.
+        for one in [
+            json!({ "deployment_id": "dp7xk3m2qa" }),
+            json!({ "grouping_id": TEST_ILK, "deployment_id": null }),
+        ] {
+            assert_eq!(deploy_order_request_error("cd_remove", &one), None, "{one}");
+        }
+        for not_one in [
+            json!({}),
+            json!({ "deployment_id": "dp7xk3m2qa", "grouping_id": TEST_ILK }),
+            json!({ "deployment_id": " " }),
+            json!({ "deployment_id": 7 }),
+            json!({ "grouping_id": TEST_ILK, "deployment_id": "" }),
+        ] {
+            assert!(
+                deploy_order_request_error("cd_remove", &not_one).is_some(),
+                "{not_one}"
+            );
+        }
+        assert!(deploy_order_request_error("cd_get", &json!("dp7xk3m2qa")).is_some());
+        assert_eq!(deploy_order_request_error("cd_catalog", &json!({})), None);
+    }
+
+    /// SY.admin forwards each order to SY.deploy@motherbee, a write as a command and a read as a
+    /// query, with the caller it stamps, and answers what SY.deploy says: an accepted write a 202, a
+    /// read a 200, a refusal by its code, BUSY a 503 with payload.retryable, and no answer 503
+    /// DEPLOY_UNAVAILABLE. A request that carries _caller, a cd_remove that names other than one
+    /// id, a Cloud order without its tenant: refused, nothing sent (docs/digital-executive-v1-
+    /// stage-2.md §2).
+    #[tokio::test]
+    async fn sy_admin_forwards_the_orders_to_sy_deploy() {
+        let (ctx, mut harness) = opa_test_admin("deploy-orders");
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let no_query = HashMap::new();
+        let wait = Duration::from_secs(5);
+        // SY.deploy's answer to what it got, as SY.wf-rules answers SY.admin's L2 requests.
+        fn deploy_answer(sent: &Message, payload: Value) -> Message {
+            let mut reply = reply_to(sent, "", payload);
+            reply.meta.msg_type = format!("{}_response", sent.meta.msg_type);
+            reply.meta.msg = None;
+            reply.meta.action = sent.meta.action.clone();
+            reply
+        }
+        let envelope_of = |body: &str| -> Value { serde_json::from_str(body).expect("JSON") };
+
+        // The operator's cd_deploy: a command with the body and the caller; accepted is a 202.
+        let order = admin_action_example_payload("cd_deploy");
+        let body = order.to_string();
+        let route = handle_cd_paths(
+            "POST",
+            "/cd/deployments",
+            &no_query,
+            body.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        );
+        let deploy = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the order");
+            assert_eq!(dst_of(&sent), json!(format!("SY.deploy@{PRIMARY_HIVE_ID}")));
+            assert_eq!(sent.meta.msg_type, "command");
+            assert_eq!(sent.meta.action.as_deref(), Some("cd_deploy"));
+            let mut expected = order.clone();
+            expected["_caller"] = json!({ "by": "operator", "tenant_id": null });
+            assert_eq!(sent.payload, expected);
+            let accepted = json!({
+                "status": "ok",
+                "accepted": true,
+                "deployment_id": "dp7xk3m2qa",
+                "grouping": { "kind": "ed", "id": TEST_ILK, "short_id": "ed4qm7k2xa" },
+                "state": "deploying",
+            });
+            harness
+                .inject(deploy_answer(&sent, accepted))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(route, deploy);
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 202, "{body}");
+        let envelope = envelope_of(&body);
+        assert_eq!(envelope["status"], json!("ok"));
+        assert_eq!(envelope["action"], json!("cd_deploy"));
+        assert_eq!(envelope["payload"]["deployment_id"], json!("dp7xk3m2qa"));
+        assert_eq!(envelope["payload"]["state"], json!("deploying"));
+        // The write is in SY.admin's command log, the caller with it.
+        let logged = fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("the log");
+        let entry: Value =
+            serde_json::from_str(logged.lines().last().expect("an entry")).expect("JSON");
+        assert_eq!(entry["action"], json!("cd_deploy"));
+        assert_eq!(entry["origin"], json!("http"));
+        assert_eq!(entry["http_status"], json!(202));
+        assert_eq!(entry["params"]["_caller"]["by"], json!("operator"));
+
+        // The operator's reads: a query each, the path's id or the query's params; NOT_FOUND 404.
+        let mut filters = HashMap::new();
+        filters.insert("tenant_id".to_string(), tenant.to_string());
+        filters.insert("grouping_kind".to_string(), "ed".to_string());
+        for (path, query, action, payload, answer, status) in [
+            (
+                "/cd/deployments/dp7xk3m2qa",
+                &no_query,
+                "cd_get",
+                json!({ "deployment_id": "dp7xk3m2qa" }),
+                json!({ "status": "error", "error_code": "NOT_FOUND", "message": "no deployment dp7xk3m2qa" }),
+                404,
+            ),
+            (
+                "/cd/deployments",
+                &filters,
+                "cd_list",
+                json!({ "tenant_id": tenant, "grouping_kind": "ed" }),
+                json!({ "status": "ok", "deployments": [] }),
+                200,
+            ),
+            (
+                "/cd/catalog",
+                &no_query,
+                "cd_catalog",
+                json!({}),
+                json!({ "status": "ok", "sources": [] }),
+                200,
+            ),
+        ] {
+            let route = handle_cd_paths("GET", path, query, b"", &ctx, &ctx.rpc);
+            let deploy = async {
+                let sent = harness.next_outgoing_within(wait).await.expect("the read");
+                assert_eq!(sent.meta.msg_type, "query", "{action}");
+                assert_eq!(sent.meta.action.as_deref(), Some(action));
+                let mut expected = payload.clone();
+                expected["_caller"] = json!({ "by": "operator", "tenant_id": null });
+                assert_eq!(sent.payload, expected, "{action}");
+                harness
+                    .inject(deploy_answer(&sent, answer.clone()))
+                    .await
+                    .expect("injected");
+            };
+            let (result, ()) = tokio::join!(route, deploy);
+            let (got, body) = result.expect("answered").expect("routed");
+            assert_eq!(got, status, "{action}: {body}");
+        }
+
+        // Fluxbee Cloud's cd_remove of a grouping: the claimed tenant in _caller; BUSY is a 503
+        // to ask again.
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "cd_remove",
+            Some(PRIMARY_HIVE_ID),
+            json!({ "tenant_id": tenant, "grouping_id": TEST_ILK }),
+            AdminOrigin::Mesh("IO.cloud@motherbee"),
+        );
+        let deploy = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the order");
+            assert_eq!(sent.meta.msg_type, "command");
+            assert_eq!(
+                sent.payload,
+                json!({
+                    "tenant_id": tenant,
+                    "grouping_id": TEST_ILK,
+                    "_caller": { "by": "cloud", "tenant_id": tenant },
+                })
+            );
+            let busy = json!({
+                "status": "error",
+                "error_code": "BUSY",
+                "message": "another deployment of the grouping is under way",
+            });
+            harness
+                .inject(deploy_answer(&sent, busy))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, deploy);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 503, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], json!("BUSY"));
+        assert_eq!(result.envelope["payload"]["retryable"], json!(true));
+
+        // The executor's cd_list: a null field reads as absent and is not sent.
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "cd_list",
+            None,
+            json!({ "tenant_id": null, "grouping_kind": "ed", "grouping_id": null }),
+            AdminOrigin::Executor,
+        );
+        let deploy = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the read");
+            assert_eq!(
+                sent.payload,
+                json!({
+                    "grouping_kind": "ed",
+                    "_caller": { "by": "operator", "tenant_id": null },
+                })
+            );
+            harness
+                .inject(deploy_answer(
+                    &sent,
+                    json!({ "status": "ok", "deployments": [] }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, deploy);
+        assert_eq!(result.expect("dispatch").http_status, 200);
+
+        // Archi's cd_tree: by archi, no tenant of its own.
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "cd_tree",
+            Some(PRIMARY_HIVE_ID),
+            json!({ "tenant_id": tenant }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        );
+        let deploy = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the read");
+            assert_eq!(sent.meta.msg_type, "query");
+            assert_eq!(
+                sent.payload["_caller"],
+                json!({ "by": "archi", "tenant_id": null })
+            );
+            harness
+                .inject(deploy_answer(
+                    &sent,
+                    json!({ "status": "ok", "tenant_id": tenant, "eds": [] }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, deploy);
+        assert_eq!(result.expect("dispatch").http_status, 200);
+
+        // Refused, nothing sent.
+        let mut forged = order.clone();
+        forged["_caller"] = json!({ "by": "cloud", "tenant_id": tenant });
+        let forged = forged.to_string();
+        for (body, code) in [
+            (forged.as_str(), "INVALID_REQUEST"),
+            ("[1]", "INVALID_REQUEST"),
+        ] {
+            let (status, answer) = handle_cd_paths(
+                "POST",
+                "/cd/deployments",
+                &no_query,
+                body.as_bytes(),
+                &ctx,
+                &ctx.rpc,
+            )
+            .await
+            .expect("answered")
+            .expect("routed");
+            assert_eq!(status, 400, "{body}: {answer}");
+            assert_eq!(envelope_of(&answer)["error_code"], json!(code));
+        }
+        for (params, origin, status) in [
+            (
+                json!({ "deployment_id": "dp7xk3m2qa", "grouping_id": TEST_ILK }),
+                AdminOrigin::Http,
+                400,
+            ),
+            (json!({}), AdminOrigin::Executor, 400),
+            (
+                json!({ "tenant_id": tenant, "deployment_id": "dp7xk3m2qa", "_caller": {} }),
+                AdminOrigin::Mesh("IO.cloud@motherbee"),
+                400,
+            ),
+            (
+                json!({ "deployment_id": "dp7xk3m2qa" }),
+                AdminOrigin::Mesh("IO.cloud@motherbee"),
+                403,
+            ),
+        ] {
+            let result = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "cd_remove",
+                Some(PRIMARY_HIVE_ID),
+                params.clone(),
+                origin,
+            )
+            .await
+            .expect("dispatch");
+            assert_eq!(result.http_status, status, "{params}: {}", result.envelope);
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+        assert!(
+            handle_cd_paths("GET", "/cd/nothing", &no_query, b"", &ctx, &ctx.rpc)
+                .await
+                .expect("answered")
+                .is_none()
+        );
+
+        // No answer: 503 DEPLOY_UNAVAILABLE, to ask again.
+        let (status, body) = deploy_order_answer(
+            "cd_deploy",
+            "SY.deploy@motherbee",
+            Err("timeout waiting for the answer".into()),
+        );
+        assert_eq!(status, 503, "{body}");
+        let envelope = envelope_of(&body);
+        assert_eq!(envelope["error_code"], json!(DEPLOY_UNAVAILABLE));
+        assert_eq!(envelope["payload"]["retryable"], json!(true));
+        assert!(envelope["error_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("SY.deploy@motherbee did not answer")));
+        // A refusal that changed nothing is retryable; one that needs another request is not.
+        let (status, body) = deploy_order_answer(
+            "cd_deploy",
+            "SY.deploy@motherbee",
+            Ok(
+                json!({ "status": "error", "error_code": "HIVE_UNAVAILABLE", "message": "worker1" }),
+            ),
+        );
+        assert_eq!(status, 503);
+        assert_eq!(envelope_of(&body)["payload"]["retryable"], json!(true));
+        let (status, body) = deploy_order_answer(
+            "cd_deploy",
+            "SY.deploy@motherbee",
+            Ok(
+                json!({ "status": "error", "error_code": "REQUEST_KEY_REUSED", "message": "other content" }),
+            ),
+        );
+        assert_eq!(status, 409);
+        assert!(envelope_of(&body)["payload"].get("retryable").is_none());
     }
 
     /// The ILK of a Fluxbee Cloud person action whose virtual flag decides it: IO.cloud's relay

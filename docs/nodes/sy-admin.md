@@ -293,7 +293,8 @@ caller and the action; a command with no stamped caller is refused too.
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
 | `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`, `set_hive_egress`, `clear_hive_egress`) and Fluxbee Cloud's (`publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link`; `MeshAccess::Cloud`) | `authorize_llm_usage_scope` |
-| `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`), io.web's exposure actions among them once the SDK's catalog lists them; payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
+| `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`), io.web's exposure actions among them once the SDK's catalog lists them, and SY.deploy's six orders; payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
+| `SY.deploy@motherbee`, exactly | the steps of its deployments, by classes: a node's whole life (`run_node`, `start_node`, `restart_node`, `kill_node` plain or with `retire_instance`, never with `purge_instance`, `get_node_status`, `get_node_config`, `set_node_config`, `node_control_config_set`), a deployment's people (`create_virtual_person`, `set_person_document`, `set_ilk_works_for`, `set_ilk_definition`, `delete_ilk`, `restore_ilk`) and its tenant's keys (`vault_list`, `vault_assign`); nothing else ([SY.deploy's orders](#sydeploys-orders)) | `authorize_deploy_step` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
@@ -410,7 +411,8 @@ the A-62 table admits from IO.cloud (`authorize_mesh_caller`): `create_tenant`, 
 `run_node`, `get_ilk`, `delete_ilk`, `restore_ilk`, `delete_tenant`, `restore_tenant`,
 `vault_list`, `vault_delete`, `update_tenant`, `set_ilk_tenant`, `vault_assign`, `get_tenant`,
 `list_tenants`, `list_tenant_nodes`, `get_node_status`, `start_node`, `kill_node`,
-`get_llm_usage`.
+`get_llm_usage`, io.web's exposure actions, and SY.deploy's orders `cd_deploy`, `cd_get`,
+`cd_list`, `cd_remove`, `cd_catalog` and `cd_tree`.
 
 `enforce_cloud_relay_content` re-checks what IO.cloud sends, so a compromised relay cannot widen
 it:
@@ -430,6 +432,8 @@ it:
   with SY.deploy.
 - `update_tenant` sets `status` only to `active` or `suspended`; `get_llm_usage` never reads all
   tenants.
+- SY.deploy's orders name the tenant Cloud claims and carry only the params the SDK lists for each
+  (`CLOUD_DEPLOY_OP_PARAMS`, the list IO.cloud's translation reads), besides `tenant_id`.
 - Most actions accept only a fixed set of fields (`only_fields`). The exposure actions carry
   their own and never a `tenant_id`: `publish_exposure` `label` and `upstream`;
   `enable_exposure` `exposure_id` and `duration_s`; `disable_exposure`, `unpublish_exposure` and
@@ -439,7 +443,8 @@ it:
 `run_node` (`cloud`, `archi`, `operator`, or the caller's name; `launched_by_for_caller`),
 `on_behalf_of` on `set_ilk_tenant`, and for Cloud `require_tenant_id` (and, for start and kill,
 `require_launched_by: "cloud"`) on node actions, `include_deleted` and `exclude_root` on
-`list_tenants`.
+`list_tenants`, and on every one of SY.deploy's orders `_caller` (`{by, tenant_id}`, the tenant
+Cloud's alone: [SY.deploy's orders](#sydeploys-orders)).
 
 ## Where actions go
 
@@ -479,6 +484,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `web_status` | answered by SY.admin from what it holds (the exposures registry, the edge's and io.web's last answers, the ACME client), plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
 | `publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link` | `SY.vault@motherbee` (an enable's key), the public edge (a publish's and an unpublish's routes) and `IO.web@motherbee` | `VAULT_PUT`, `EDGE_WEB_ROUTES`, `IO_WEB_EXPOSURES`, `IO_WEB_ACCESS_LINK`, each waited 5 s ([The exposures](#the-exposures)) |
 | `list_exposures` | answered by SY.admin from its registry | |
+| `cd_deploy`, `cd_remove`; `cd_get`, `cd_list`, `cd_catalog`, `cd_tree` | `SY.deploy@motherbee` | a `command` (the writes) or a `query` (the reads) with the action's name, the request and the `_caller` SY.admin stamps (`handle_deploy_order`, `send_l2_action_request`) ([SY.deploy's orders](#sydeploys-orders)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
@@ -500,7 +506,9 @@ orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purg
 catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEOUT_SECS`; for
 `web_status`, its read of the orchestrator's view of io.web), everything else 30
 (`JSR_ADMIN_ORCH_TIMEOUT_SECS`). The `wf_rules_*` actions, the check included, wait 75 for
-SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`, `wf_rules_request_timeout`). The routes that ask a
+SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`, `wf_rules_request_timeout`). SY.deploy's orders wait
+10 for SY.deploy, which answers before any step (`JSR_ADMIN_DEPLOY_TIMEOUT_SECS`,
+`deploy_request_timeout`). The routes that ask a
 node itself (`node_control_config_get/set`, the instance actions and `cognition_clear`) wait 5 less
 than their action, 25, so they answer before a caller that waits 30.
 
@@ -648,6 +656,56 @@ the release that maps them lists them in `is_mutating_admin_action` too.
   `retire_instance` (`enforce_cloud_relay_content`). A recreate that keeps the ILK: `restore_ilk`,
   then `run_node` with that `ilk_id`, which the orchestrator registers the node on
   (`resolve_node_ilk_id`).
+
+## SY.deploy's orders
+
+SY.deploy, the motherbee's deployer ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md)
+§2, §3), takes its orders through SY.admin, and runs each deployment's steps as SY.admin actions of
+its own. SY.admin forwards each order to `SY.deploy@motherbee` (`handle_deploy_order`), as it sends
+the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for the writes and a
+`query` for the reads, with the action's name and its payload.
+
+| Action | HTTP | Kind | Payload |
+| --- | --- | --- | --- |
+| `cd_deploy` | `POST /cd/deployments` | command | the body: `tenant_id`, `request_key`, `source` `{id, version}`, `grouping` `{kind, id}`, `blanks`, an optional `hive` |
+| `cd_get` | `GET /cd/deployments/{deployment_id}` | query | `{deployment_id}`, the path's |
+| `cd_list` | `GET /cd/deployments?tenant_id=&grouping_kind=&grouping_id=` | query | the query's params as fields, each an optional filter |
+| `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | command | exactly one of `deployment_id` and `grouping_id`, the path's |
+| `cd_catalog` | `GET /cd/catalog` | query | the query's params as fields (none) |
+| `cd_tree` | `GET /cd/tree?tenant_id=` | query | `{tenant_id}` |
+
+- **The caller, stamped:** every order carries `_caller` `{by, tenant_id}` (`stamp_relay_facts`),
+  from the router-stamped caller (`launched_by_for_caller`): `by` is `operator` (the HTTP API, the
+  executor), `archi` or `cloud`; `tenant_id` is the tenant Fluxbee Cloud claims, checked by
+  `enforce_cloud_relay_content`, and `null` for the others. With it SY.deploy answers `NOT_FOUND`
+  for anything of another tenant, and `cd_list` and `cd_tree` list only that one. A request that
+  carries `_caller` is refused with `400 INVALID_REQUEST` before anything else, and nothing is sent.
+- **Who asks:** the operator's HTTP API, the executor, Archi (`MeshAccess::Archi`), and Fluxbee Cloud
+  through IO.cloud's relay, the six in `CLOUD_EXPOSED_ACTIONS` with their params in the SDK's
+  `CLOUD_DEPLOY_OP_PARAMS`. SY.deploy itself may not.
+- **Refused before SY.deploy is asked** (`deploy_order_request_error`): a payload that is no JSON
+  object, and a `cd_remove` that names other than exactly one of `deployment_id` and `grouping_id`,
+  a non-empty string: `400 INVALID_REQUEST`. SY.deploy checks the rest. A field that is `null` reads
+  as absent and is not sent, as the executor passes `null` for an optional field a plan leaves out.
+- **The answers:** an accepted write (`{status: ok, accepted: true, deployment_id, grouping,
+  state: deploying}`) is `202` with its status `ok`, so a mesh caller reads it as ok; any other ok,
+  `200`. SY.deploy's codes: `INVALID_REQUEST` and `BLANK_INVALID` `400`; `NOT_FOUND` and
+  `SOURCE_NOT_FOUND` `404`; `REQUEST_KEY_REUSED`, `AI_KEY_MISSING`, `CREDENTIAL_MISSING`,
+  `NUMBER_TAKEN` and `DEPLOYMENT_NOT_REMOVABLE` `409`; `HIVE_UNAVAILABLE` and `BUSY` `503`, with
+  `payload.retryable: true` (`deploy_error_http_status`, `DEPLOY_RETRYABLE_CODES`): SY.deploy's
+  `BUSY` is a `503`, where SY.wf-rules' is a `409`. SY.deploy not answering within 10 s, or not
+  reachable, is `503 DEPLOY_UNAVAILABLE` with `payload.retryable: true` (`deploy_order_answer`): a
+  `cd_deploy` sent again with its `request_key` gives back the same deployment.
+- **The audit log:** the two writes are in SY.admin's command log, with the `_caller` stamped on
+  them; the reads are not.
+- **SY.deploy's row** (§8, agreed by the operator on 2026-11-26): `SY.deploy@motherbee`, its name
+  exactly, has a clause of its own in `authorize_mesh_caller`, next to Archi's and IO.cloud's,
+  admitting the actions of `DEPLOY_STEP_ACTIONS` and nothing else (`authorize_deploy_step`):
+  `kill_node` plain or with `retire_instance`, refused with a `purge_instance` that is not `false`;
+  no purge of a node or of an ILK, and nothing the whole installation shares (routes, VPN rules, the
+  user OPA policy, hives, runtimes). `SY.deploy` on another hive, or another name, has no row.
+  SY.admin stamps `launched_by: SY.deploy@motherbee` on its launches, as for any caller. The row's
+  bounds (which nodes, which tenants) come later (§12).
 
 ## A node's self-description
 
@@ -2309,7 +2367,7 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 29, 130 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 30, 136 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -2445,6 +2503,12 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `unpublish_exposure` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): remove an exposure: the edge's route goes and its host answers 404; the name stays on the certificate until its renewal. |
 | `issue_exposure_link` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): a one-time link to an enabled exposure, minted by io.web, opened once top-level within about 120 s; never logged. |
 | `list_exposures` | `GET /web/exposures` | List the exposures: each one's id, label, host, url, upstream, state (closed or enabled, with enabled_until), certificate, route and io.web states. |
+| `cd_deploy` | `POST /cd/deployments` | Deploy a source, with its blanks, into a grouping through SY.deploy: a grouping of kind ed with no id is a new Digital Executive (the source plain-ed). Answers accepted (202) at once; cd_get follows it to active or failed. |
+| `cd_get` | `GET /cd/deployments/{deployment_id}` | Read one deployment from SY.deploy: its state (deploying, active, failed, removing, removed), grouping, source, blanks and nodes with their status; a failed one names its step and code. |
+| `cd_list` | `GET /cd/deployments` | List SY.deploy's deployments, by tenant, grouping kind or grouping. |
+| `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed. |
+| `cd_catalog` | `GET /cd/catalog` | List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks. |
+| `cd_tree` | `GET /cd/tree` | Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret. |
 
 ### HTTP routes outside the catalog
 
