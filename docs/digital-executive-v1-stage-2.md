@@ -429,8 +429,8 @@ one.
   them to the worker, and ai.generic takes the definition once every asset is on its hive.
 - Archi's asset checks and hashing (`validate_agent_asset_value` and its builders,
   `src/bin/sy_architect.rs`) move to the core library, so both write the same files.
-- **The native texts are the operator's,** to approve before the build. They say nothing on whether
-  the ED is an AI.
+- **The native texts are the operator's:** approved on 2026-11-27 as drafted (*"por ahora es
+  perfecto"*), in the source `plain-ed` version 1. They say nothing on whether the ED is an AI.
 
 ---
 
