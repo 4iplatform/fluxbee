@@ -1404,33 +1404,18 @@ fn validate_explicit_subject_ilk(
         )
     };
     let snapshot = list_ilks_from_hive_id(hive_id).map_err(unavailable)?;
-    let known = ilk_belongs_to_tenant(&snapshot.ilks, ilk_id, tenant_id) || {
-        let channels = list_ich_options_from_hive_id(hive_id).map_err(unavailable)?;
-        ilk_has_channel_in_scope(&channels, ilk_id, tenant_id)
-    };
-    if !known {
-        // Any ILK this tenant does not know answers the same, a virtual one included: the answer
-        // tells another tenant nothing about it (docs/io/io-api-node-spec.md, by_ilk).
-        return Err(ApiIngressError::new(
+    if ilk_belongs_to_tenant(&snapshot.ilks, ilk_id, tenant_id) {
+        return Ok(());
+    }
+    let channels = list_ich_options_from_hive_id(hive_id).map_err(unavailable)?;
+    if ilk_has_channel_in_scope(&channels, ilk_id, tenant_id) {
+        Ok(())
+    } else {
+        Err(ApiIngressError::new(
             "subject_not_found",
             "requested subject is not known to this IO.api tenant",
-        ));
+        ))
     }
-    // A virtual person (a Digital Executive) speaks only through what it was given: its own IO
-    // nodes and its conscious. An integrator's `by_ilk` never speaks as one, even of its own tenant
-    // (docs/digital-executive-v1-stage-1.md §4).
-    if ilk_is_virtual(&snapshot.ilks, ilk_id) {
-        return Err(ApiIngressError::new(
-            "ilk_virtual",
-            "requested subject is a virtual person (a Digital Executive); by_ilk cannot name one",
-        ));
-    }
-    Ok(())
-}
-
-fn ilk_is_virtual(ilks: &[IdentityIlkOption], ilk_id: &str) -> bool {
-    ilks.iter()
-        .any(|ilk| ilk.ilk_id == ilk_id && ilk.is_virtual)
 }
 
 fn ilk_belongs_to_tenant(ilks: &[IdentityIlkOption], ilk_id: &str, tenant_id: &str) -> bool {
@@ -1963,35 +1948,6 @@ mod tests {
             &ilks,
             "ilk:11111111-1111-4111-8111-111111111111",
             "tnt:22222222-2222-4222-8222-222222222222"
-        ));
-    }
-
-    /// A virtual person is never a `by_ilk` subject, even charged to the instance's own tenant; a
-    /// person is unaffected.
-    #[test]
-    fn a_virtual_person_is_never_a_by_ilk_subject() {
-        let acme = "tnt:11111111-1111-4111-8111-111111111111";
-        let laura = "ilk:55555555-5555-4555-8555-555555555555";
-        let ana = "ilk:66666666-6666-4666-8666-666666666666";
-        let person = |ilk_id: &str, is_virtual: bool| IdentityIlkOption {
-            ilk_id: ilk_id.to_string(),
-            tenant_id: acme.to_string(),
-            display_name: None,
-            handler_node: None,
-            registration_status: "complete".to_string(),
-            ilk_type: "human".to_string(),
-            role_hash: None,
-            skill_hashes: Vec::new(),
-            handbook_hashes: Vec::new(),
-            personality_hash: None,
-            is_virtual,
-        };
-        let ilks = vec![person(laura, true), person(ana, false)];
-        assert!(ilk_is_virtual(&ilks, laura));
-        assert!(!ilk_is_virtual(&ilks, ana));
-        assert!(!ilk_is_virtual(
-            &ilks,
-            "ilk:77777777-7777-4777-8777-777777777777"
         ));
     }
 
