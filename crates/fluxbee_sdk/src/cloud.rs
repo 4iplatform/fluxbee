@@ -65,7 +65,42 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("unpublish_exposure", "unpublish_exposure"),
     ("issue_exposure_link", "issue_exposure_link"),
     ("list_exposures", "list_exposures"),
+    // SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): a Digital Executive's birth and
+    // end, and their reads. Each relays to the SY.admin action of its own name, always for the
+    // tenant Cloud claims, which SY.admin carries to SY.deploy as the caller's (`_caller.tenant_id`):
+    // SY.deploy answers NOT_FOUND for another tenant's and lists only that one. Each takes the
+    // params `CLOUD_DEPLOY_OP_PARAMS` names.
+    ("cd_deploy", "cd_deploy"),
+    ("cd_get", "cd_get"),
+    ("cd_list", "cd_list"),
+    ("cd_remove", "cd_remove"),
+    ("cd_catalog", "cd_catalog"),
+    ("cd_tree", "cd_tree"),
 ];
+
+/// The params each of SY.deploy's orders takes from Fluxbee Cloud (docs/digital-executive-v1-stage-2.md
+/// §2), besides the tenant, which travels at the envelope root (docs/io-cloud-api.md §3, rule 3).
+/// One list for both sides: IO.cloud refuses any other param, and SY.admin admits from IO.cloud's
+/// relay these and `tenant_id`, nothing else (`enforce_cloud_relay_content`).
+pub const CLOUD_DEPLOY_OP_PARAMS: &[(&str, &[&str])] = &[
+    (
+        "cd_deploy",
+        &["request_key", "source", "grouping", "blanks", "hive"],
+    ),
+    ("cd_get", &["deployment_id"]),
+    ("cd_list", &["grouping_kind", "grouping_id"]),
+    ("cd_remove", &["deployment_id", "grouping_id"]),
+    ("cd_catalog", &[]),
+    ("cd_tree", &[]),
+];
+
+/// The params a deploy order (`cd_*`) takes from Fluxbee Cloud, or `None` for any other op.
+pub fn cloud_deploy_op_params(op: &str) -> Option<&'static [&'static str]> {
+    CLOUD_DEPLOY_OP_PARAMS
+        .iter()
+        .find(|(deploy_op, _)| *deploy_op == op)
+        .map(|(_, params)| *params)
+}
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces for
 /// `IO.cloud@motherbee` (`authorize_mesh_caller`). Kept as a `&[&str]` const for ergonomic `.contains()` at the gate; a
@@ -98,6 +133,12 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "unpublish_exposure",
     "issue_exposure_link",
     "list_exposures",
+    "cd_deploy",
+    "cd_get",
+    "cd_list",
+    "cd_remove",
+    "cd_catalog",
+    "cd_tree",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -207,7 +248,19 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "unpublish_exposure", "category": "relay",
           "summary": "Remove an exposure: it closes and its host answers 404; its label can be published again, as a new exposure. No envelope tenant_id. params.exposure_id. Returns {exposure_id, host, removed, route, io_web, persisted}. EXPOSURE_NOT_FOUND: no such exposure (after an unpublish sent again, done). BUSY and RECORD_FAILED: send it again." },
         { "op": "list_exposures", "category": "relay",
-          "summary": "Every published exposure, the closed ones included: {exposures: [view], count, max: 16}. Each view: exposure_id, label, host, url, upstream, state (closed, or enabled with enabled_until), published_at, certificate.state (covered, pending, waiting_dns, failed, held, off), route.state (acknowledged, pending, no_edge) and io_web.state (acknowledged, pending, absent). No envelope tenant_id, no params. Never BUSY." }
+          "summary": "Every published exposure, the closed ones included: {exposures: [view], count, max: 16}. Each view: exposure_id, label, host, url, upstream, state (closed, or enabled with enabled_until), published_at, certificate.state (covered, pending, waiting_dns, failed, held, off), route.state (acknowledged, pending, no_edge) and io_web.state (acknowledged, pending, absent). No envelope tenant_id, no params. Never BUSY." },
+        { "op": "cd_deploy", "category": "relay",
+          "summary": "Deploy a source into a grouping of YOUR tenant (the envelope tenant_id): a new Digital Executive is the source plain-ed into params.grouping {kind: ed}. params.request_key (your id for this deployment, at most 64 characters of [A-Za-z0-9._:-]: the same key gives back the same deployment, other content answers REQUEST_KEY_REUSED), params.source {id, version} (without a version, the newest), params.grouping {kind, id} (no id: a new one), params.blanks (exactly the source's, as cd_catalog lists them), params.hive (optional). No secret travels: a credential is the key of one you stored with put_token. Answers at once {accepted: true, deployment_id, grouping, state: deploying}: read cd_get until active or failed. A failed one stays failed with its step and code: cd_deploy again with the same request_key resumes it, cd_remove ends it. SOURCE_NOT_FOUND, BLANK_INVALID, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, REQUEST_KEY_REUSED: change the request. HIVE_UNAVAILABLE, BUSY and DEPLOY_UNAVAILABLE (retryable): send it again with the same request_key." },
+        { "op": "cd_get", "category": "relay",
+          "summary": "One deployment of YOUR tenant (the envelope tenant_id): params.deployment_id. Its state (deploying, active, failed, removing, removed), grouping, source and version, and its nodes with their status; a failed one names its step, code and detail. One of another tenant answers NOT_FOUND. DEPLOY_UNAVAILABLE (retryable): read it again." },
+        { "op": "cd_list", "category": "relay",
+          "summary": "YOUR tenant's deployments (the envelope tenant_id), optionally of one grouping kind (params.grouping_kind, ed) or one grouping (params.grouping_id). Never another tenant's. DEPLOY_UNAVAILABLE (retryable): read it again." },
+        { "op": "cd_remove", "category": "relay",
+          "summary": "Remove one deployment of YOUR tenant (the envelope tenant_id), params.deployment_id, or a whole grouping, an ED, params.grouping_id: exactly one of the two. Answers at once {accepted: true, ...}: read cd_get until removed. An ED's nodes are retired, their identities kept and marked, and the ED is marked; its credentials stay, for you to delete (delete_token). The founding deployment alone, while its grouping has others, answers DEPLOYMENT_NOT_REMOVABLE. One of another tenant answers NOT_FOUND. BUSY and DEPLOY_UNAVAILABLE (retryable): send it again." },
+        { "op": "cd_catalog", "category": "relay",
+          "summary": "The sources ready to deploy for YOUR tenant (the envelope tenant_id), by kind (ed, infra, custom): each with its versions and its blanks, the fields cd_deploy's params.blanks takes. No params." },
+        { "op": "cd_tree", "category": "relay",
+          "summary": "YOUR tenant's tree (the envelope tenant_id), read when asked: its general infra, its EDs (its virtual persons, each with its document), each ED's parts (the identities that work for it, with their role, node and status) and its deployments (source, version, state, each agent's assets, each IO's credential key names). Never a secret. No params." }
     ])
 }
 
@@ -246,7 +299,13 @@ mod tests {
                 "disable_exposure",
                 "unpublish_exposure",
                 "issue_exposure_link",
-                "list_exposures"
+                "list_exposures",
+                "cd_deploy",
+                "cd_get",
+                "cd_list",
+                "cd_remove",
+                "cd_catalog",
+                "cd_tree"
             ]
         );
     }
@@ -403,6 +462,71 @@ mod tests {
                 assert!(summary.contains(name), "{op}'s summary names {name}");
             }
         }
+    }
+
+    /// SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): each op relays to SY.admin's
+    /// action of its own name, names the tenant it acts for, and has its params listed, the one
+    /// list IO.cloud's translation and SY.admin's relay check read. The writes answer accepted and
+    /// say what to read next; each names DEPLOY_UNAVAILABLE.
+    #[test]
+    fn the_deploy_ops_act_for_the_claimed_tenant_and_list_their_params() {
+        let catalog = cloud_action_catalog();
+        let summary = |op: &str| -> String {
+            catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["op"] == op)
+                .and_then(|entry| entry["summary"].as_str())
+                .unwrap_or_else(|| panic!("catalog has no {op}"))
+                .to_string()
+        };
+        let ops: Vec<&str> = CLOUD_DEPLOY_OP_PARAMS.iter().map(|(op, _)| *op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                "cd_deploy",
+                "cd_get",
+                "cd_list",
+                "cd_remove",
+                "cd_catalog",
+                "cd_tree"
+            ]
+        );
+        for op in ops {
+            assert_eq!(
+                admin_action_for_cloud_op(op),
+                Some(op),
+                "{op} relays to its own name"
+            );
+            assert!(CLOUD_EXPOSED_ACTIONS.contains(&op), "{op}");
+            let summary = summary(op);
+            assert!(
+                summary.contains("YOUR tenant") && summary.contains("(the envelope tenant_id)"),
+                "{op} acts for the claimed tenant"
+            );
+            let params = cloud_deploy_op_params(op).expect("listed");
+            assert!(
+                !params.contains(&"tenant_id"),
+                "{op}: the tenant is the envelope's"
+            );
+            assert!(
+                !params.contains(&"_caller"),
+                "{op}: SY.admin stamps the caller"
+            );
+        }
+        for op in ["cd_deploy", "cd_remove"] {
+            let summary = summary(op);
+            assert!(summary.contains("accepted: true") && summary.contains("cd_get"));
+            assert!(summary.contains("DEPLOY_UNAVAILABLE"), "{op}");
+        }
+        assert!(summary("cd_deploy").contains("REQUEST_KEY_REUSED"));
+        assert!(summary("cd_remove").contains("DEPLOYMENT_NOT_REMOVABLE"));
+        assert_eq!(
+            cloud_deploy_op_params("cd_remove"),
+            Some(&["deployment_id", "grouping_id"][..])
+        );
+        assert_eq!(cloud_deploy_op_params("list_tokens"), None);
     }
 
     #[test]
