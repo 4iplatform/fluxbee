@@ -719,3 +719,50 @@ Options (b), a label over several agents, and (c), one node that does everything
   does.
 - Its costs (its tenant), its responsibilities, its permissions, its lifecycle (an executive that
   made history is disabled, never deleted).
+
+## 32. Notes, 2026-11-27: the ED's identity lives in identity
+
+- **The operator, after the cleanup (0.1.155, 0.1.156):** stage 2's four points are agreed as
+  proposed (the conscious speaks as the ED from its config, SY.deploy's admin row by classes of
+  actions now, no WhatsApp channel on the ED, the IO's person checked once at its config), but they
+  are partial to the global design. On the global: where does the ED's real identity live, only in a
+  flag that says the ILK is a virtual person? Data is missing in identity, and with it "who is the
+  ED" is resolved. At least, as talked, the JSON's reference in identity, so that everyone can know
+  it internally: the ED's layer 2 public inside Fluxbee, its layer 1 public on the internet. Easier
+  than putting SY.deploy into this: SY.deploy needs the plan and the data to create the ED, but then
+  it only creates, and does not keep the ED's data, as the orchestrator with the nodes.
+- **Facts read for it (2026-11-27):**
+  - **What identity keeps of an ED today:** its ILK, of type human, with the virtual flag; its
+    display name and company in `identification`, in the database. Of it, the SHM holds only the
+    display name, the flags and `handler_node`.
+  - **Already decided** (design §10.4, notes §25): a person's extra data in one JSON file per
+    version, in a folder of its own that the motherbee sends and the workers receive (design
+    §10.5), with its 16-hex hash in the `IlkEntry`'s 8 reserved bytes, written by identity on a new
+    command from SY.admin. It was made for the profile (position, boss, responsibilities), and for
+    people only.
+  - **The precedent the operator names:** the orchestrator registers each node's ILK in identity at
+    spawn (`ensure_node_identity_registered`, `src/bin/sy_orchestrator.rs`) and keeps only the
+    node's deployment history. From then on, identity keeps the node's identity.
+  - **The question open since the start** (§31; design open question 16): where the ED's list of
+    ILKs lives, and whether every node reads it.
+  - **Nothing in the SHM says which person a node's ILK works for.** An IO's assigned person is its
+    config (design §7.1), and so was the conscious's `speaks_as` in stage 2's draft.
+- **Proposed in the talk (2026-11-27), for the operator's call:**
+  - **The ED's document:** the profile's JSON grows into the ED's document, kept by identity.
+    - **Layer 2, inside Fluxbee:** its names, company, personality and profile, and its parts: the
+      conscious (node and ILK), each channel (type, address, its IO's node and ILK), and later each
+      responsibility's agents.
+    - **Layer 1, on the internet:** the part a person would expose, from which the DID document and
+      the card are made (design §12.3).
+  - **The relation, in the SHM:** each part's ILK names the person it works for and its role
+    (conscious, channel, agent), so that "is there an ED behind this node, and is it its soul" is one
+    read of memory, as `handler_node` is. A new field: `IDENTITY_VERSION` 7, with every reader at
+    once (the router, the SY nodes, the Rust and Go SDKs and their nodes). The work done once.
+  - **SY.deploy creates and records what it did.** At the birth it hands identity the ED's data and
+    each part as it makes it, through SY.admin. After that, a change goes to identity through
+    SY.admin.
+  - **What it changes:**
+    - SY.deploy's records keep only deployments. Cloud's tree comes from identity (the ED and its
+      parts) and from SY.deploy (what was deployed, its version, its state).
+    - The conscious and the IO would read their person from identity, not from their config. Today's
+      assignment of an IO by its config (notes §19) would move to identity.
