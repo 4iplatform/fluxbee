@@ -768,8 +768,10 @@ the ledger and the logbook.
   - Workers rebuild like the motherbee.
   - The `cognition_*` tables are emptied once (marker `cognition_reset_v1`).
 - **Replies between ILKs.** The AI SDK's reply carries `src_ilk` = the agent's own ILK
-  (`self_ilk_id`) and `dst_ilk` = the incoming `src_ilk`; an agent booted without an ILK sends no
-  `src_ilk`, never the human's. SY.frontdesk.gov uses the same builders. Nothing routes on a
+  (`self_ilk_id`), or on a solution reply the person its config names and identity confirms
+  (`speaks_as`, a Digital Executive's conscious; docs/digital-executive-v1-stage-2.md §6.1), and
+  `dst_ilk` = the incoming `src_ilk`; an agent booted without an ILK sends no `src_ilk`, never the
+  human's. SY.frontdesk.gov uses the same builders. Nothing routes on a
   reply's `src_ilk` (IO nodes reply by `meta.context.io.reply_target`; the identity pre-resolve
   only runs on Resolve). Archi labels replies by `src_ilk` and will show the agent.
   - Cognition's binding compares ILK weights: both participants weigh 1.0 whatever the direction,

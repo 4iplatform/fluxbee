@@ -126,7 +126,13 @@ EOF
     `provider_output_truncated` error;
   - `behavior.base_url`: it needs `behavior.provider`, and it must be `https` on that provider's
     host (`api.openai.com` or `api.anthropic.com`);
-  - `behavior.multimodal`: `true` by default.
+  - `behavior.multimodal`: `true` by default;
+  - `speaks_as`, at the top level: the `ilk:<uuid>` of the person the agent speaks as, a Digital
+    Executive's, for its conscious; SY.deploy writes it. The node's solution replies carry that
+    person as `src_ilk` while identity confirms it (the node's ILK works for the person as its
+    `conscious`), its own ILK otherwise; its status's `extensions.speaks_as` says which and why. It
+    is read at start: a change takes effect at the next start
+    ([digital-executive-v1-stage-2](digital-executive-v1-stage-2.md) §6.1).
 
   Each field is described in `nodes/ai/ai-generic/README.md`.
 - **Leave `temperature` out:** current models reject it (gpt-5.5, Claude 5; FINDINGS A-69).

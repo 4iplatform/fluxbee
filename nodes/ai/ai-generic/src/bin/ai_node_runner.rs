@@ -20,10 +20,10 @@ use fluxbee_ai_sdk::{
     FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput,
     FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient,
     LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings,
-    NodeRuntime, ResolvedModelInput, RuntimeConfig, RuntimeLoad, RuntimeLoadSnapshot, TenantSource,
-    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
-    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
-    MSG_PING, MSG_STATUS,
+    NodeRuntime, ResolvedModelInput, RuntimeConfig, RuntimeLoad, RuntimeLoadSnapshot,
+    SpeaksAsStatus, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool,
+    ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch,
+    UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -150,6 +150,13 @@ struct EffectiveConfigDocument {
     behavior: EffectiveBehaviorSection,
     #[serde(default)]
     runtime: Option<EffectiveRuntimeSection>,
+    /// The person this agent speaks as, an `ilk:<uuid>`: a Digital Executive's, for its conscious,
+    /// written by SY.deploy at launch (docs/digital-executive-v1-stage-2.md §6.1). Read at start
+    /// into the AI runtime's `RuntimeConfig::speaks_as` (`runtime_config_for`); a CONFIG_SET that
+    /// changes it takes effect at the next start. Its replies carry the person only while identity
+    /// confirms it (the AI SDK's `speaks_as`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speaks_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1817,7 +1824,8 @@ impl GenericAiNode {
                     "config.behavior.provider",
                     "config.behavior.base_url",
                     "config.behavior.multimodal",
-                    "config.runtime.cognitive_definition"
+                    "config.runtime.cognitive_definition",
+                    "config.speaks_as"
                 ],
                 "resources": [
                     {
@@ -1840,6 +1848,7 @@ impl GenericAiNode {
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
                     "The prompt is the agent ILK's definition; while it has none (no hashes, no asset loaded, ILK not found) the model runs a fixed unconfigured prompt.",
                     "config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start.",
+                    "config.speaks_as (an ilk:<uuid>) names the person this agent speaks as, a Digital Executive's for its conscious: its solution replies carry that person as src_ilk while identity confirms it (this node's ILK works for the person, in the role conscious), and its own ILK otherwise; NODE_STATUS_GET's extensions.speaks_as says which and why. It applies at the next start.",
                     "config.runtime.immediate_memory is refused: the agent's memory is the cognition package of its conversation, which the router attaches to its messages; ai.generic keeps none of its own."
                 ]
             },
@@ -1890,6 +1899,7 @@ impl GenericAiNode {
             state.current_state,
             state.last_error.as_ref(),
             self.runtime_load.snapshot(),
+            self.runtime_load.speaks_as(),
         )
     }
 
@@ -5549,6 +5559,7 @@ impl ManagedNodeConfigContract for AiGenericContract {
             "behavior.base_url",
             "behavior.multimodal",
             "runtime.cognitive_definition",
+            "speaks_as",
         ]
     }
     fn notes(&self) -> &'static [&'static str] {
@@ -5562,6 +5573,12 @@ impl ManagedNodeConfigContract for AiGenericContract {
              hive holds none); a model it names must be one of its provider.",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
+            "speaks_as (top level, an ilk:<uuid>) names the person this agent speaks as, a Digital \
+             Executive's for its conscious, written by SY.deploy: its solution replies carry that \
+             person as src_ilk while identity confirms it (this node's ILK works for the person as \
+             its conscious), and its own ILK otherwise; NODE_STATUS_GET's extensions.speaks_as \
+             says which and why. It is read at start: a CONFIG_SET that changes it takes effect at \
+             the next start.",
         ]
     }
     fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, ContractError> {
@@ -5607,6 +5624,21 @@ fn effective_cognitive_section(
         .and_then(|cfg| cfg.runtime.as_ref())
         .and_then(|runtime| runtime.cognitive_definition.clone())
         .unwrap_or_default()
+}
+
+/// The AI runtime's config: its own defaults, and the person the node's config says it speaks as
+/// (`speaks_as`, docs/digital-executive-v1-stage-2.md §6.1), trimmed, None when absent or blank.
+/// It is read at start only, as the runtime is started with it: a CONFIG_SET that changes it takes
+/// effect at the next start.
+fn runtime_config_for(config: Option<&EffectiveConfigDocument>) -> RuntimeConfig {
+    RuntimeConfig {
+        speaks_as: config
+            .and_then(|cfg| cfg.speaks_as.as_deref())
+            .map(str::trim)
+            .filter(|ilk| !ilk.is_empty())
+            .map(str::to_string),
+        ..RuntimeConfig::default()
+    }
 }
 
 /// The runtime version the node runs: `_system.runtime_version` of its config.json, which the
@@ -5665,6 +5697,10 @@ async fn run_managed_node(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
     let cognitive_section = effective_cognitive_section(effective_doc.as_ref());
     let cognitive_definition_config = CognitiveDefinitionRuntimeConfig::from(cognitive_section);
+    let runtime_config = runtime_config_for(effective_doc.as_ref());
+    if let Some(person) = runtime_config.speaks_as.as_deref() {
+        tracing::info!(node_name = %node_name, speaks_as = %person, "the config names the person this agent speaks as; its replies carry it while identity confirms it");
+    }
     let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved()));
     let behavior = effective_doc
         .as_ref()
@@ -5722,7 +5758,7 @@ async fn run_managed_node(
         cognitive_definition,
     );
     let runtime = node_runtime(dispatcher, ai_node);
-    runtime.run_with_config(RuntimeConfig::default()).await?;
+    runtime.run_with_config(runtime_config).await?;
     Ok(())
 }
 
@@ -6111,15 +6147,23 @@ fn build_control_plane_response(msg: &Message, response_msg: &str, payload: Valu
 /// runtime's load, when the runtime runs (FINDINGS A-290): `extensions.ai_runtime`, and `DEGRADED`
 /// with `last_error` `ai_runtime_saturated` while the runtime turned work away in its last window
 /// (`RuntimeLoadSnapshot::add_to_status`). Since 0.1.136 the node answers at once however busy, so
-/// a saturated node no longer shows by a status that times out.
+/// a saturated node no longer shows by a status that times out. And while the config the runtime
+/// started with names a person the agent speaks as, `extensions.speaks_as` `{ilk, confirmed,
+/// reason?}`: whether identity confirms it, and why not (`SpeaksAsStatus::add_to_status`, docs/
+/// digital-executive-v1-stage-2.md §6.1), its health unchanged. It is the person the runtime runs
+/// with: a CONFIG_SET that changes `speaks_as` shows here after the next start.
 fn node_status_payload(
     state: NodeLifecycleState,
     last_error: Option<&ControlPlaneErrorInfo>,
     load: Option<RuntimeLoadSnapshot>,
+    speaks_as: Option<SpeaksAsStatus>,
 ) -> Value {
     let mut payload = build_node_status_response_payload(state, last_error);
     if let Some(load) = load {
         load.add_to_status(&mut payload);
+    }
+    if let Some(speaks_as) = speaks_as {
+        speaks_as.add_to_status(&mut payload);
     }
     payload
 }
@@ -12603,6 +12647,7 @@ mod tests {
             NodeLifecycleState::Configured,
             None,
             Some(saturated.clone()),
+            None,
         );
         assert_eq!(busy["health_state"], json!("DEGRADED"));
         assert_eq!(busy["lifecycle_state"], json!("CONFIGURED"));
@@ -12620,7 +12665,7 @@ mod tests {
             last_turned_away_ms_ago: Some(45_000),
             ..saturated.clone()
         };
-        let healthy = node_status_payload(NodeLifecycleState::Configured, None, Some(calm));
+        let healthy = node_status_payload(NodeLifecycleState::Configured, None, Some(calm), None);
         assert_eq!(healthy["health_state"], json!("HEALTHY"));
         assert!(healthy.get("last_error").is_none());
         assert_eq!(
@@ -12636,6 +12681,7 @@ mod tests {
             NodeLifecycleState::FailedConfig,
             Some(&config_error),
             Some(saturated),
+            None,
         );
         assert_eq!(failed["health_state"], json!("DEGRADED"));
         assert_eq!(failed["last_error"]["code"], json!("invalid_config"));
@@ -12644,11 +12690,173 @@ mod tests {
             json!("saturated")
         );
 
-        let before = node_status_payload(NodeLifecycleState::Configured, None, None);
+        let before = node_status_payload(NodeLifecycleState::Configured, None, None, None);
         assert_eq!(
             before,
             build_node_status_response_payload(NodeLifecycleState::Configured, None)
         );
+        assert!(before.pointer("/extensions/speaks_as").is_none());
+    }
+
+    /// docs/digital-executive-v1-stage-2.md §6.1: while the config names a person the agent speaks
+    /// as, the status says it as `extensions.speaks_as` `{ilk, confirmed, reason?}`, beside the
+    /// runtime's load, and its health stays as the rest makes it: a conscious just born, before its
+    /// relation is set, is not confirmed yet and still HEALTHY.
+    #[test]
+    fn node_status_says_whom_the_agent_speaks_as() {
+        const PERSON: &str = "ilk:3f0c6a52-9c1e-4f5e-8f43-6d2b1a7e9c10";
+        let load = RuntimeLoadSnapshot {
+            state: fluxbee_ai_sdk::RuntimeLoadState::Serving,
+            window_s: 30,
+            last_turned_away_ms_ago: None,
+            model_workers: 4,
+            model_workers_busy: 0,
+            turns_waiting: 0,
+            queue_capacity: 128,
+            direct_capacity: 64,
+            direct_running: 1,
+            turns_refused: 0,
+            direct_dropped: 0,
+            busy_answers_dropped: 0,
+            replies_too_large: 0,
+        };
+        let waiting = node_status_payload(
+            NodeLifecycleState::Configured,
+            None,
+            Some(load.clone()),
+            Some(SpeaksAsStatus {
+                ilk: PERSON.to_string(),
+                confirmed: false,
+                reason: Some("identity names no person this node's ILK works for".to_string()),
+            }),
+        );
+        assert_eq!(waiting["health_state"], json!("HEALTHY"), "{waiting}");
+        assert!(waiting.get("last_error").is_none());
+        assert_eq!(
+            waiting["extensions"]["speaks_as"],
+            json!({
+                "ilk": PERSON,
+                "confirmed": false,
+                "reason": "identity names no person this node's ILK works for"
+            })
+        );
+        assert_eq!(
+            waiting["extensions"]["ai_runtime"]["state"],
+            json!("serving")
+        );
+
+        let confirmed = node_status_payload(
+            NodeLifecycleState::Configured,
+            None,
+            Some(load),
+            Some(SpeaksAsStatus {
+                ilk: PERSON.to_string(),
+                confirmed: true,
+                reason: None,
+            }),
+        );
+        assert_eq!(
+            confirmed["extensions"]["speaks_as"],
+            json!({"ilk": PERSON, "confirmed": true})
+        );
+    }
+
+    /// docs/digital-executive-v1-stage-2.md §6.1 and the plain ED's conscious config (SY.deploy
+    /// writes it at run_node): the node boots CONFIGURED on it, its effective config keeps the
+    /// top-level `speaks_as`, and the runtime starts with that person; blank or absent, with none.
+    #[test]
+    fn the_runtime_starts_with_the_person_the_config_names() {
+        const PERSON: &str = "ilk:3f0c6a52-9c1e-4f5e-8f43-6d2b1a7e9c10";
+        let root = std::env::temp_dir().join(format!("ai-generic-speaks-as-{}", Uuid::new_v4()));
+        let name = "AI.ed4qm7k2xa@worker1";
+        let path = managed_node_config_path_with_root(name, &root).expect("path");
+        fs::create_dir_all(path.parent().expect("dir")).expect("node dir");
+        let contract = AiGenericContract {
+            node_name: name.to_string(),
+        };
+        let boot = |config: Value| {
+            fs::write(&path, config.to_string()).expect("config.json");
+            let state =
+                fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
+                    name, &contract, &root,
+                )
+                .expect("bootstrap");
+            assert_eq!(
+                state.current_state,
+                NodeLifecycleState::Configured,
+                "{:?}",
+                state.last_error
+            );
+            let effective = state.effective_config.expect("its effective config");
+            let doc: EffectiveConfigDocument =
+                serde_json::from_value(effective.clone()).expect("the effective config reads");
+            (effective, runtime_config_for(Some(&doc)))
+        };
+        let behavior = json!({"kind": "ai_chat", "model": "claude-sonnet-5-5"});
+
+        let (effective, runtime) = boot(json!({
+            "_system": {"config_version": 1},
+            "tenant_id": "tnt:6a1f3c2e-0b4d-4e8a-9c7f-2d5e8b1a3c40",
+            "behavior": behavior,
+            "speaks_as": PERSON
+        }));
+        assert_eq!(effective["speaks_as"], json!(PERSON));
+        assert_eq!(runtime.speaks_as.as_deref(), Some(PERSON));
+
+        let (_, runtime) = boot(json!({"behavior": behavior, "speaks_as": format!("  {PERSON} ")}));
+        assert_eq!(runtime.speaks_as.as_deref(), Some(PERSON));
+
+        let (_, runtime) = boot(json!({"behavior": behavior, "speaks_as": "  "}));
+        assert_eq!(runtime.speaks_as, None);
+
+        let (effective, runtime) = boot(json!({"behavior": behavior}));
+        assert!(effective.get("speaks_as").is_none(), "{effective}");
+        assert_eq!(runtime.speaks_as, None);
+        assert_eq!(runtime_config_for(None).speaks_as, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// docs/digital-executive-v1-stage-2.md §6.1: the status, asked through the runtime the node
+    /// runs on, says whom the runtime's config says the agent speaks as, and why identity does not
+    /// confirm it: here the node has no ILK of its own. A runtime whose config names no person
+    /// says nothing of it.
+    #[tokio::test]
+    async fn the_status_says_whom_the_running_agent_speaks_as() {
+        const PERSON: &str = "ilk:3f0c6a52-9c1e-4f5e-8f43-6d2b1a7e9c10";
+        for speaks_as in [Some(PERSON), None] {
+            let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+                "AI.generic@motherbee",
+                build_ai_generic_rpc_profile().expect("profile"),
+            );
+            let config = RuntimeConfig {
+                self_ilk_id: None,
+                speaks_as: speaks_as.map(str::to_string),
+                ..RuntimeConfig::default()
+            };
+            let running =
+                tokio::spawn(node_runtime(dispatcher, test_node()).run_with_config(config));
+            harness
+                .inject(sample_request())
+                .await
+                .expect("the status request");
+            let answer = harness
+                .next_outgoing_within(Duration::from_secs(10))
+                .await
+                .expect("the status");
+            running.abort();
+            let status = answer.payload.pointer("/extensions/speaks_as");
+            match speaks_as {
+                Some(person) => {
+                    let status = status.expect("extensions.speaks_as");
+                    assert_eq!(status["ilk"], json!(person), "{}", answer.payload);
+                    assert_eq!(status["confirmed"], json!(false));
+                    let reason = status["reason"].as_str().expect("its reason");
+                    assert!(reason.contains("FLUXBEE_NODE_ILK_ID"), "{reason}");
+                }
+                None => assert!(status.is_none(), "{}", answer.payload),
+            }
+            assert!(answer.payload.pointer("/extensions/ai_runtime").is_some());
+        }
     }
 
     // --- agent-tools-v1 §6.2.1: read_blob ---

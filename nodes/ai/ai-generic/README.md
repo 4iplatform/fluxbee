@@ -91,6 +91,11 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
     config keeps its config's `last_error`.
   - Since 0.1.136 the node answers its status at once however busy, so before 0.1.142 a saturated
     node read `HEALTHY`, its saturation only in its journal (FINDINGS A-290).
+  - `extensions.speaks_as`, while the config the node started with names a person it speaks as
+    ([`config.speaks_as`](#configspeaks_as)): `{ilk, confirmed, reason?}`, the person, whether
+    identity confirms it, and why not. Its health stays as the rest makes it: a conscious just
+    born, before its relation is set, reads `confirmed: false` and `HEALTHY`. Absent while the
+    config names none.
 - **`NODE_HELP`** returns the runtime's tool catalog: `{status: "ok", node_name, runtime,
   runtime_version, tools}`, the cards of [Tools](#tools). `runtime_version` is the one the
   orchestrator launched it at (`_system.runtime_version` of its `config.json`), `null` for a node
@@ -132,6 +137,21 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   memory is cognition's package, per conversation ([Messages](#messages)). Every `config.json` a
   `CONFIG_SET` wrote before its removal has it, the default included: such a node boots
   FAILED_CONFIG until a `CONFIG_SET` without it.
+
+### `config.speaks_as`
+
+The person this agent speaks as, an `ilk:<uuid>`, at the config's top level: a Digital
+Executive's, for its conscious, which SY.deploy writes at `run_node`
+([digital-executive-v1-stage-2](../../../docs/digital-executive-v1-stage-2.md) §6.1).
+
+- **Read at start** into the AI runtime's `RuntimeConfig::speaks_as`. A `CONFIG_SET` that changes it
+  is kept in `config.json` and takes effect at the next start; until then the status names the
+  person the node runs with.
+- **Confirmed by identity:** while the node's own ILK's entry in its hive's identity SHM works for
+  that person (`works_for`) as its `conscious` (`work_role`), read at start and every 10 s, the
+  node's solution replies carry the person as `src_ilk` ([Messages](#messages)). Otherwise they
+  carry its own ILK, the status says why, and the journal WARNs at most once a minute.
+- **Blank or absent:** nothing is read and nothing changes.
 
 ## The key
 
@@ -254,7 +274,10 @@ reads nothing of the hive's ([hive-config-update-v1](../../../docs/hive-config-u
   block after the trace and before the message: `vars` as JSON, cut at 8 KiB with a line that says
   so, and the menu.
   - Text and multimodal input alike: as parts, each block is a text part of its own, first.
-- **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`. Its
+- **Its reply** carries the agent's own ILK as `src_ilk`, or the person its config names and
+  identity confirms ([`config.speaks_as`](#configspeaks_as)), never one copied from the message;
+  and the sender's as `dst_ilk`. A control reply and a vault call keep the agent's own ILK, and the
+  writer of a reply stays the agent. Its
   `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`,
   `final_response_contract`, `wf` and `evaluation`: an answer never carries the request's WF block
   back, and its evaluation is only ever its own. It keeps the request's trace, and the runtime adds
