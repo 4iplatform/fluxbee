@@ -151,6 +151,29 @@ flag**. There is no new ILK type.
   orchestrator, SY.admin, ai.generic) returns its first match. If the ED shares its conscious's
   name, any of them may get the wrong ILK.
 
+### 3.0 Where its identity lives: in identity (decided, 2026-11-27)
+
+The operator (notes §32): a flag is not where an ED's identity lives; the data is missing in
+identity, and with it "who is the ED" is resolved. SY.deploy creates the ED and does not keep its
+data, as the orchestrator registers a node's ILK in identity and keeps only its deployment history.
+
+- **The relation, on every ILK, in the SHM:** `works_for`, the person a node's ILK works for, and
+  `work_role` (`conscious`, `channel`, `agent`). "Is there an ED behind this node, and is it its
+  soul" is one read of memory. A person's parts are the ILKs that name it. It is a new field of the
+  identity SHM: version 7, every reader at once.
+- **The person's document:** the profile's JSON (§10.4) becomes the person's document, kept by
+  identity, its hash in the SHM. **Layer 2,** inside Fluxbee: its names, company, personality, its
+  channels and the IOs that carry them, and its profile. **Layer 1,** on the internet: what a person
+  would expose, from which the DID document and the card are made (§12).
+- **Both are written by identity,** on SY.admin's command: at the birth from SY.deploy's steps,
+  after it from the operator, Archi or Cloud.
+- **An IO is assigned by its config, and identity confirms it** (the operator, 2026-11-27). SY.deploy
+  writes the IO's `io.person_ilk` at launch, as before (§7.1), and the IO stamps that person only
+  while its own ILK's `works_for` names the same person. Neither a config written by hand nor an
+  identity relation alone makes an IO an ED's. The conscious follows the same rule for the person it
+  speaks as (§7.2).
+- **SY.deploy keeps deployments only:** what it ran, when, and with what result (§5.3).
+
 ### 3.1 Where an ED is not a person (decided, 2026-11-25)
 
 Treating every person's rule as holding for an ED opens two holes the panel found:
@@ -278,7 +301,8 @@ grouping: *"eso me cierra más"*.
 - **Reads Archi's sources (CI)** and computes each deployment's desired state as the source plus
   its blanks' values.
 - **Builds the steps** and asks SY.admin for each.
-- **Keeps** each deployment's manifest, its history, and the list.
+- **Keeps** each deployment's manifest, its history, and the list. What an ED is lives in identity
+  (§3.0, decided 2026-11-27): SY.deploy keeps no ED data.
 - **Is a system node** (`SY.`), part of the infra. What it deploys is a user's (notes §12).
 
 **What the panel found about building the steps:**
@@ -488,6 +512,8 @@ name any person's ILK, real or virtual.
   `provision_on_miss`, the blob runtime and `self_tenant_id`. The assigned ILK sits next to
   `io.dst_node`. io.linkedhelper reads its own `adapter.dst_node`.
 - **For an ED,** the first layer sets the ED as the assigned ILK and its conscious as `dst_node`.
+- **Confirmed by identity** (decided, 2026-11-27, §3.0): the IO stamps its assigned person only
+  while its own ILK's `works_for` names the same person, with the role `channel`.
 - **Decided:** the assigned ILK must be charged to the IO's own tenant, the same rule io.api
   applies to a `by_ilk` subject (`validate_explicit_subject_ilk`).
 
@@ -516,7 +542,8 @@ hand that wrote.**
 - **The conscious's reply carries the ED as `src_ilk`.** **Decided** as the review asked, since the
   natural way to build it is a hole:
   - **Where the ED comes from.** The ED the conscious speaks as comes **from its own config**,
-    written by SY.deploy and checked there: virtual, and in the same tenant. It is never copied from
+    written by SY.deploy, and is confirmed by identity: its own ILK's `works_for` names it, with the
+    role `conscious` (2026-11-27, §3.0). It is never copied from
     the incoming message. Copying it, the mirror of `build_reply_meta`, would let whoever writes a
     `dst_ilk` choose who an agent speaks as, a real person included.
   - **Who stamps it.** The runtime stamps the ED on that node's replies only. The responsibilities'
@@ -1041,7 +1068,9 @@ The operator brought two methods and a combination, as ideas to adapt.
 14. **"Something more" in the core:** IO + AI + something Fluxbee builds that is useful (notes §4).
     One candidate is the tasks on timers (notes §1.2).
 15. **The line between infra and an ED's deployments** (§6.4).
-16. **Where the ED's list of ILKs lives,** and whether nodes read it in the shared memory (§4.2).
+16. **Closed (2026-11-27), §3.0:** in identity, as each part's `works_for` in the SHM, with the
+    person's document. Was: **where the ED's list of ILKs lives,** and whether nodes read it in the
+    shared memory (§4.2).
     The operator, 2026-11-26: SY.deploy as the only keeper of what an ED is made of is fragile, and
     identity may have to keep more. If every node needs to know which ED stands behind a node, the
     structure belongs in identity and its SHM, built once and properly, not by halves. To be talked
