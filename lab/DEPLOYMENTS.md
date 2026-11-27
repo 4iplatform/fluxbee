@@ -21,8 +21,9 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.155** | 2026-11-26 | `4cb16973` | motherbee + spokes (core), two binaries, one branch each: the Digital Executive's stage 1 cleanup, release one (the operator, 2026-11-26: the security path went ahead of the flow and bent the next stage's design). SY.identity: a virtual person takes channels as any person does, and an IO's provision of its address resolves to it (merges, in or out, still refused); io.api: `by_ilk` names a virtual person again | ✅ live, gate0255 16 PASS, no FAIL | snapshot `pre-edclean-0-1-155` · `apt install fluxbee=0.1.154` (nothing one-way) |
-| **0.1.154** | 2026-11-25 | `ba6d0d9a` | motherbee + spokes (core), the router alone, the Digital Executive's stage 1, release B ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §3): the router binds a person's `src_ilk` to its sender (IO, WF, SY; a virtual person's to SY) on its three paths, in REPORT mode (a would-be refusal only logs `src_ilk_bind would_refuse`, throttled); a background watcher publishes the view of the hive's persons and aliases, the message path never reads the region | ✅ live, gate0254 17 PASS, no FAIL | snapshot `pre-router-ed1-0-1-154` · `apt install fluxbee=0.1.153` |
+| **0.1.156** | 2026-11-26 | `0a5be3fb` | motherbee + spokes (core), the router alone: the Digital Executive's stage 1 cleanup, release two. The router's binding of a person's `src_ilk` comes out whole (its rule, its watcher, its report lines, and the identity reader's ILK kinds it read): the router and `src/shm` are 0.1.153's again | ✅ live, gate0256 14 PASS, no FAIL | snapshot `pre-edclean2-0-1-156` · `apt install fluxbee=0.1.155` (nothing one-way) |
+| **0.1.155** | 2026-11-26 | `4cb16973` | motherbee + spokes (core), two binaries, one branch each: the Digital Executive's stage 1 cleanup, release one (the operator, 2026-11-26: the security path went ahead of the flow and bent the next stage's design). SY.identity: a virtual person takes channels as any person does, and an IO's provision of its address resolves to it (merges, in or out, still refused); io.api: `by_ilk` names a virtual person again | ✅ replaced by 0.1.156 | snapshot `pre-edclean-0-1-155` (deleted 2026-11-26) · `apt install fluxbee=0.1.154` (nothing one-way) |
+| **0.1.154** | 2026-11-25 | `ba6d0d9a` | motherbee + spokes (core), the router alone, the Digital Executive's stage 1, release B ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md) §3): the router binds a person's `src_ilk` to its sender (IO, WF, SY; a virtual person's to SY) on its three paths, in REPORT mode (a would-be refusal only logs `src_ilk_bind would_refuse`, throttled); a background watcher publishes the view of the hive's persons and aliases, the message path never reads the region | ✅ replaced by 0.1.155; its binding taken out in 0.1.156 | snapshot `pre-router-ed1-0-1-154` (deleted 2026-11-26) · `apt install fluxbee=0.1.153` |
 | **0.1.153** | 2026-11-25 | `93a4024a` | motherbee + spokes (core), the Digital Executive's stage 1, release A ([digital-executive-v1-stage-1](../docs/digital-executive-v1-stage-1.md)): the identity SHM's virtual-person bit (`ILK_FLAG_VIRTUAL`, its three copies), SY.identity's virtual person (migration v6, `ILK_CREATE_VIRTUAL` from SY.admin@motherbee only, the `ILK_VIRTUAL` refusals of merges, re-registration, channels and provisions), SY.admin's `create_virtual_person` and Cloud's person actions refused on an ED, io.api's `by_ilk` refusing one, Archi's SCMD route | ✅ live, gate0253 31/31 PASS (one tool FAIL re-run PASS) | snapshot `pre-ed1-0-1-153` · `apt install fluxbee=0.1.152` (migration v6 only adds a column) |
 | **0.1.152** | 2026-11-20 | `9dfe1a4d` | motherbee + spokes (core), two binaries, one branch each: Archi (SY.architect) takes an identity's whole lifecycle in SCMD on SY.admin's own routes (purges included, run directly as every SCMD; each mutation tracked, apart from what Archi's AI may write; the dead staged-action path removed), A-348 (SCMD config `?replace` and the binding fields), A-307's Archi part (`BUSY`), A-327 (the explanation turn reads the prompt cache); SY.admin A-358 (a `hive` upstream at an address io.web refuses is refused at publish, `HIVE_ADDRESS_REFUSED`) and A-337 (the plan review sees no secret; a plan holding the mask refused), the purge help as the code has it | ✅ live, checked on 8.x | snap `pre-archi-0-1-152` (all 4 VMs) · `apt install fluxbee=0.1.151` + 0.1.151's `update_installation` (nothing one-way) |
 | **0.1.151** | 2026-11-19 | `890d258f` | motherbee + spokes (core), io.web stage 2.2's R2, the binaries, one branch per binary ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): io.web a transparent reverse proxy to each exposure's upstream (every method, bodies and streams frame by frame, WebSockets, no wait of its own; the Origin check; the header table; a renewal moves the sessions; what is open cut at once when the access ends), SY.edge the pass-through (every method but CONNECT and TRACE, bodies, WebSockets in their connection's scope, no wait of its own, TCP keepalive, every cookie pair, HSTS, frame_origins), SY.admin `publish_cloud_endpoint`'s `cloud_origins`; with A-356 and A-357 (SY.admin's executor contract) | ✅ live, checked on 8.x | snap `pre-web22-0-1-151` (all 4 VMs) · `apt install fluxbee=0.1.150` + 0.1.150's `update_installation` (nothing one-way; exposures go back to the placeholder; io.web's and the edge's files hold the origins, which their 0.1.150 refuses: each serves SY.admin's next push, within 60 s; 0.1.150's SY.admin drops the origins from its registry, so name them again after coming back) |
@@ -164,6 +165,40 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.156 — the Digital Executive's stage 1 cleanup, release two: the router's binding out
+
+- **Date:** 2026-11-26 (ART) · **Previous version:** 0.1.155 · **Commit:** `0a5be3fb`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The router alone
+  (shared code, METHOD §9).
+- **Why:** 0.1.155's; this is the router's part.
+- **What changed (`coa/ed-cleanup-router`):** reverts `ba6d0d9a`, `d8ff00c5` and `bf1a4d0a`. The
+  binding of a person's `src_ilk` comes out whole: its rule on the three paths, its background
+  watcher, its `src_ilk_bind` report lines, the built `enforce`, and `src/shm`'s reader of ILK kinds
+  and of the region's sequence, which only the router read. The router and `src/shm` are byte for
+  byte 0.1.153's.
+- **Review:** a revert; the trees compared with 0.1.153's, no difference.
+- **Build:** CI green on the branch and on the integrated head `0a5be3fb`. Build on fb-build
+  02:08:54–02:25:57Z (17.1 min), publish before the mark.
+- **The deploy:** the mark at 02:26:25Z; `ops deploy 0.1.156 --snapshot pre-edclean2-0-1-156 --drop
+  pre-edclean-0-1-155` in 271 s:
+  - **Phases:** snapshots 31.1 s, the motherbee's apt 140.9 s, its admin on the version 40.5 s, the
+    spokes answering 8.5 s, the update's call 21.7 s, the hives on the target 14.5 s, health 6.8 s.
+  - **On the target after the update's call:** the motherbee 4.2 s, egress1 25.9 s, ingress1 30.0 s,
+    worker1 34.3 s.
+  - **Health:** clean; every hive on 0.1.156, one hash.
+- **Checked on 8.x (the gate, gate0256, 02:31–02:34Z; `scratchpad/gate-tools/r156_gate.py` with
+  0.1.154's `r154_probe.py`, git-ignored; 14 PASS, no FAIL, no model call):**
+  - **The smoke:** a new node RUNNING in 8.1 s on 0.1.156, stopped; a stopped one reads STOPPED.
+  - **The probe on worker1's router socket,** 0.1.154's four cases with a virtual person as the ILK
+    (an AI and an IO as it, an AI with its bare UUID): all four delivered, no `src_ilk_bind` line.
+  - **The sweep:** no `src_ilk_bind` line in any hive's router journal since the mark, the
+    watcher's own included.
+  - **Cleaned:** the virtual person, the smoke node.
+- **Next:** the Digital Executive's stage 2 on the new path
+  ([stage 2](../docs/digital-executive-v1-stage-2.md)).
+- **Rollback:** snapshot `pre-edclean2-0-1-156`, or `apt install fluxbee=0.1.155` and 0.1.155's
+  `update_installation`: nothing one-way.
 
 ## 0.1.155 — the Digital Executive's stage 1 cleanup, release one: SY.identity and io.api
 
