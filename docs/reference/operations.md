@@ -33,7 +33,7 @@ it (see [SY.vault](../nodes/sy-vault.md)):
 
 | Role | System nodes (start order) |
 | --- | --- |
-| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault |
+| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.deploy, SY.frontdesk.gov, SY.vault |
 | worker | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules |
 | egress | SY.config.routes, SY.opa.rules |
 | ingress | SY.config.routes, SY.opa.rules, SY.edge |
@@ -43,7 +43,7 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
 [SY.identity](../nodes/sy-identity.md), [SY.opa.rules](../nodes/sy-opa-rules.md),
 [SY.vault](../nodes/sy-vault.md), [SY.storage](../nodes/sy-storage.md),
 [SY.cognition](../nodes/sy-cognition.md), [SY.timer](../nodes/sy-timer.md),
-[SY.wf-rules](../nodes/sy-wf-rules.md).
+[SY.wf-rules](../nodes/sy-wf-rules.md), [SY.deploy](../nodes/sy-deploy.md).
 
 ## Install the motherbee
 

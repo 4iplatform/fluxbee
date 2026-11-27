@@ -82,7 +82,7 @@ core update, and a core rollback takes it back.
 
 | Role | System nodes (the release's list) | Created by | Purpose |
 | --- | --- | --- | --- |
-| `motherbee` | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault | the `.deb` and `fluxbee-firstboot` | control plane, secrets, PostgreSQL, the Cloud relay |
+| `motherbee` | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.deploy, SY.frontdesk.gov, SY.vault | the `.deb` and `fluxbee-firstboot` | control plane, secrets, PostgreSQL, the Cloud relay |
 | `worker` | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules | `add_hive` | room for AI, IO and WF nodes |
 | `ingress` | SY.config.routes, SY.opa.rules, SY.edge | `add_hive` with `role: ingress` | the public HTTPS door |
 | `egress` | SY.config.routes, SY.opa.rules | `add_hive` with `role: egress` | outbound NAT for the workers |

@@ -113,6 +113,7 @@ const MOTHERBEE: RoleSettings = RoleSettings {
             "SY.cognition",
             "SY.timer",
             "SY.wf-rules",
+            "SY.deploy",
             "SY.frontdesk.gov",
             "SY.vault",
         ],
@@ -486,6 +487,12 @@ dist:
             .unwrap_or_default()
     }
 
+    /// The nodes a release added to a role's list since the lists moved into the code: the role,
+    /// the node, and the node it starts after. SY.deploy, the CD node, runs on the motherbee only
+    /// (docs/digital-executive-v1-stage-2.md §10.1); no start waits for it.
+    const ADDED_SINCE: [(HiveRole, &str, &str); 1] =
+        [(HiveRole::Motherbee, "SY.deploy", "SY.wf-rules")];
+
     #[test]
     fn the_table_holds_the_system_nodes_the_example_shipped() {
         let shipped: serde_yaml::Value =
@@ -493,12 +500,17 @@ dist:
         for role in HiveRole::ALL {
             let section = &shipped["system_nodes"][role.as_str()];
             let table = role.settings().system_nodes;
-            assert_eq!(
-                strings(section.get("nodes")),
-                table.nodes,
-                "{}: nodes",
-                role.as_str()
-            );
+            let mut nodes = strings(section.get("nodes"));
+            for (added_to, node, after) in ADDED_SINCE {
+                if added_to == role {
+                    let at = nodes
+                        .iter()
+                        .position(|name| name == after)
+                        .expect("the node it starts after");
+                    nodes.insert(at + 1, node.to_string());
+                }
+            }
+            assert_eq!(nodes, table.nodes, "{}: nodes", role.as_str());
             assert_eq!(
                 strings(section.get("wait_for")),
                 table.wait_for,

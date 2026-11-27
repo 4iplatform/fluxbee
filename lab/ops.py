@@ -814,7 +814,7 @@ def spoke_core_updates(v, digest, spokes, mark, spoke_times, phases, started):
 # The units a timeline reads on each hive, and what counts as a milestone among their lines.
 TIMELINE_UNITS = [
     "rt-gateway", "sy-orchestrator", "sy-admin", "sy-identity", "sy-vault", "sy-config-routes",
-    "sy-opa-rules", "sy-cognition", "sy-timer", "sy-wf-rules", "sy-edge", "sy-storage",
+    "sy-opa-rules", "sy-cognition", "sy-timer", "sy-wf-rules", "sy-deploy", "sy-edge", "sy-storage",
     "sy-architect", "sy-frontdesk-gov", "fluxbee-syncthing",
 ]
 TIMELINE_MILESTONES = (

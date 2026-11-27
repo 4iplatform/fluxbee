@@ -24122,6 +24122,7 @@ const BOX_INSTALL_UNITS: &[&str] = &[
     "sy-cognition",
     "sy-timer",
     "sy-wf-rules",
+    "sy-deploy",
     "sy-orchestrator",
     "sy-admin",
     "sy-architect",
@@ -24485,7 +24486,7 @@ const REMOVE_HIVE_CREDENTIALS_SCRIPT: &str =
 /// Stops and disables the core services, stops the managed nodes (their transient
 /// `fluxbee-node-*` units), then deletes the node state.
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov sy-edge fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-deploy sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov sy-edge fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -46305,6 +46306,7 @@ mod tests {
             "sy-cognition",
             "sy-timer",
             "sy-wf-rules",
+            "sy-deploy",
             "sy-frontdesk-gov",
             "sy-vault",
             "sy-edge",

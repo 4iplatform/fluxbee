@@ -143,7 +143,7 @@ that had joined before.
 
 | Role | SY nodes, in start order | `wait_for` |
 | --- | --- | --- |
-| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.cognition, SY.timer, SY.vault |
+| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.deploy, SY.frontdesk.gov, SY.vault | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.cognition, SY.timer, SY.vault |
 | worker | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer |
 | egress | SY.config.routes, SY.opa.rules | SY.config.routes |
 | ingress | SY.config.routes, SY.opa.rules, SY.edge | SY.config.routes |

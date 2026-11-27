@@ -38,7 +38,8 @@ One page per node: [rt-gateway](nodes/rt-gateway.md) (the router),
 [SY.vault](nodes/sy-vault.md), [SY.storage](nodes/sy-storage.md),
 [SY.cognition](nodes/sy-cognition.md), [SY.config.routes](nodes/sy-config-routes.md),
 [SY.opa.rules](nodes/sy-opa-rules.md), [SY.timer](nodes/sy-timer.md),
-[SY.wf-rules](nodes/sy-wf-rules.md), [SY.edge](nodes/sy-edge.md),
+[SY.wf-rules](nodes/sy-wf-rules.md), [SY.deploy](nodes/sy-deploy.md) (the CD node),
+[SY.edge](nodes/sy-edge.md),
 [SY.frontdesk.gov](nodes/sy-frontdesk-gov.md). Archi's handbook, shipped with the package:
 [archi/handbook_fluxbee.md](archi/handbook_fluxbee.md).
 

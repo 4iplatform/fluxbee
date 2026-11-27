@@ -14,7 +14,7 @@ Fluxbee ships as **ONE single integrated Debian package** (`fluxbee_<ver>_amd64.
 motherbee only — see [07-operaciones.md](history/07-operaciones.md) for the deploy model). The package carries:
 
 - The **core** (`SY.*`): rt-gateway, sy-admin, sy-config-routes, sy-architect, sy-vault,
-  sy-orchestrator, sy-storage, sy-identity, sy-cognition, sy-edge (Rust) +
+  sy-orchestrator, sy-storage, sy-identity, sy-cognition, sy-edge, sy-deploy (Rust) +
   sy-opa-rules, sy-timer, sy-wf-rules (Go) + sy-frontdesk-gov. Each core
   binary travels in `/usr/bin` **and** in `/var/lib/fluxbee/dist/core/bin` (this copy is the one the
   dist-sync replicates to the spokes; its hashes are baked into `dist/core/manifest.json`).
@@ -277,9 +277,11 @@ the problem of whoever connects a Cloud, not of the backend.
   operator's repair surface: `sudo fluxbee-seed-runtimes`.
 - [`packaging/deb-preinst`](../packaging/deb-preinst) — copies the live manifest before the unpack.
 - [`packaging/deb-prerm`](../packaging/deb-prerm) / [`packaging/deb-postinst`](../packaging/deb-postinst)
-  — on an upgrade the `prerm` stops only `sy-orchestrator`, `sy-admin` and `sy-wf-rules`; the rest of the
-  core keeps serving with the old binaries until the boot of the new orchestrator restarts it
-  in order (A-45). Details in [07-operaciones.md](history/07-operaciones.md) §6.1.
+  — on an upgrade the `prerm` stops only `sy-orchestrator`, `sy-admin`, `sy-wf-rules` and `sy-deploy`
+  (whose steps go through SY.admin, so it resumes a deployment under way instead of failing a step
+  meanwhile); the rest of the core keeps serving with the old binaries until the boot of the new
+  orchestrator restarts it in order (A-45). Details in [07-operaciones.md](history/07-operaciones.md)
+  §6.1. The `postinst` creates each core service's state directory, `state/sy-deploy` among them.
 - [`scripts/make-deb.sh`](../scripts/make-deb.sh) — build entrypoint for devs.
 - [07-operaciones.md](history/07-operaciones.md) — deploy and lifecycle (add_hive, update, roles).
 - [14-runtime-rollout-motherbee.md](history/14-runtime-rollout-motherbee.md) — runtimes update channel.

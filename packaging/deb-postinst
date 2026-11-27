@@ -2,8 +2,9 @@
 # fluxbee .deb postinst: system user, dirs, units. A fresh install does NOT start
 # services: `fluxbee-firstboot` owns that transition after provisioning secrets.
 # During an upgrade the prerm stopped the dist manifest's writers (sy-orchestrator, sy-admin,
-# sy-wf-rules) and left the rest serving on the old binaries; starting the orchestrator brings the
-# writers back and its boot restarts every service that runs a replaced binary (FINDINGS A-45).
+# sy-wf-rules) and sy-deploy, and left the rest serving on the old binaries; starting the
+# orchestrator brings them back and its boot restarts every service that runs a replaced binary
+# (FINDINGS A-45).
 set -e
 
 if ! getent passwd fluxbee >/dev/null 2>&1; then
@@ -14,7 +15,7 @@ fi
 install -d /etc/fluxbee
 install -d -m 0700 /var/lib/fluxbee/ssh
 install -d -m 0700 /var/lib/fluxbee/tls
-for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/current opa/staged opa/backup \
+for d in state/nodes state/cookbook state/sy-admin state/sy-edge state/sy-deploy hives opa/current opa/staged opa/backup \
          wf-rules modules blob blob/public state/io-blob syncthing \
          dist/runtimes dist/vendor dist/policy; do
     install -d "/var/lib/fluxbee/$d"

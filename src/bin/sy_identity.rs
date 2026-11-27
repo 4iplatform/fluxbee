@@ -11428,8 +11428,8 @@ mod tests {
     }
 
     /// The system ILKs come from the release's list for the hive (the motherbee's on the primary,
-    /// the worker's on a replica), the same lists hive.yaml's `system_nodes` gave; a `system_nodes`
-    /// still in the file is ignored, whatever it says.
+    /// the worker's on a replica), the lists hive.yaml's `system_nodes` gave, with SY.deploy added
+    /// on the motherbee since; a `system_nodes` still in the file is ignored, whatever it says.
     #[test]
     fn system_ilks_come_from_the_release_s_lists_not_hive_yaml() {
         let old_lists = [
@@ -11446,6 +11446,7 @@ mod tests {
                     "SY.cognition",
                     "SY.timer",
                     "SY.wf-rules",
+                    "SY.deploy",
                     "SY.frontdesk.gov",
                     "SY.vault",
                 ][..],

@@ -30,6 +30,10 @@ REMOVED (operator decisions, 2026-09-28):
     does not remove, and counts them in its log line (packages_left=);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
+  - SY.deploy's records of what it deployed (state/sy-deploy/deployments/ and journal/): the
+    nodes and ILKs they name go with the users' above, so SY.deploy is held down from the start
+    (it would resume a deployment under way) and its records go once the ILKs are purged; its
+    sources' copies stay (state/sy-deploy/sources/, the installation's catalog);
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
@@ -97,6 +101,10 @@ WF_NODE_PREFIX = "WF."
 WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (src/release_settings.rs)
 COGNITION_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.cognition (the same)
 CONVERSATION_DIRS = ("thread-state", "immediate-memory")
+# SY.deploy's records of what it deployed (docs/nodes/sy-deploy.md): removed; its sources' copies
+# (sources/) stay.
+DEPLOY_STATE = os.path.join(STATE_DIR, "state", "sy-deploy")
+DEPLOY_RECORD_DIRS = ("deployments", "journal")
 
 
 def die(msg):
@@ -324,6 +332,30 @@ def conversation_dirs():
                     found.append(os.path.join(dirpath, d))
                     dirnames.remove(d)
     return sorted(found)
+
+
+def deploy_records():
+    """-> the deployments SY.deploy records (state/sy-deploy/deployments/<id>.json)."""
+    try:
+        return sorted(f[:-5] for f in os.listdir(os.path.join(DEPLOY_STATE, "deployments"))
+                      if f.endswith(".json") and not f.startswith("."))
+    except OSError:
+        return []
+
+
+def remove_deploy_records():
+    """Removes SY.deploy's records and journals, SY.deploy held down. Answers the paths left."""
+    left = []
+    for d in DEPLOY_RECORD_DIRS:
+        path = os.path.join(DEPLOY_STATE, d)
+        try:
+            for f in os.listdir(path):
+                os.remove(os.path.join(path, f))
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            left.append("%s (%s)" % (path, e))
+    return left
 
 
 def cognition_hives(local_hive):
@@ -653,6 +685,7 @@ def main():
     tables = storage_tables() if can_db else []
     counts = storage_counts(tables) if can_db else {}
     conv = conversation_dirs()
+    deployments = deploy_records()
     cog_hives = cognition_hives(hive_id)
     tenants = user_tenants(hive_id)
     opa_versions = opa_user_policy_versions()
@@ -677,6 +710,8 @@ def main():
     for i in ilks_now:
         print("    %s  %-8s %s%s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or "",
                                    "  [already marked]" if i.get("deleted_at_ms") else ""))
+    print("    + SY.deploy's records of what it deployed (state/sy-deploy/deployments/, journal/;"
+          " SY.deploy held down until they go): %d" % len(deployments))
     print("[4] vault secrets to delete (everything but infra): %d" % len(secrets_now))
     for s in secrets_now:
         md = s.get("metadata") or {}
@@ -715,6 +750,9 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
+    # SY.deploy is held down first: it would resume a deployment under way, or a removal, over the
+    # nodes and ILKs the reset removes. Its records go after [3/9], and it starts again.
+    deploy_held = hold_down(["sy-deploy.service"])
     print("\n== [0/9] take down the published pages")
     # First, while SY.admin, the edge and IO.blob run: nothing the reset stops serves the take-down.
     # No removal below waits for a page (FINDINGS A-242); [8] takes down the pages that went up
@@ -733,6 +771,11 @@ def main():
         "ILKs (mark + purge)", lambda: user_ilks(hive_id, surviving_now, base),
         lambda i: purge_identity("ilks", hive_id, i["ilk_id"]),
         lambda i: i["ilk_id"])
+    # SY.deploy's records named those nodes and ILKs: they go, and SY.deploy starts again.
+    deploy_left = remove_deploy_records()
+    release(deploy_held)
+    print("  SY.deploy's records: %s" % ("%d removed" % len(deployments) if not deploy_left
+                                         else "FAIL %s" % "; ".join(deploy_left)))
     # The last removal of a node: a publish under way then ends within LAST_PUBLISH_SECS ([8]).
     removed_at = time.monotonic()
     publishers_removed = nodes_removed(workflows, user_nodes, ilks_now)
@@ -816,7 +859,7 @@ def main():
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
     problems = (len(wf_fail) + len(node_fail) + len(page_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail)
-                + len(opa_fail) + len(left) + len(cog_fail))
+                + len(opa_fail) + len(left) + len(cog_fail) + len(deploy_left))
     summary = summary_line(hive_id, len(workflows), len(user_nodes), pages_done, len(ilks_now),
                            len(secrets_now), len(tables), len(packages_left), problems, time.time() - t0)
     try:

@@ -2418,7 +2418,8 @@ mod tests {
     }
 
     /// The well-known SY ILKs are the release's SY nodes for the hive's role, the motherbee's list
-    /// hive.yaml's `system_nodes` gave; a `system_nodes` still in the file is ignored.
+    /// hive.yaml's `system_nodes` gave and SY.deploy, added since; a `system_nodes` still in the
+    /// file is ignored.
     #[test]
     fn well_known_system_ilks_come_from_the_release_s_list() {
         let config_dir = std::env::temp_dir().join(format!(
@@ -2448,6 +2449,7 @@ mod tests {
             "SY.cognition",
             "SY.timer",
             "SY.wf-rules",
+            "SY.deploy",
             "SY.frontdesk.gov",
             "SY.vault",
         ]

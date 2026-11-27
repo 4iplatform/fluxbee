@@ -45,13 +45,13 @@ node_bin_src() { # <workspace> <bin> -> path to the built binary
 RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_routes
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
   sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition
-  sy-edge:sy_edge)
+  sy-edge:sy_edge sy-deploy:sy_deploy)
 # wf-generic is not a core binary: it ships only as the wf.engine runtime, seeded below from
 # base-nodes.json, which is what every WF node runs (FINDINGS A-211).
 GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules)
 # units: every core service. sy-edge gets a dedicated unit below (custom rt-gateway ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
-  sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-frontdesk-gov)
+  sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-deploy sy-frontdesk-gov)
 
 echo "== [1/5] build rust =="
 cargo build --release --locked --bins
@@ -213,12 +213,12 @@ gen_unit() { # <name> [after] [wants] [role_regex]
     echo "TimeoutStopSec=15"; echo
     echo "[Install]"; echo "WantedBy=multi-user.target"; } > "$DEST/lib/systemd/system/$name.service"
 }
-# Units whose binary exits on the wrong hive role (sy-admin/sy-storage=motherbee,
+# Units whose binary exits on the wrong hive role (sy-admin/sy-storage/sy-deploy=motherbee,
 # sy-identity=motherbee|worker) get an ExecCondition mirroring that guard — otherwise a
 # Wants= pull-in (e.g. io-cloud.service) starts them on a foreign role and Restart=always
 # turns the binary's clean wrong-role exit into an infinite crash-loop.
 unit_role_gate() { case "$1" in
-  sy-admin|sy-storage) echo "motherbee" ;;
+  sy-admin|sy-storage|sy-deploy) echo "motherbee" ;;
   sy-identity) echo "motherbee|worker" ;;
   *) echo "" ;;
 esac; }
@@ -280,7 +280,7 @@ Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
- architect, cognition, timer, wf-rules, opa-rules, frontdesk, edge)
+ architect, cognition, timer, wf-rules, deploy, opa-rules, frontdesk, edge)
  plus the managed IO/AI runtimes (io.api, io.blob, io.cloud, io.slack, io.wapp,
  ai.generic, wf.engine, io.linkedhelper) seeded under dist/runtimes per
  packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes).
