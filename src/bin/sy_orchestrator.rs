@@ -144,6 +144,13 @@ const SYNCTHING_FOLDER_DIST_INSTALLATION_ID: &str = "fluxbee-dist-installation";
 /// sent by the motherbee only, and covered by what handles every `fluxbee-dist*` folder (the
 /// `dist` sync hint, remove_hive's unlink).
 const SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID: &str = "fluxbee-dist-agent-assets";
+/// The people's documents: the files SY.identity writes on the motherbee as
+/// `blob/people/person-<uuid>_<hash16>.json`, one per version of a person's document
+/// (docs/digital-executive-v1-stage-2.md §1.2). The agent-assets folder's sibling in every way
+/// (design §10.5): WORKER ONLY, where the agents that read them run; sent by the motherbee only;
+/// under `blob/` but a `fluxbee-dist` folder, so outside `read_blob` and the blob GC, and covered
+/// by what handles every `fluxbee-dist*` folder (the `dist` sync hint, remove_hive's unlink).
+const SYNCTHING_FOLDER_DIST_PEOPLE_ID: &str = "fluxbee-dist-people";
 const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
 const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
 const SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY: &str = "receiveonly";
@@ -5435,8 +5442,8 @@ async fn syncthing_folder_status_across_restart(
 /// A caller asking to settle the "dist" channel names the channel, not the layout: motherbee
 /// and the e2e scripts send `folder_id: "fluxbee-dist"` (`SYNCTHING_DIST_CHANNEL_ID`), and they
 /// should not have to know that the target holds `fluxbee-dist-core-<role>` plus `-vendor`, plus
-/// `-runtimes` and `-agent-assets` only on a worker. The hive knows its own role, so it resolves
-/// the request here.
+/// `-runtimes`, `-agent-assets` and `-people` only on a worker. The hive knows its own role, so
+/// it resolves the request here.
 ///
 /// Resolves through `dist_sync_folders_for_hive`, NOT `dist_sync_folders_for_role`. On motherbee
 /// the per-role variant answers `fluxbee-dist-core-motherbee` — a folder motherbee never declares,
@@ -9545,36 +9552,53 @@ fn ensure_dirs(
     }
     // Agent assets travel in a dist folder (FINDINGS A-72) and are owned like a dist tree: on the
     // motherbee root's, where SY.architect writes them and Syncthing only reads to send them; on a
-    // worker the Syncthing user's, who writes what it receives, and ai.generic reads as root. Both
-    // calls create the directory. The motherbee takes the tree back only where hard links to
-    // another user's files are protected, like the blob trees above: it may still be the Syncthing
-    // user's from an older install. Ingress and egress run no agent and get no folder.
-    let agent_assets = agent_assets_folder_path(&blob.path);
-    let agent_assets_owned = match role {
-        HiveRole::Motherbee if can_take_back => Some(ensure_root_owned_tree(
-            &agent_assets,
-            SYNCTHING_SERVICE_USER,
-        )),
-        HiveRole::Motherbee => Some(Err(
-            "fs.protected_hardlinks is not 1: blob/agent-assets was not taken back".into(),
-        )),
-        HiveRole::Worker if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) => {
-            Some(ensure_owned_tree(&agent_assets, SYNCTHING_SERVICE_USER))
-        }
-        HiveRole::Worker | HiveRole::Ingress | HiveRole::Egress => None,
-    };
-    if let Some(Err(err)) = agent_assets_owned {
-        tracing::error!(error = %err, "could not set the agent-assets tree's owner");
-        append_drift_alert(
-            "posture",
+    // worker the Syncthing user's, who writes what it receives, and ai.generic reads as root. The
+    // people's documents are their sibling (docs/digital-executive-v1-stage-2.md §1.2): SY.identity
+    // writes them on the motherbee, and the workers receive them. Both calls create the directory.
+    // The motherbee takes each tree back only where hard links to another user's files are
+    // protected, like the blob trees above: it may still be the Syncthing user's from an older
+    // install. Ingress and egress run no agent and get neither folder.
+    for (tree, alert) in [
+        (
+            agent_assets_folder_path(&blob.path),
             "agent_assets_owner_not_set",
-            "warning",
-            hive_id,
-            format!("the agent-assets tree's owner was not set at this start: {err}"),
-            None,
-            None,
-            None,
-        );
+        ),
+        (people_folder_path(&blob.path), "people_owner_not_set"),
+    ] {
+        let name = tree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let owned = match role {
+            HiveRole::Motherbee if can_take_back => {
+                Some(ensure_root_owned_tree(&tree, SYNCTHING_SERVICE_USER))
+            }
+            HiveRole::Motherbee => Some(Err(format!(
+                "fs.protected_hardlinks is not 1: blob/{name} was not taken back"
+            )
+            .into())),
+            HiveRole::Worker if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) => {
+                Some(ensure_owned_tree(&tree, SYNCTHING_SERVICE_USER))
+            }
+            HiveRole::Worker | HiveRole::Ingress | HiveRole::Egress => None,
+        };
+        if let Some(Err(err)) = owned {
+            tracing::error!(
+                error = %err,
+                tree = %name,
+                "could not set a dist tree's owner under blob/"
+            );
+            append_drift_alert(
+                "posture",
+                alert,
+                "warning",
+                hive_id,
+                format!("the {name} tree's owner was not set at this start: {err}"),
+                None,
+                None,
+                None,
+            );
+        }
     }
     report_unusable_managed_dirs(
         hive_id,
@@ -9583,6 +9607,7 @@ fn ensure_dirs(
             blob.path.join("active"),
             blob.path.join("staging"),
             blob.path.join("agent-assets"),
+            blob.path.join("people"),
             blob.path.join("public"),
             blob.sync_data_dir.clone(),
             dist.path.clone(),
@@ -9616,6 +9641,11 @@ fn blob_public_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
 
 fn agent_assets_folder_path(blob_root: &Path) -> PathBuf {
     blob_root.join("agent-assets")
+}
+
+/// The people's documents' folder, `blob/people` (docs/digital-executive-v1-stage-2.md §1.2).
+fn people_folder_path(blob_root: &Path) -> PathBuf {
+    blob_root.join("people")
 }
 
 fn blob_public_syncthing_folder_type(is_motherbee: bool) -> &'static str {
@@ -16968,6 +16998,8 @@ struct DistSyncFolder {
 ///   * runtimes— worker only. Tenant workflow packages live here; this is the subtree that
 ///     must never reach the DMZ.
 ///   * agent assets — worker only, where the agents run; `blob/agent-assets` (FINDINGS A-72).
+///   * people — worker only, beside the agent assets; `blob/people`, the people's documents
+///     (docs/digital-executive-v1-stage-2.md §1.2).
 ///
 /// Paths are asymmetric by design: motherbee serves `dist/core/<role>`, the spoke receives it
 /// as its own `dist/core`. Syncthing resolves a folder id to a local path per device, so both
@@ -17018,6 +17050,11 @@ fn dist_sync_folders_for_role(
             id: SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID.to_string(),
             path: agent_assets_folder_path(blob_root),
             label: "Fluxbee Dist Agent Assets",
+        });
+        out.push(DistSyncFolder {
+            id: SYNCTHING_FOLDER_DIST_PEOPLE_ID.to_string(),
+            path: people_folder_path(blob_root),
+            label: "Fluxbee Dist People",
         });
     }
     out
@@ -17070,16 +17107,18 @@ fn peer_shares_public_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bo
 }
 
 /// Whether a spoke of this role must never be in this Fluxbee folder, whatever hive.yaml's enable
-/// flags say: blob/active is workers' only (A-50), blob/public the ingress's, runtimes and agent
-/// assets workers' only, and each core folder its own role's. The reconcile takes a spoke out of
-/// these folders and nothing else, so a flag turned off for a while never strips anyone. What adds
-/// a spoke to a folder never adds a forbidden one: the joins, the agent assets following the
-/// runtimes (A-72) and the blob folders following their dist folder (stage 5).
+/// flags say: blob/active is workers' only (A-50), blob/public the ingress's, runtimes, agent
+/// assets and the people's documents workers' only, and each core folder its own role's. The
+/// reconcile takes a spoke out of these folders and nothing else, so a flag turned off for a while
+/// never strips anyone. What adds a spoke to a folder never adds a forbidden one: the joins, the
+/// agent assets and the people's documents following the runtimes (A-72) and the blob folders
+/// following their dist folder (stage 5).
 fn folder_forbidden_for_role(folder_id: &str, role: HiveRole) -> bool {
     match folder_id {
         SYNCTHING_FOLDER_BLOB_ID
         | SYNCTHING_FOLDER_DIST_RUNTIMES_ID
-        | SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID => role != HiveRole::Worker,
+        | SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID
+        | SYNCTHING_FOLDER_DIST_PEOPLE_ID => role != HiveRole::Worker,
         SYNCTHING_FOLDER_BLOB_PUBLIC_ID => role != HiveRole::Ingress,
         id => id
             .strip_prefix(SYNCTHING_FOLDER_DIST_CORE_PREFIX)
@@ -18984,8 +19023,8 @@ fn reconcile_syncthing_peer_removal_xml(
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         // Every dist folder PRESENT in the config, not a fixed id: the removed hive's role is
         // not known here, and a hive may be attached to any of `fluxbee-dist-core-<role>`,
-        // `-vendor`, `-policy`, `-runtimes`, `-agent-assets`. Leaving a stale device on any of
-        // them would keep shipping bytes to a hive that was removed.
+        // `-vendor`, `-policy`, `-runtimes`, `-agent-assets`, `-people`. Leaving a stale device on
+        // any of them would keep shipping bytes to a hive that was removed.
         for folder_id in dist_folder_ids_present_in_config(&updated) {
             let (next, folder_changed) =
                 remove_syncthing_folder_device(&updated, &folder_id, peer_device_id)?;
@@ -19150,10 +19189,10 @@ fn reconcile_syncthing_folders_xml(
             }
         }
         // Policy and the installation file go to every role, like vendor, so they are shared
-        // with exactly vendor's peers; agent assets go to the workers, like runtimes, so they
-        // follow runtimes' (FINDINGS A-72). Peer links are written only when a hive joins
-        // (add_hive / finalize); without this a folder added by a later release would stay local
-        // on the hives that joined before it.
+        // with exactly vendor's peers; agent assets and the people's documents go to the workers,
+        // like runtimes, so they follow runtimes' (FINDINGS A-72). Peer links are written only
+        // when a hive joins (add_hive / finalize); without this a folder added by a later release
+        // would stay local on the hives that joined before it.
         //
         // The blob folders follow the dist folder with their audience the same way
         // (docs/hive-config-update-v1.md §8, FINDINGS A-181): `fluxbee-blob` the workers',
@@ -19176,6 +19215,10 @@ fn reconcile_syncthing_folders_xml(
             (
                 SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
                 SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID,
+            ),
+            (
+                SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
+                SYNCTHING_FOLDER_DIST_PEOPLE_ID,
             ),
             (SYNCTHING_FOLDER_DIST_RUNTIMES_ID, SYNCTHING_FOLDER_BLOB_ID),
             (ingress_core.as_str(), SYNCTHING_FOLDER_BLOB_PUBLIC_ID),
@@ -31286,16 +31329,35 @@ async fn kill_node_flow(
             "node_name": node_name_ref,
         });
     }
+    let purge_instance = payload
+        .get("purge_instance")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // docs/digital-executive-v1-stage-2.md §9: a retire removes the node from its hive as a purge
+    // does, and keeps its identity: its ILK is marked, never purged, and its secrets stay.
+    let retire_instance = payload
+        .get("retire_instance")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(message) = kill_node_removal_conflict(purge_instance, retire_instance) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+            "target": target_hive,
+            "node_name": node_name_ref,
+            "purge_instance": purge_instance,
+            "retire_instance": retire_instance,
+        });
+    }
+    // A purge or a retire: either removes the instance once the node is stopped.
+    let removes_instance = purge_instance || retire_instance;
     let unit = unit_from_node_name(node_name_ref);
     // SO-04: serialize with any concurrent lifecycle/config op on this node.
     let _node_lock = state.lock_node(node_name_ref).await;
 
     let force = payload
         .get("force")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let purge_instance = payload
-        .get("purge_instance")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let signal = if force {
@@ -31332,12 +31394,17 @@ async fn kill_node_flow(
                 "purge_instance".to_string(),
                 serde_json::json!(purge_instance),
             );
+            obj.insert(
+                "retire_instance".to_string(),
+                serde_json::json!(retire_instance),
+            );
             if let Some(name) = validated_node_name.as_ref() {
                 obj.insert("node_name".to_string(), serde_json::json!(name));
             }
         }
-        // A purge waits for the spoke's teardown_node (TEARDOWN_FORWARD_TIMEOUT_SECS).
-        let forward_timeout = if purge_instance {
+        // A purge waits for the spoke's teardown_node (TEARDOWN_FORWARD_TIMEOUT_SECS), and a retire
+        // for the spoke's timer purge and ILK mark within the same window.
+        let forward_timeout = if removes_instance {
             Duration::from_secs(TEARDOWN_FORWARD_TIMEOUT_SECS)
         } else {
             system_forward_timeout()
@@ -31376,7 +31443,7 @@ async fn kill_node_flow(
         ServiceActivity::Inactive => {
             // A stop of a node that is down right now still lasts. "Down" includes a node waiting
             // for systemd's next automatic restart (a crash loop): the stop cancels that too.
-            if !purge_instance
+            if !removes_instance
                 && node_effective_config_path(state, node_name_ref).is_ok_and(|path| path.is_file())
             {
                 if let Err(err) = execute_on_hive(state, &target_hive, &cmd, "kill_node") {
@@ -31388,6 +31455,7 @@ async fn kill_node_flow(
                         "node_name": validated_node_name,
                         "unit": unit,
                         "purge_instance": purge_instance,
+                        "retire_instance": retire_instance,
                     });
                 }
                 let relaunch_on_boot = clear_relaunch_on_boot(state, node_name_ref);
@@ -31399,11 +31467,13 @@ async fn kill_node_flow(
                     "node_name": validated_node_name,
                     "unit": unit,
                     "purge_instance": purge_instance,
+                    "retire_instance": retire_instance,
                     "unit_was_active": false,
                     "relaunch_on_boot": relaunch_on_boot,
                 });
             }
-            if !should_purge_inactive_kill_target(purge_instance, validated_node_name.as_deref()) {
+            if !should_purge_inactive_kill_target(removes_instance, validated_node_name.as_deref())
+            {
                 return serde_json::json!({
                     "status": "not_found",
                     "state": "not_found",
@@ -31414,6 +31484,7 @@ async fn kill_node_flow(
                     "signal": signal,
                     "force": force,
                     "purge_instance": purge_instance,
+                    "retire_instance": retire_instance,
                 });
             }
             false
@@ -31429,6 +31500,7 @@ async fn kill_node_flow(
                 "node_name": validated_node_name,
                 "unit": unit,
                 "purge_instance": purge_instance,
+                "retire_instance": retire_instance,
             });
         }
     };
@@ -31436,9 +31508,9 @@ async fn kill_node_flow(
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => {
             // A stop lasts: the relaunches leave the node down until it is started again. A purge
-            // records it too, before its first step, so one that stops partway (SY.timer down)
-            // leaves the node stopped with its files, not relaunched by the next reconcile
-            // (FINDINGS A-121).
+            // or a retire records it too, before its first step, so one that stops partway
+            // (SY.timer down) leaves the node stopped with its files, not relaunched by the next
+            // reconcile (FINDINGS A-121).
             let relaunch_on_boot = clear_relaunch_on_boot(state, node_name_ref);
             let mut response = serde_json::json!({
                 "status": "ok",
@@ -31449,14 +31521,15 @@ async fn kill_node_flow(
                 "signal": signal.clone(),
                 "force": force,
                 "purge_instance": purge_instance,
+                "retire_instance": retire_instance,
                 "unit_was_active": unit_was_active,
                 "pre_stop_state": if unit_was_active { "active" } else { "inactive_or_not_found" },
             });
-            if !purge_instance {
+            if !removes_instance {
                 response["state"] = serde_json::json!("stopped");
                 response["relaunch_on_boot"] = serde_json::json!(relaunch_on_boot);
             }
-            if purge_instance {
+            if removes_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
                     let (persisted_ilk_id, _persisted_tenant_id) =
                         load_persisted_node_identity(state, node_name);
@@ -31474,6 +31547,7 @@ async fn kill_node_flow(
                             "signal": signal,
                             "force": force,
                             "purge_instance": purge_instance,
+                            "retire_instance": retire_instance,
                             "timer_purge": timer_purge,
                             "relaunch_on_boot": relaunch_on_boot,
                         });
@@ -31500,6 +31574,7 @@ async fn kill_node_flow(
                                         "signal": signal,
                                         "force": force,
                                         "purge_instance": purge_instance,
+                                        "retire_instance": retire_instance,
                                         "timer_purge": timer_purge,
                                         "instance_purged": true,
                                         "removed_path": removed_path.display().to_string(),
@@ -31508,11 +31583,12 @@ async fn kill_node_flow(
                                     });
                                 }
                             }
-                            append_optional_teardown_cleanup(
+                            append_removed_node_identity(
                                 state,
                                 &mut response,
                                 node_name,
                                 persisted_ilk_id.as_deref(),
+                                retire_instance,
                             )
                             .await;
                         }
@@ -31536,6 +31612,7 @@ async fn kill_node_flow(
                                             "signal": signal,
                                             "force": force,
                                             "purge_instance": purge_instance,
+                                            "retire_instance": retire_instance,
                                             "timer_purge": timer_purge,
                                             "instance_purged": false,
                                             "purge_status": "instance_not_found",
@@ -31543,11 +31620,12 @@ async fn kill_node_flow(
                                         });
                                     }
                                 }
-                                append_optional_teardown_cleanup(
+                                append_removed_node_identity(
                                     state,
                                     &mut response,
                                     node_name,
                                     persisted_ilk_id.as_deref(),
+                                    retire_instance,
                                 )
                                 .await;
                             } else {
@@ -31561,6 +31639,7 @@ async fn kill_node_flow(
                                     "signal": signal,
                                     "force": force,
                                     "purge_instance": purge_instance,
+                                    "retire_instance": retire_instance,
                                     "relaunch_on_boot": relaunch_on_boot,
                                 });
                             }
@@ -31578,12 +31657,15 @@ async fn kill_node_flow(
             "node_name": validated_node_name,
             "unit": unit,
             "purge_instance": purge_instance,
+            "retire_instance": retire_instance,
         }),
     }
 }
 
-fn should_purge_inactive_kill_target(purge_instance: bool, node_name: Option<&str>) -> bool {
-    purge_instance
+/// Whether a kill of a node whose unit does not run still removes its instance: a purge or a
+/// retire (`removes_instance`) of a named node.
+fn should_purge_inactive_kill_target(removes_instance: bool, node_name: Option<&str>) -> bool {
+    removes_instance
         && node_name
             .map(|name| !name.trim().is_empty())
             .unwrap_or(false)
@@ -32306,9 +32388,239 @@ async fn append_optional_teardown_cleanup(
             "errors": [],
         });
     }
+    append_routing_references(state, response, node_name);
+}
+
+/// The routes, VPNs and taps that still name a node its removal took away: a purge and a retire
+/// leave them, and say so.
+fn append_routing_references(
+    state: &OrchestratorState,
+    response: &mut serde_json::Value,
+    node_name: &str,
+) {
     response["routing_references"] =
         serde_json::to_value(enumerate_routing_references_to(state, node_name))
             .unwrap_or_else(|_| serde_json::json!({ "routes": [], "vpns": [], "taps": [] }));
+}
+
+/// Why `kill_node` refuses a request before it stops anything (docs/digital-executive-v1-stage-2.md
+/// §9): `purge_instance` and `retire_instance` are two ends of a node's identity, its teardown or
+/// its mark, and one request takes only one.
+fn kill_node_removal_conflict(purge_instance: bool, retire_instance: bool) -> Option<&'static str> {
+    (purge_instance && retire_instance).then_some(
+        "purge_instance and retire_instance are exclusive: a purge tears the node's identity and \
+         secrets down, a retire marks its ILK and keeps them; ask for one",
+    )
+}
+
+/// What a removal does in the stores once the node's files are gone: a purge's `teardown_node`
+/// (`append_optional_teardown_cleanup`), or a retire's mark of the node's ILK
+/// (`append_retire_identity_mark`).
+async fn append_removed_node_identity(
+    state: &OrchestratorState,
+    response: &mut serde_json::Value,
+    node_name: &str,
+    ilk_id: Option<&str>,
+    retire_instance: bool,
+) {
+    if retire_instance {
+        append_retire_identity_mark(state, response, node_name, ilk_id).await;
+    } else {
+        append_optional_teardown_cleanup(state, response, node_name, ilk_id).await;
+    }
+}
+
+/// docs/digital-executive-v1-stage-2.md §9: a retire's request to identity, in place of a purge's
+/// `teardown_node`: one `ILK_DELETE {ilk_id}` to the primary's SY.identity, which marks the ILK
+/// (reversible: hidden, its keys and the node's name held until a purge) and purges nothing.
+/// SY.identity takes ILK_DELETE from an orchestrator for its own hive's nodes, and marks with its
+/// own reason: the request names none, since ILK_DELETE takes `ilk_id`, `tenant_id` and
+/// `ilk_type` only. SY.vault is not asked: the secrets dedicated to the ILK stay with it.
+fn retire_mark_request(ilk_id: &str) -> (String, &'static str, serde_json::Value) {
+    (
+        ensure_l2_name("SY.identity", PRIMARY_HIVE_ID),
+        MSG_ILK_DELETE,
+        serde_json::json!({ "ilk_id": ilk_id }),
+    )
+}
+
+#[cfg(not(test))]
+async fn retire_mark_node_ilk(
+    state: &OrchestratorState,
+    ilk_id: &str,
+) -> Result<serde_json::Value, IdentityError> {
+    let (target, request_msg, payload) = retire_mark_request(ilk_id);
+    orchestrator_identity_system_call_ok(
+        state,
+        &target,
+        request_msg,
+        payload,
+        system_forward_timeout(),
+    )
+    .await
+}
+
+/// The test seam: the answer a test set (`set_test_retire_mark_answer`), else SY.identity's mark.
+#[cfg(test)]
+async fn retire_mark_node_ilk(
+    _state: &OrchestratorState,
+    ilk_id: &str,
+) -> Result<serde_json::Value, IdentityError> {
+    if let Some(canned) = test_retire_mark_slot()
+        .lock()
+        .expect("test retire mark lock")
+        .take()
+    {
+        return canned;
+    }
+    Ok(serde_json::json!({
+        "status": "ok",
+        "ilk_id": ilk_id,
+        "state": "deleted",
+        "already_deleted": false,
+    }))
+}
+
+#[cfg(test)]
+type TestRetireMarkAnswer = Result<serde_json::Value, IdentityError>;
+
+#[cfg(test)]
+fn test_retire_mark_slot() -> &'static StdMutex<Option<TestRetireMarkAnswer>> {
+    static SLOT: OnceLock<StdMutex<Option<TestRetireMarkAnswer>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_test_retire_mark_answer(answer: TestRetireMarkAnswer) {
+    *test_retire_mark_slot()
+        .lock()
+        .expect("test retire mark lock") = Some(answer);
+}
+
+/// What a retire reports of its ILK's mark.
+#[derive(Debug)]
+struct RetireMarkReport {
+    /// `None` when the outcome is unknown.
+    ilk_retired: Option<bool>,
+    /// The step, with its target and ILK.
+    step: serde_json::Value,
+    /// Set when the step is not `ok`: the ILK may stay unmarked.
+    error: Option<String>,
+}
+
+/// A retire's mark as its answer reports it. An error never reads as ok:
+/// - SY.identity's ok: marked, `already_deleted` when it was marked before;
+/// - `ILK_NOT_FOUND`: SY.identity holds no such ILK (purged before), so there is nothing to mark;
+/// - no answer (a timeout, a lost channel, an answer that could not be read): unknown, since
+///   SY.identity may still have marked it;
+/// - any other refusal, or a request that never left: an error with its code, nothing marked.
+fn retire_mark_report(
+    ilk_id: &str,
+    result: &Result<serde_json::Value, IdentityError>,
+) -> RetireMarkReport {
+    let (target, _, _) = retire_mark_request(ilk_id);
+    let err = match result {
+        Ok(payload) => {
+            return RetireMarkReport {
+                ilk_retired: Some(true),
+                step: serde_json::json!({
+                    "status": "ok",
+                    "target": target,
+                    "ilk_id": ilk_id,
+                    "already_deleted": payload
+                        .get("already_deleted")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                }),
+                error: None,
+            };
+        }
+        Err(err) => err,
+    };
+    let (error_code, message) = identity_error_code_and_message(err);
+    if matches!(err, IdentityError::SystemRejected { .. }) && error_code == "ILK_NOT_FOUND" {
+        return RetireMarkReport {
+            ilk_retired: Some(false),
+            step: serde_json::json!({
+                "status": "ok",
+                "target": target,
+                "ilk_id": ilk_id,
+                "not_found": true,
+            }),
+            error: None,
+        };
+    }
+    let unknown = matches!(
+        err,
+        IdentityError::ActionTimeout { .. }
+            | IdentityError::Timeout { .. }
+            | IdentityError::InvalidResponse(_)
+            | IdentityError::Node(_)
+            | IdentityError::Json(_)
+    );
+    let (ilk_retired, status, error) = if unknown {
+        (
+            None,
+            "unknown",
+            format!(
+                "{error_code}: SY.identity gave no answer, so whether {ilk_id} is marked is \
+                 unknown; read it (get_ilk) and mark it with delete_ilk if it is not: {message}"
+            ),
+        )
+    } else {
+        (
+            Some(false),
+            "error",
+            format!("{error_code}: {ilk_id} was not marked: {message}"),
+        )
+    };
+    RetireMarkReport {
+        ilk_retired,
+        step: serde_json::json!({
+            "status": status,
+            "target": target,
+            "ilk_id": ilk_id,
+            "error_code": error_code,
+            "error_detail": message,
+        }),
+        error: Some(error),
+    }
+}
+
+/// docs/digital-executive-v1-stage-2.md §9: the retire's step in the stores. The node's ILK is
+/// marked (`retire_mark_node_ilk`) and never purged, so it keeps holding the node's name, and a
+/// recreate takes it back (`restore_ilk`, then `run_node` with its `ilk_id`); its secrets are not
+/// touched. The answer says so in `ilk_retired`, `ilk_retire` (with `ilk_retire_error` when that
+/// step is not `ok`) and `vault_secrets_kept`.
+async fn append_retire_identity_mark(
+    state: &OrchestratorState,
+    response: &mut serde_json::Value,
+    node_name: &str,
+    ilk_id: Option<&str>,
+) {
+    if let Some(ilk_id) = ilk_id {
+        let result = retire_mark_node_ilk(state, ilk_id).await;
+        let report = retire_mark_report(ilk_id, &result);
+        if let Some(error) = &report.error {
+            tracing::warn!(
+                node_name = %node_name,
+                ilk_id = %ilk_id,
+                error = %error,
+                "node retire left its ILK unmarked, or its mark unknown"
+            );
+            response["ilk_retire_error"] = serde_json::json!(error);
+        }
+        response["ilk_retired"] = serde_json::json!(report.ilk_retired);
+        response["ilk_retire"] = report.step;
+    } else {
+        response["ilk_retired"] = serde_json::json!(false);
+        response["ilk_retire"] = serde_json::json!({
+            "status": "skipped",
+            "reason": "the identity map records no ILK for this node",
+        });
+    }
+    response["vault_secrets_kept"] = serde_json::json!(true);
+    append_routing_references(state, response, node_name);
 }
 
 async fn purge_owner_timers_before_teardown(
@@ -47625,11 +47937,12 @@ mod tests {
             .expect("motherbee must declare the vendor folder");
         assert!(vendor_folder.contains(INGRESS_DEVICE_ID));
 
-        // Runtimes and agent assets: NOT attached, and not even declared for an ingress-only
-        // link.
+        // Runtimes, agent assets and the people's documents: NOT attached, and not even declared
+        // for an ingress-only link.
         for worker_only in [
             SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
             SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID,
+            SYNCTHING_FOLDER_DIST_PEOPLE_ID,
         ] {
             if let Some(folder) = folder_block(&mother, worker_only) {
                 assert!(
@@ -47661,6 +47974,7 @@ mod tests {
         assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_ID)));
         assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_RUNTIMES_ID)));
         assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID)));
+        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_PEOPLE_ID)));
         // Its core folder maps onto the plain `dist/core` path its own code reads.
         assert!(ingress.contains(&format!("id=\"{core_id}\"")));
         assert!(ingress.contains("path=\"/var/lib/fluxbee/dist/core\""));
@@ -47916,6 +48230,7 @@ mod tests {
             ("fluxbee-blob-public", [true, false, true]),
             ("fluxbee-dist-runtimes", [false, true, true]),
             ("fluxbee-dist-agent-assets", [false, true, true]),
+            ("fluxbee-dist-people", [false, true, true]),
             ("fluxbee-dist-core-worker", [false, true, true]),
             ("fluxbee-dist-core-ingress", [true, false, true]),
             ("fluxbee-dist-core-egress", [true, true, false]),
@@ -48011,6 +48326,7 @@ mod tests {
                             "fluxbee-dist-agent-assets",
                             "fluxbee-dist-core-worker",
                             "fluxbee-dist-installation",
+                            "fluxbee-dist-people",
                             "fluxbee-dist-policy",
                             "fluxbee-dist-runtimes",
                             "fluxbee-dist-vendor",
@@ -51257,10 +51573,16 @@ blob:
                 "{} runs no agent",
                 role.as_str()
             );
+            assert!(
+                !ids.contains(&SYNCTHING_FOLDER_DIST_PEOPLE_ID.to_string()),
+                "{} runs no agent to read the people's documents",
+                role.as_str()
+            );
         }
         // The worker does get it — it is the ONLY delivery path for published packages
         // (there is no sync_runtime_to_worker SSH push) — and the agent assets its agents read
-        // (FINDINGS A-72), from blob/agent-assets on both ends.
+        // (FINDINGS A-72), from blob/agent-assets on both ends, and the people's documents, from
+        // blob/people (docs/digital-executive-v1-stage-2.md §1.2).
         for is_motherbee in [true, false] {
             let worker =
                 dist_sync_folders_for_role(&dist, &blob_root, HiveRole::Worker, is_motherbee);
@@ -51273,6 +51595,13 @@ blob:
                 .collect();
             assert_eq!(assets.len(), 1);
             assert_eq!(assets[0].path, blob_root.join("agent-assets"));
+            let people: Vec<&DistSyncFolder> = worker
+                .iter()
+                .filter(|f| f.id == SYNCTHING_FOLDER_DIST_PEOPLE_ID)
+                .collect();
+            assert_eq!(people.len(), 1);
+            assert_eq!(people[0].path, blob_root.join("people"));
+            assert_eq!(people[0].label, "Fluxbee Dist People");
         }
     }
 
@@ -51356,7 +51685,8 @@ blob:
 
     /// FINDINGS A-72: a worker that joined before the agent-assets folder existed gets it with
     /// its next core update, on both ends, shared with the peers it already shares runtimes with;
-    /// a peer without runtimes (the ingress) never gets it.
+    /// a peer without runtimes (the ingress) never gets it. The people's documents' folder, its
+    /// sibling (docs/digital-executive-v1-stage-2.md §1.2), reaches them the same way.
     #[test]
     fn agent_assets_reach_the_workers_that_joined_before_them() {
         const INGRESS: &str = "INGRESS-DEVICE-ID-1234567890";
@@ -51388,17 +51718,29 @@ blob:
             let (updated, changed) =
                 reconcile_syncthing_folders_xml(&joined_before, &blob, &dist, is_motherbee, role)
                     .expect("folder reconcile must succeed");
-            assert!(changed.contains(&SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID.to_string()));
-            assert!(updated.contains(&format!(
-                "<folder id=\"{SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID}\" label=\"Fluxbee Dist Agent Assets\" path=\"/var/lib/fluxbee/blob/agent-assets\" type=\"{}\"",
-                dist_syncthing_folder_type(is_motherbee)
-            )));
-            assert_eq!(
-                syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID)
-                    .unwrap(),
-                vec![LOCAL_DEVICE_ID.to_string(), PEER_DEVICE_ID.to_string()],
-                "motherbee side: {is_motherbee}"
-            );
+            for (folder_id, label, path) in [
+                (
+                    SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID,
+                    "Fluxbee Dist Agent Assets",
+                    "/var/lib/fluxbee/blob/agent-assets",
+                ),
+                (
+                    SYNCTHING_FOLDER_DIST_PEOPLE_ID,
+                    "Fluxbee Dist People",
+                    "/var/lib/fluxbee/blob/people",
+                ),
+            ] {
+                assert!(changed.contains(&folder_id.to_string()), "{folder_id}");
+                assert!(updated.contains(&format!(
+                    "<folder id=\"{folder_id}\" label=\"{label}\" path=\"{path}\" type=\"{}\"",
+                    dist_syncthing_folder_type(is_motherbee)
+                )));
+                assert_eq!(
+                    syncthing_folder_device_ids(&updated, folder_id).unwrap(),
+                    vec![LOCAL_DEVICE_ID.to_string(), PEER_DEVICE_ID.to_string()],
+                    "{folder_id}, motherbee side: {is_motherbee}"
+                );
+            }
             let (again, changed_again) =
                 reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
                     .expect("second reconcile must succeed");
@@ -51415,6 +51757,7 @@ blob:
         assert!(!ingress.contains(&format!(
             "<folder id=\"{SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID}\""
         )));
+        assert!(!ingress.contains(&format!("<folder id=\"{SYNCTHING_FOLDER_DIST_PEOPLE_ID}\"")));
     }
 
     // --- Stage 5 (docs/hive-config-update-v1.md §8): the blob folders' members, and A-188 ---
@@ -56464,6 +56807,7 @@ blob:
         assert!(ids.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
         assert!(ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
         assert!(ids.contains(&SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID.to_string()));
+        assert!(ids.contains(&SYNCTHING_FOLDER_DIST_PEOPLE_ID.to_string()));
     }
 
     /// The shared id (vendor) is declared ONCE even though all three roles use it.
@@ -56520,6 +56864,12 @@ blob:
                 ids.contains(&SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID.to_string()),
                 wants_runtimes,
                 "agent assets for {}",
+                role.as_str()
+            );
+            assert_eq!(
+                ids.contains(&SYNCTHING_FOLDER_DIST_PEOPLE_ID.to_string()),
+                wants_runtimes,
+                "the people's documents for {}",
                 role.as_str()
             );
         }
@@ -59416,14 +59766,31 @@ blob:
     }
 
     /// The motherbee takes blob/agent-assets back, as it does the other blob trees, only where hard
-    /// links to another user's files are protected.
+    /// links to another user's files are protected, and blob/people the same way: both trees go
+    /// through the one pass.
     #[test]
     fn the_motherbee_takes_agent_assets_back_only_where_hard_links_are_protected() {
         let src = include_str!("sy_orchestrator.rs");
         let start = src.find("fn ensure_dirs(").expect("ensure_dirs");
         let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
-        assert!(
-            body.contains("HiveRole::Motherbee if can_take_back => Some(ensure_root_owned_tree(")
+        let compact: String = body.split_whitespace().collect();
+        assert!(compact.contains(
+            "HiveRole::Motherbeeifcan_take_back=>{Some(ensure_root_owned_tree(&tree,SYNCTHING_SERVICE_USER))}"
+        ));
+        let pass = &body[body
+            .find("for (tree, alert) in [")
+            .expect("the trees' pass")..];
+        let pass = &pass[..pass.find("] {").expect("its list")];
+        for tree in [
+            "agent_assets_folder_path(&blob.path)",
+            "people_folder_path(&blob.path)",
+            "\"people_owner_not_set\"",
+        ] {
+            assert!(pass.contains(tree), "{tree}");
+        }
+        assert_eq!(
+            people_folder_path(Path::new("/var/lib/fluxbee/blob")),
+            PathBuf::from("/var/lib/fluxbee/blob/people")
         );
     }
 
@@ -63499,6 +63866,318 @@ blob:
         assert_eq!(summary.taps[0].match_dst, "AI.demo@motherbee");
         assert_eq!(summary.taps[1].match_src, "AI.demo@motherbee");
         assert_eq!(summary.taps[2].target, "AI.demo@motherbee");
+    }
+
+    /// docs/digital-executive-v1-stage-2.md §9: `kill_node` takes `purge_instance` or
+    /// `retire_instance`, never both: such a request is refused before anything is stopped,
+    /// locally and before a forward, and names both fields.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_takes_a_purge_or_a_retire_never_both() {
+        assert!(kill_node_removal_conflict(true, true).is_some());
+        for (purge, retire) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                kill_node_removal_conflict(purge, retire),
+                None,
+                "{purge} {retire}"
+            );
+        }
+        let state = sample_orchestrator_state_for_tests();
+        for node_name in ["AI.ghost@motherbee", "AI.ghost@workerbee"] {
+            let kill = kill_node_flow(
+                &state,
+                &serde_json::json!({
+                    "node_name": node_name,
+                    "purge_instance": true,
+                    "retire_instance": true,
+                }),
+            )
+            .await;
+            assert_eq!(kill["status"], "error", "{kill}");
+            assert_eq!(kill["error_code"], "INVALID_REQUEST", "{kill}");
+            assert_eq!(kill["purge_instance"], true, "{kill}");
+            assert_eq!(kill["retire_instance"], true, "{kill}");
+            assert!(
+                kill["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("exclusive")),
+                "{kill}"
+            );
+        }
+    }
+
+    /// A retire on another hive goes there with `retire_instance`, and the refusal of both never
+    /// leaves this hive.
+    #[tokio::test]
+    async fn a_retire_is_forwarded_to_the_nodes_hive() {
+        let mut harness = admin_worker_for_tests().await;
+        harness
+            .inject(test_admin_command(
+                "retire-forwarded",
+                "kill_node",
+                serde_json::json!({
+                    "target": "workerbee",
+                    "node_name": "AI.ed@workerbee",
+                    "retire_instance": true,
+                }),
+            ))
+            .await
+            .expect("inject kill_node");
+        let kill = next_outgoing_now(&mut harness, "KILL_NODE forwarded").await;
+        assert_eq!(kill.meta.msg.as_deref(), Some("KILL_NODE"));
+        assert_eq!(kill.payload["node_name"], "AI.ed@workerbee");
+        assert_eq!(kill.payload["retire_instance"], true);
+        assert_eq!(kill.payload["purge_instance"], false);
+        harness
+            .inject(test_response_for(
+                &kill,
+                SYSTEM_KIND,
+                "KILL_NODE_RESPONSE",
+                serde_json::json!({ "status": "ok", "node_name": "AI.ed@workerbee", "retire_instance": true }),
+            ))
+            .await
+            .expect("inject the kill's answer");
+        let retired = next_outgoing_now(&mut harness, "kill_node answered").await;
+        assert_eq!(retired.meta.action.as_deref(), Some("kill_node"));
+        assert_eq!(
+            retired.payload["retire_instance"], true,
+            "{}",
+            retired.payload
+        );
+
+        harness
+            .inject(test_admin_command(
+                "retire-and-purge",
+                "kill_node",
+                serde_json::json!({
+                    "target": "workerbee",
+                    "node_name": "AI.ed@workerbee",
+                    "retire_instance": true,
+                    "purge_instance": true,
+                }),
+            ))
+            .await
+            .expect("inject kill_node");
+        let refused = next_outgoing_now(&mut harness, "kill_node refused").await;
+        assert_eq!(refused.meta.action.as_deref(), Some("kill_node"));
+        assert_eq!(
+            refused.payload["error_code"], "INVALID_REQUEST",
+            "{}",
+            refused.payload
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// A retire is a purge on the hive (the stop, the timer purge, the instance's directory, its
+    /// uuid file and its map entry, each kept where a purge has it), and then, in place of the
+    /// purge's `teardown_node`, the retire's mark of the ILK; the stop that lasts and the inactive
+    /// node's removal read either removal alike. The source is read: a test cannot run systemctl.
+    #[test]
+    fn a_retire_takes_the_purges_steps_on_the_hive_and_marks_its_ilk() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body_of = |name: &str| {
+            let start = src.find(name).expect(name);
+            &src[start..start + src[start..].find("\n}\n").expect("its end")]
+        };
+        let kill = body_of("async fn kill_node_flow(");
+        let conflict = kill
+            .find("kill_node_removal_conflict(purge_instance, retire_instance)")
+            .expect("the refusal of both");
+        assert!(conflict < kill.find("state.lock_node(").expect("the lock"));
+        assert!(
+            conflict
+                < kill
+                    .find("forward_system_action_to_hive")
+                    .expect("the forward")
+        );
+        assert!(kill.contains("\"retire_instance\".to_string(),"));
+        assert!(kill.contains("let forward_timeout = if removes_instance {"));
+        assert!(kill.contains("if !removes_instance\n"));
+        assert!(kill.contains("should_purge_inactive_kill_target(removes_instance,"));
+        let removal = &kill[kill.find("if removes_instance {").expect("the removal")..];
+        let mut at = 0;
+        for step in [
+            "load_persisted_node_identity(",
+            "purge_owner_timers_before_teardown(",
+            "remove_node_instance_dir_with_root(",
+            "purge_node_uuid_file(",
+            "remove_node_ilk_mapping(",
+            "append_removed_node_identity(",
+        ] {
+            let found = removal[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} after the step before"));
+            at += found + step.len();
+        }
+        // Both ways a removal ends name the request's retire; the purge's teardown is never called
+        // here directly.
+        let calls: Vec<usize> = kill
+            .match_indices("append_removed_node_identity(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for at in calls {
+            let call = &kill[at..at + kill[at..].find(".await").expect("its await")];
+            assert!(call.contains("retire_instance"), "{call}");
+        }
+        assert!(!kill.contains("append_optional_teardown_cleanup("));
+        let dispatch = body_of("async fn append_removed_node_identity(");
+        assert!(dispatch.contains("if retire_instance {"));
+        assert!(dispatch.contains("append_retire_identity_mark("));
+        assert!(dispatch.contains("append_optional_teardown_cleanup("));
+    }
+
+    /// What identity receives for a retire: one ILK_DELETE {ilk_id} to the primary's SY.identity,
+    /// which marks the ILK; never ILK_PURGE, never SY.admin's teardown_node, never SY.vault.
+    #[test]
+    fn a_retire_sends_identity_one_ilk_delete() {
+        let ilk = "ilk:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let (target, msg, payload) = retire_mark_request(ilk);
+        assert_eq!(target, "SY.identity@motherbee");
+        assert_eq!(msg, "ILK_DELETE");
+        assert_eq!(payload, serde_json::json!({ "ilk_id": ilk }));
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("#[cfg(not(test))]\nasync fn retire_mark_node_ilk(")
+            .expect("retire_mark_node_ilk");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        assert!(body.contains("retire_mark_request(ilk_id)"));
+        assert_eq!(
+            body.matches("orchestrator_identity_system_call_ok(")
+                .count(),
+            1
+        );
+        for never in ["MSG_ILK_PURGE", "teardown_node", "send_admin_rpc", "VAULT"] {
+            assert!(!body.contains(never), "{never}");
+        }
+    }
+
+    /// The retire's answer: the mark, the secrets kept and the routing references, and none of a
+    /// purge's teardown fields. Each outcome of the mark reads as itself: marked; already gone
+    /// (ILK_NOT_FOUND), nothing to mark; no answer, unknown; a refusal, an error with its code;
+    /// no ILK recorded, skipped.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retire_reports_its_mark_and_keeps_the_secrets() {
+        let _guard = teardown_test_serial_guard();
+        let state = sample_orchestrator_state_for_tests();
+        let ilk = "ilk:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let node = "AI.ed@worker1";
+
+        let mut response = serde_json::json!({ "status": "ok" });
+        append_removed_node_identity(&state, &mut response, node, Some(ilk), true).await;
+        assert_eq!(response["ilk_retired"], true, "{response}");
+        assert_eq!(response["ilk_retire"]["status"], "ok");
+        assert_eq!(response["ilk_retire"]["target"], "SY.identity@motherbee");
+        assert_eq!(response["ilk_retire"]["ilk_id"], ilk);
+        assert_eq!(response["ilk_retire"]["already_deleted"], false);
+        assert_eq!(response["vault_secrets_kept"], true);
+        assert!(response["routing_references"].is_object(), "{response}");
+        for purge_only in [
+            "ilk_deleted",
+            "ilk_delete",
+            "ilk_delete_error",
+            "vault_secrets_purged",
+            "ilk_retire_error",
+        ] {
+            assert!(
+                response.get(purge_only).is_none(),
+                "{purge_only}: {response}"
+            );
+        }
+
+        // The same call without the retire is the purge's teardown, through SY.admin.
+        let mut purged = serde_json::json!({ "status": "ok" });
+        append_removed_node_identity(&state, &mut purged, node, Some(ilk), false).await;
+        assert_eq!(
+            purged["ilk_delete"]["target"], "SY.admin@motherbee",
+            "{purged}"
+        );
+        assert!(purged.get("ilk_retire").is_none(), "{purged}");
+
+        let rejected = |code: &str| IdentityError::SystemRejected {
+            action: MSG_ILK_DELETE.to_string(),
+            error_code: code.to_string(),
+            message: format!("{code} from identity"),
+        };
+        let cases: Vec<(TestRetireMarkAnswer, serde_json::Value, &str, bool)> = vec![
+            (
+                Ok(serde_json::json!({ "status": "ok", "ilk_id": ilk, "already_deleted": true })),
+                serde_json::json!(true),
+                "ok",
+                false,
+            ),
+            (
+                Err(rejected("ILK_NOT_FOUND")),
+                serde_json::json!(false),
+                "ok",
+                false,
+            ),
+            (
+                Err(IdentityError::ActionTimeout {
+                    action: MSG_ILK_DELETE.to_string(),
+                    trace_id: "retire-trace".to_string(),
+                    target: "SY.identity@motherbee".to_string(),
+                    timeout_ms: 45_000,
+                }),
+                serde_json::Value::Null,
+                "unknown",
+                true,
+            ),
+            (
+                Err(rejected("UNAUTHORIZED")),
+                serde_json::json!(false),
+                "error",
+                true,
+            ),
+            (
+                Err(IdentityError::Unreachable {
+                    reason: "no route".to_string(),
+                    original_dst: "SY.identity@motherbee".to_string(),
+                }),
+                serde_json::json!(false),
+                "error",
+                true,
+            ),
+        ];
+        for (answer, retired, status, has_error) in cases {
+            set_test_retire_mark_answer(answer);
+            let mut response = serde_json::json!({ "status": "ok" });
+            append_retire_identity_mark(&state, &mut response, node, Some(ilk)).await;
+            assert_eq!(response["ilk_retired"], retired, "{response}");
+            assert_eq!(response["ilk_retire"]["status"], status, "{response}");
+            assert_eq!(
+                response.get("ilk_retire_error").is_some(),
+                has_error,
+                "{response}"
+            );
+            assert_eq!(response["vault_secrets_kept"], true, "{response}");
+        }
+        let mut response = serde_json::json!({ "status": "ok" });
+        set_test_retire_mark_answer(Err(rejected("ILK_NOT_FOUND")));
+        append_retire_identity_mark(&state, &mut response, node, Some(ilk)).await;
+        assert_eq!(response["ilk_retire"]["not_found"], true, "{response}");
+        set_test_retire_mark_answer(Err(rejected("UNAUTHORIZED")));
+        append_retire_identity_mark(&state, &mut response, node, Some(ilk)).await;
+        assert_eq!(
+            response["ilk_retire"]["error_code"], "UNAUTHORIZED",
+            "{response}"
+        );
+        assert!(
+            response["ilk_retire_error"]
+                .as_str()
+                .is_some_and(|error| error.contains(ilk) && error.contains("not marked")),
+            "{response}"
+        );
+
+        // No ILK recorded for the node: nothing to mark, and nothing asked.
+        let mut response = serde_json::json!({ "status": "ok" });
+        append_retire_identity_mark(&state, &mut response, node, None).await;
+        assert_eq!(response["ilk_retired"], false, "{response}");
+        assert_eq!(response["ilk_retire"]["status"], "skipped", "{response}");
+        assert_eq!(response["vault_secrets_kept"], true, "{response}");
     }
 
     /// docs/control-path-hardening-v1.md §2: the teardown reports `teardown_node`'s steps in its

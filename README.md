@@ -568,8 +568,9 @@ calls use `/hives/motherbee/...`.
   its own database name.
 - **SY.vault:** `/var/lib/fluxbee/vault.db`, values encrypted under
   `/etc/fluxbee/vault.master.key`.
-- **Blobs:** `/var/lib/fluxbee/blob/`. `active/` is synced with the workers; `agent-assets/` is
-  not.
+- **Blobs:** `/var/lib/fluxbee/blob/`. `active/` is synced with the workers. So are
+  `agent-assets/` and `people/` (the people's documents), each in a dist folder the motherbee
+  sends (`fluxbee-dist-agent-assets`, `fluxbee-dist-people`), outside `read_blob` and the blob GC.
 
 ---
 

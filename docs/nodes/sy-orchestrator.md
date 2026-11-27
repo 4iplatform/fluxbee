@@ -208,7 +208,9 @@ shows those nodes the same way, with `managed: false`.
    `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh` (`runtime_start_script`).
    A node whose config already exists is refused (`NODE_ALREADY_EXISTS`).
 5. The node gets an ILK: `ILK_REGISTER` to `SY.identity@motherbee` with `ilk_type: "agent"` and
-   the node's tenant (`ensure_node_identity_registered`). The tenant is the one the request names,
+   the node's tenant (`ensure_node_identity_registered`). The ILK is the request's `ilk_id` when it
+   names one, canonical, else a new one (`resolve_node_ilk_id`): a retired node is recreated on its
+   ILK this way, once `restore_ilk` has undone its mark. The tenant is the one the request names,
    `tenant_id`, else `config.tenant_id` (`resolve_tenant_id_for_node`); there is no default. A
    spawn that names none is refused with `IDENTITY_REGISTER_FAILED`, and its message names both
    fields (FINDINGS A-213).
@@ -306,6 +308,27 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   (`TEARDOWN_FORWARD_TIMEOUT_SECS`). The node's identity-map entry is already gone by then, so a
   retry of the purge does not find the ILK again: the answer's `ilk_delete.ilk_id` is what to clean
   up by hand.
+- **Retire** ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §9): `kill_node`
+  with `retire_instance: true` removes the node from its hive and keeps its identity. It is
+  exclusive with `purge_instance`: a request with both is refused, `INVALID_REQUEST`, before
+  anything is stopped or forwarded (`kill_node_removal_conflict`). On the hive it does what a purge
+  does, in the same order and with the same answers for each step: the stop (a node already down
+  included), `relaunch_on_boot` cleared, the timer purge, the instance directory, its uuid file
+  and its identity-map entry. Then, in place of the purge's `teardown_node`, it sends one
+  `ILK_DELETE {ilk_id}` to `SY.identity@motherbee` (`retire_mark_request`, the system forward's
+  45 s), which marks the ILK: hidden, reversible, its keys and the node's name held, never purged.
+  SY.identity takes ILK_DELETE from an orchestrator for its own hive's nodes, and marks it with its
+  own reason (`direct`): ILK_DELETE takes no reason. SY.vault is not asked, so the secrets dedicated
+  to the ILK stay. The answer carries `retire_instance: true`, the purge's file fields,
+  `ilk_retired` (`true`, `false`, or `null` when the outcome is unknown), `ilk_retire` (`{status
+  ok|error|unknown|skipped, target, ilk_id}`, with `already_deleted`, `not_found`, or
+  `error_code` and `error_detail`), `ilk_retire_error` when that step is not `ok`,
+  `vault_secrets_kept: true` and `routing_references` (`retire_mark_report`). `ILK_NOT_FOUND` is an
+  `ok` step with nothing marked; no answer is `unknown`, and the error says to read the ILK and mark
+  it with `delete_ilk` if it is not. As for a purge, the identity-map entry is gone by then, so a
+  retry does not find the ILK again: `ilk_retire.ilk_id` names it. The motherbee forwards a retire
+  to the node's hive with `retire_instance` and waits as for a purge (150 s). A recreate that keeps
+  the ILK is `restore_ilk`, then `run_node` with that `ilk_id`.
 - **When systemctl does not answer** for the node's unit (FINDINGS A-271, since 0.1.133): run,
   start, restart, kill and remove ask again, up to 3 times 250 ms apart within a second
   (`NODE_ACTION_CHECK_LIMIT`). Still with no answer, none acts on it as "not running":
@@ -883,6 +906,7 @@ a restart on it would restart Syncthing at every call while `systemctl show` fai
 | `fluxbee-dist-installation` | `dist/installation`: the installation file ([The installation file](#the-installation-file)) | every spoke |
 | `fluxbee-dist-runtimes` | runtime packages | workers only |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets`: SY.architect's agent assets, which ai.generic reads from disk | workers only |
+| `fluxbee-dist-people` | `blob/people`: the people's documents, `person-<uuid>_<hash16>.json`, which SY.identity writes on the motherbee ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.2) | workers only |
 | `fluxbee-blob` | `blob/active` | workers only, as the release has it (`peer_shares_active_blob`), following `fluxbee-dist-runtimes`' members |
 | `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`), following `fluxbee-dist-core-ingress`' members |
 
@@ -893,18 +917,22 @@ writes them. `fluxbee-blob` is `sendreceive`.
 A folder added by a later release reaches the hives that joined before it at their next local
 reconcile, without a re-join (`reconcile_syncthing_folders_xml`): `fluxbee-dist-policy` and
 `fluxbee-dist-installation` are shared with every member of `fluxbee-dist-vendor`, and
-`fluxbee-dist-agent-assets` with every member of `fluxbee-dist-runtimes`. Since 0.1.127 the blob
+`fluxbee-dist-agent-assets` and `fluxbee-dist-people` with every member of
+`fluxbee-dist-runtimes`. Since 0.1.127 the blob
 folders follow the same way ([hive-config-update-v1](../hive-config-update-v1.md) §8, FINDINGS
 A-181): `fluxbee-blob` every member of `fluxbee-dist-runtimes`, and `fluxbee-blob-public` every
 member of `fluxbee-dist-core-ingress`, on the hives whose role declares them. A hive that joined
 while the blob sync was off gets them, and a device taken out of one by hand is back at the next
 reconcile: each start of the orchestrator, and a watchdog repair of an unhealthy folder. A join
 links a new spoke to each, and `remove_hive` takes it out of every `fluxbee-dist*` folder the
-config holds and out of both blob folders, whatever the blob's flags. The agent-assets tree is
-owned like a dist tree (`ensure_dirs`): root's on the motherbee, readable by the `fluxbee` group,
-and the `fluxbee` user's on a worker, where Syncthing writes what it receives (FINDINGS A-72).
-`blob/` itself is no folder, so a file written there and renamed into `blob/agent-assets` is never
-sent half-written.
+config holds and out of both blob folders, whatever the blob's flags. The agent-assets tree and
+the people tree, its sibling, are owned like a dist tree (`ensure_dirs`, one pass for both): root's
+on the motherbee, readable by the `fluxbee` group, and the `fluxbee` user's on a worker, where
+Syncthing writes what it receives (FINDINGS A-72). A tree whose owner was not set raises a drift
+alert, `agent_assets_owner_not_set` or `people_owner_not_set`. `blob/` itself is no folder, so a
+file written there and renamed into `blob/agent-assets` or `blob/people` is never sent
+half-written. Neither is a blob folder: `read_blob` and the blob GC (`blob/staging`,
+`blob/active`) do not reach them.
 
 ## The installation file
 
