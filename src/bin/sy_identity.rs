@@ -3218,6 +3218,10 @@ impl IdentityStore {
             })
             .map(|ilk| ilk.ilk_id.clone())
             .collect();
+        let incoming: Vec<IlkRecord> = incoming
+            .into_iter()
+            .map(|ilk| with_primary_work_relation(ilk, self))
+            .collect();
         let mut deltas = Vec::new();
         for ilk in incoming {
             // Never overwrite an ilk_id that already belongs to a different hive
@@ -3301,6 +3305,18 @@ fn ingest_ilk_type_authorized(ilk: &IlkRecord, publisher_hive: &str) -> bool {
 /// and the primary's record stands either way.
 fn ingest_virtual_flag_authorized(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
     incoming.is_virtual == existing.is_some_and(|existing| existing.is_virtual)
+}
+
+/// Whom an ILK works for is the primary's to change, by ILK_SET_WORKS_FOR alone
+/// (docs/digital-executive-v1-stage-2.md §1.1). A replica's push carries the relation as the replica
+/// last heard it, which can be older than the primary's: an ED's node lives on a worker, and its
+/// relation is set on the primary right after the node is born. So a replica-pushed record takes the
+/// primary's relation, or none for an ILK the primary does not hold yet, whatever it carries.
+fn with_primary_work_relation(mut incoming: IlkRecord, store: &IdentityStore) -> IlkRecord {
+    let existing = store.ilks.get(&incoming.ilk_id);
+    incoming.works_for = existing.and_then(|existing| existing.works_for.clone());
+    incoming.work_role = existing.and_then(|existing| existing.work_role.clone());
+    incoming
 }
 
 /// Per-hive authority: is `publisher_hive` allowed to push this delta? A replica
@@ -7165,6 +7181,12 @@ fn ingest_replica_frame(
             delta,
         } => {
             if delta_authorized_for_hive(&delta, &publisher_hive, store) {
+                let delta = match delta {
+                    IdentityDelta::IlkUpsert { ilk } => IdentityDelta::IlkUpsert {
+                        ilk: with_primary_work_relation(ilk, store),
+                    },
+                    other => other,
+                };
                 store.apply_delta(delta.clone());
                 vec![delta]
             } else {
@@ -11693,6 +11715,41 @@ mod tests {
         assert!(
             store.ilks.contains_key(&t_ilk("sys")),
             "apply_delta must not remove a system ilk"
+        );
+    }
+
+    /// A replica's push, a stale one or a forged one, never changes whom an ILK works for: the
+    /// primary's relation stands, and an ILK the primary does not hold yet comes in with none.
+    #[test]
+    fn a_replica_push_never_changes_whom_an_ilk_works_for() {
+        let mut store = IdentityStore::default();
+        let mut conscious = ilk_for("AI.ed4qm7k2xa@worker1", &t_ilk("w1a"));
+        conscious.works_for = Some(t_ilk("ed"));
+        conscious.work_role = Some("conscious".to_string());
+        store.ilks.insert(t_ilk("w1a"), conscious);
+        // The replica's view is older than the primary's, and a new ILK claims a relation.
+        let stale = ilk_for("AI.ed4qm7k2xa@worker1", &t_ilk("w1a"));
+        let mut forged = ilk_for("AI.other@worker1", &t_ilk("w1b"));
+        forged.works_for = Some(t_ilk("ed"));
+        forged.work_role = Some("conscious".to_string());
+        store.reconcile_hive_ilks("worker1", vec![stale.clone(), forged.clone()]);
+        assert_eq!(store.ilks[&t_ilk("w1a")].works_for, Some(t_ilk("ed")));
+        assert_eq!(
+            store.ilks[&t_ilk("w1a")].work_role.as_deref(),
+            Some("conscious")
+        );
+        assert_eq!(store.ilks[&t_ilk("w1b")].works_for, None);
+        assert_eq!(store.ilks[&t_ilk("w1b")].work_role, None);
+        // The delta path takes the same relation.
+        assert_eq!(
+            with_primary_work_relation(stale, &store).works_for,
+            Some(t_ilk("ed"))
+        );
+        let mut forged_again = forged;
+        forged_again.works_for = Some(t_ilk("other"));
+        assert_eq!(
+            with_primary_work_relation(forged_again, &store).works_for,
+            None
         );
     }
 
