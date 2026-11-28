@@ -18202,7 +18202,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "cd_get" => "Read one deployment from SY.deploy: its state (deploying, active, failed, removing, removed), grouping, source, blanks and nodes with their status; a failed one names its step and code.",
         "cd_list" => "List SY.deploy's deployments, by tenant, grouping kind or grouping.",
         "cd_remove" => "Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed.",
-        "cd_catalog" => "List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks.",
+        "cd_catalog" => "List the packages SY.deploy holds, ready to deploy: each with its kind (executive, capability, infrastructure), origin (system, catalog, custom), title, description, versions and blanks; optionally of one kind, or those offered to one ED (grouping_id).",
         "cd_publish" => "Publish one released package to SY.deploy's catalog (Archi's CI): SY.deploy checks its format and keeps a copy, answering kept new or already with its id, version and hash; PACKAGE_INVALID says why, PACKAGE_CHANGED is the same id and version with other content, PACKAGE_TOO_LARGE one past a mesh message (128 KiB).",
         "cd_unpublish" => "Withdraw one version of a package from SY.deploy's catalog: it is offered no more and no new deployment takes it; the deployments that run it keep it.",
         "cd_tree" => "Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret.",
@@ -19925,6 +19925,20 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "A whole grouping, an ED's ILK (the path's in POST /cd/groupings/{grouping_id}/remove). Exactly one of the two.",
             ),
         ],
+        // The catalog's filters (docs/digital-executive-v1-stage-3.md §4, §7), Fluxbee Cloud's too
+        // (`CLOUD_DEPLOY_OP_PARAMS`).
+        "cd_catalog" => vec![
+            admin_action_body_field(
+                "kind",
+                "string",
+                "Optional filter: one kind, executive, capability or infrastructure; over HTTP ?kind=.",
+            ),
+            admin_action_body_field(
+                "grouping_id",
+                "string",
+                "Optional filter: one ED, its grouping id (its ILK): the packages offered to it, a capability offered to named EDs only listed only for one of them; over HTTP ?grouping_id=.",
+            ),
+        ],
         _ => Vec::new(),
     }
 }
@@ -20613,7 +20627,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         // every quoted GET example is one Archi's translation is held to.
         "cd_list" => "curl -X GET /cd/deployments?grouping_kind=ed",
         "cd_remove" => "curl -X POST /cd/deployments/dp7xk3m2qa/remove",
-        "cd_catalog" => "curl -X GET /cd/catalog",
+        "cd_catalog" => "curl -X GET /cd/catalog?kind=capability",
         "cd_tree" => "curl -X GET /cd/tree?tenant_id=tnt:11111111-1111-4111-8111-111111111111",
         "cd_publish" => {
             return Some(format!(
@@ -21458,7 +21472,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             DEPLOY_ORDER_NOTE,
         ],
         "cd_catalog" => vec![
-            "Each source: its id, kind, versions and blanks, the fields cd_deploy's blanks take. In this stage, SY.deploy's native plain-ed.",
+            "Each package Archi published (cd_publish) and SY.deploy offers: its id, kind (executive, the base of a new ED; capability, an extension of one ED, deployed into its grouping; infrastructure, for all of a tenant's EDs, into the tenant's grouping), origin (system and catalog, offered to every tenant; custom, to its own tenant alone), title, description, versions and blanks, the fields cd_deploy's blanks take. A withdrawn version (cd_unpublish) is left out.",
+            "Each filter is optional; over HTTP the query's ?kind=&grouping_id=. Fluxbee Cloud's lists only what the tenant it claims is offered.",
             DEPLOY_ORDER_NOTE,
         ],
         "cd_tree" => vec![
@@ -53065,6 +53080,11 @@ mod tests {
                 json!({ "tenant_id": tenant, "grouping_id": TEST_ILK }),
             ),
             ("cd_catalog", json!({ "tenant_id": tenant })),
+            // The catalog's filters (docs/digital-executive-v1-stage-3.md §7).
+            (
+                "cd_catalog",
+                json!({ "tenant_id": tenant, "kind": "capability", "grouping_id": TEST_ILK }),
+            ),
             ("cd_tree", json!({ "tenant_id": tenant })),
         ] {
             assert!(check(action, params.clone()).is_ok(), "{action} {params}");
@@ -53083,7 +53103,14 @@ mod tests {
                 "cd_get",
                 json!({ "tenant_id": tenant, "deployment_id": "dp7xk3m2qa", "hive": "worker1" }),
             ),
-            ("cd_catalog", json!({ "tenant_id": tenant, "kind": "ed" })),
+            (
+                "cd_catalog",
+                json!({ "tenant_id": tenant, "origin": "system" }),
+            ),
+            (
+                "cd_catalog",
+                json!({ "tenant_id": tenant, "kind": "capability", "tenant": tenant }),
+            ),
         ] {
             assert!(check(action, params.clone()).is_err(), "{action} {params}");
         }
@@ -53460,6 +53487,34 @@ mod tests {
         );
         assert_eq!(status, 409);
         assert!(envelope_of(&body)["payload"].get("retryable").is_none());
+    }
+
+    /// cd_catalog's filters are one list (docs/digital-executive-v1-stage-3.md §7): the help names
+    /// exactly the params Fluxbee Cloud's op takes, each optional, and its example uses one.
+    #[test]
+    fn cd_catalogs_filters_are_clouds_op_params() {
+        let named: Vec<String> = admin_action_body_optional_fields("cd_catalog")
+            .iter()
+            .filter_map(|field| field["name"].as_str().map(str::to_string))
+            .collect();
+        let cloud: Vec<String> = fluxbee_sdk::cloud::cloud_deploy_op_params("cd_catalog")
+            .expect("Cloud's op")
+            .iter()
+            .map(|param| param.to_string())
+            .collect();
+        assert_eq!(named, cloud);
+        assert_eq!(named, vec!["kind", "grouping_id"]);
+        assert!(admin_action_body_required_fields("cd_catalog").is_empty());
+        assert_eq!(
+            admin_action_example_scmd("cd_catalog").as_deref(),
+            Some("curl -X GET /cd/catalog?kind=capability")
+        );
+        for words in ["executive", "capability", "infrastructure", "origin"] {
+            assert!(
+                admin_action_summary("cd_catalog").contains(words),
+                "{words}"
+            );
+        }
     }
 
     /// The two writes of SY.deploy's catalog are actions of the catalog

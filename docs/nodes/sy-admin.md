@@ -672,7 +672,7 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
 | `cd_get` | `GET /cd/deployments/{deployment_id}` | query | `{deployment_id}`, the path's |
 | `cd_list` | `GET /cd/deployments?tenant_id=&grouping_kind=&grouping_id=` | query | the query's params as fields, each an optional filter |
 | `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | command | exactly one of `deployment_id` and `grouping_id`, the path's |
-| `cd_catalog` | `GET /cd/catalog` | query | the query's params as fields (none) |
+| `cd_catalog` | `GET /cd/catalog?kind=&grouping_id=` | query | the query's params as fields, each an optional filter: a package's `kind` (`executive`, `capability`, `infrastructure`) and one ED, `grouping_id`, for what is offered to it ([stage 3](../digital-executive-v1-stage-3.md) §4, §7); Fluxbee Cloud's the same two (`CLOUD_DEPLOY_OP_PARAMS`) |
 | `cd_tree` | `GET /cd/tree?tenant_id=` | query | `{tenant_id}` |
 | `cd_publish` | `POST /cd/packages` | command | the body: `{package}`, one released package ([stage 3](../digital-executive-v1-stage-3.md) §2, §3) |
 | `cd_unpublish` | `POST /cd/packages/{id}/{version}/unpublish` | command | `{id, version}`, the path's |
@@ -2539,7 +2539,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `cd_get` | `GET /cd/deployments/{deployment_id}` | Read one deployment from SY.deploy: its state (deploying, active, failed, removing, removed), grouping, source, blanks and nodes with their status; a failed one names its step and code. |
 | `cd_list` | `GET /cd/deployments` | List SY.deploy's deployments, by tenant, grouping kind or grouping. |
 | `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed. |
-| `cd_catalog` | `GET /cd/catalog` | List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks. |
+| `cd_catalog` | `GET /cd/catalog` | List the packages SY.deploy holds, ready to deploy: each with its kind (executive, capability, infrastructure), origin (system, catalog, custom), title, description, versions and blanks; optionally of one kind, or those offered to one ED (grouping_id). |
 | `cd_tree` | `GET /cd/tree` | Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret. |
 | `cd_publish` | `POST /cd/packages` | Publish one released package to SY.deploy's catalog (Archi's CI): SY.deploy checks its format and keeps a copy, answering kept new or already with its id, version and hash; PACKAGE_INVALID says why, PACKAGE_CHANGED is the same id and version with other content, PACKAGE_TOO_LARGE one past a mesh message (128 KiB). |
 | `cd_unpublish` | `POST /cd/packages/{id}/{version}/unpublish` | Withdraw one version of a package from SY.deploy's catalog: it is offered no more and no new deployment takes it; the deployments that run it keep it. |

@@ -90,7 +90,9 @@ pub const CLOUD_DEPLOY_OP_PARAMS: &[(&str, &[&str])] = &[
     ("cd_get", &["deployment_id"]),
     ("cd_list", &["grouping_kind", "grouping_id"]),
     ("cd_remove", &["deployment_id", "grouping_id"]),
-    ("cd_catalog", &[]),
+    // Two optional filters (docs/digital-executive-v1-stage-3.md §4, §7): a package's kind, and
+    // one ED, for the capabilities offered to it.
+    ("cd_catalog", &["kind", "grouping_id"]),
     ("cd_tree", &[]),
 ];
 
@@ -250,7 +252,7 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "list_exposures", "category": "relay",
           "summary": "Every published exposure, the closed ones included: {exposures: [view], count, max: 16}. Each view: exposure_id, label, host, url, upstream, state (closed, or enabled with enabled_until), published_at, certificate.state (covered, pending, waiting_dns, failed, held, off), route.state (acknowledged, pending, no_edge) and io_web.state (acknowledged, pending, absent). No envelope tenant_id, no params. Never BUSY." },
         { "op": "cd_deploy", "category": "relay",
-          "summary": "Deploy a source into a grouping of YOUR tenant (the envelope tenant_id): a new Digital Executive is the source plain-ed into params.grouping {kind: ed}. params.request_key (your id for this deployment, at most 64 characters of [A-Za-z0-9._:-]: the same key gives back the same deployment, other content answers REQUEST_KEY_REUSED), params.source {id, version} (without a version, the newest), params.grouping {kind, id} (no id: a new one), params.blanks (exactly the source's, as cd_catalog lists them), params.hive (optional). No secret travels: a credential is the key of one you stored with put_token. Answers at once {accepted: true, deployment_id, grouping, state: deploying}: read cd_get until active or failed. A failed one stays failed with its step and code: cd_deploy again with the same request_key resumes it, cd_remove ends it. SOURCE_NOT_FOUND, BLANK_INVALID, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, REQUEST_KEY_REUSED: change the request. HIVE_UNAVAILABLE, BUSY and DEPLOY_UNAVAILABLE (retryable): send it again with the same request_key." },
+          "summary": "Deploy a source into a grouping of YOUR tenant (the envelope tenant_id): a new Digital Executive is the source plain-ed into params.grouping {kind: ed}. params.request_key (your id for this deployment, at most 64 characters of [A-Za-z0-9._:-]: the same key gives back the same deployment, other content answers REQUEST_KEY_REUSED), params.source {id, version} (without a version, the newest), params.grouping {kind, id} (no id: a new one), params.blanks (exactly the source's, as cd_catalog lists them), params.hive (optional). No secret travels: a credential is the key of one you stored with put_token. Answers at once {accepted: true, deployment_id, grouping, state: deploying}: read cd_get until active or failed. A failed one stays failed with its step and code: cd_deploy again with the same request_key resumes it, cd_remove ends it. SOURCE_NOT_FOUND, BLANK_INVALID, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, REQUEST_KEY_REUSED: change the request. HIVE_UNAVAILABLE, BUSY, CATALOG_NOT_READY (a new installation whose hive holds no package yet) and DEPLOY_UNAVAILABLE (retryable): send it again with the same request_key." },
         { "op": "cd_get", "category": "relay",
           "summary": "One deployment of YOUR tenant (the envelope tenant_id): params.deployment_id. Its state (deploying, active, failed, removing, removed), grouping, source and version, and its nodes with their status; a failed one names its step, code and detail. One of another tenant answers NOT_FOUND. DEPLOY_UNAVAILABLE (retryable): read it again." },
         { "op": "cd_list", "category": "relay",
@@ -258,7 +260,7 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "cd_remove", "category": "relay",
           "summary": "Remove one deployment of YOUR tenant (the envelope tenant_id), params.deployment_id, or a whole grouping, an ED, params.grouping_id: exactly one of the two. Answers at once {accepted: true, ...}: read cd_get until removed. An ED's nodes are retired, their identities kept and marked, and the ED is marked; its credentials stay, for you to delete (delete_token). The founding deployment alone, while its grouping has others, answers DEPLOYMENT_NOT_REMOVABLE. One of another tenant answers NOT_FOUND. BUSY and DEPLOY_UNAVAILABLE (retryable): send it again." },
         { "op": "cd_catalog", "category": "relay",
-          "summary": "The sources ready to deploy for YOUR tenant (the envelope tenant_id), by kind (ed, infra, custom): each with its versions and its blanks, the fields cd_deploy's params.blanks takes. No params." },
+          "summary": "The packages ready to deploy that YOUR tenant (the envelope tenant_id) is offered: the system and catalog ones, offered to every tenant, and the custom ones made for yours. Each with its kind (executive: a new ED; capability: an extension of one ED, deployed into it; infrastructure: for all your EDs), origin (system, catalog, custom), title, description, versions and blanks, the fields cd_deploy's params.blanks takes. params.kind (optional): one kind. params.grouping_id (optional): one ED, its grouping.id: a capability offered to named EDs only is listed only for one of them. DEPLOY_UNAVAILABLE (retryable): read it again." },
         { "op": "cd_tree", "category": "relay",
           "summary": "YOUR tenant's tree (the envelope tenant_id), read when asked: its general infra, its EDs (its virtual persons, each with its document), each ED's parts (the identities that work for it, with their role, node and status) and its deployments (source, version, state, each agent's assets, each IO's credential key names). Never a secret. No params." }
     ])
@@ -521,11 +523,34 @@ mod tests {
             assert!(summary.contains("DEPLOY_UNAVAILABLE"), "{op}");
         }
         assert!(summary("cd_deploy").contains("REQUEST_KEY_REUSED"));
+        assert!(summary("cd_deploy").contains("CATALOG_NOT_READY"));
         assert!(summary("cd_remove").contains("DEPLOYMENT_NOT_REMOVABLE"));
         assert_eq!(
             cloud_deploy_op_params("cd_remove"),
             Some(&["deployment_id", "grouping_id"][..])
         );
+        // The catalog's two filters (docs/digital-executive-v1-stage-3.md §7), each its summary
+        // names; Cloud writes no package (cd_publish and cd_unpublish are Archi's).
+        assert_eq!(
+            cloud_deploy_op_params("cd_catalog"),
+            Some(&["kind", "grouping_id"][..])
+        );
+        let catalog = summary("cd_catalog");
+        for words in [
+            "params.kind",
+            "params.grouping_id",
+            "executive",
+            "capability",
+            "infrastructure",
+            "origin",
+        ] {
+            assert!(catalog.contains(words), "{words}");
+        }
+        for op in ["cd_publish", "cd_unpublish"] {
+            assert_eq!(cloud_deploy_op_params(op), None, "{op}");
+            assert_eq!(admin_action_for_cloud_op(op), None, "{op}");
+            assert!(!CLOUD_EXPOSED_ACTIONS.contains(&op), "{op}");
+        }
         assert_eq!(cloud_deploy_op_params("list_tokens"), None);
     }
 

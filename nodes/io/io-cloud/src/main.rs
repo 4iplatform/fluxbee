@@ -3973,6 +3973,12 @@ mod tests {
                 json!({"grouping_id": "ilk:22222222-2222-4222-8222-222222222222"}),
             ),
             ("cd_catalog", json!({})),
+            // The catalog's filters (docs/io-cloud-api.md §5.9).
+            ("cd_catalog", json!({"kind": "capability"})),
+            (
+                "cd_catalog",
+                json!({"kind": "capability", "grouping_id": "ilk:22222222-2222-4222-8222-222222222222"}),
+            ),
             ("cd_tree", json!({})),
         ] {
             let (action, payload) = translate_cloud_op(op, Some(tenant), &params)
@@ -4011,8 +4017,14 @@ mod tests {
                 "cd_tree",
                 json!({"tenant_id": "tnt:99999999-9999-4999-8999-999999999999"}),
             ),
-            ("cd_catalog", json!({"kind": "ed"})),
+            ("cd_catalog", json!({"origin": "system"})),
             ("cd_get", json!(["dp7xk3m2qa"])),
+            // The catalog's writes are Archi's: no op of Cloud's.
+            (
+                "cd_publish",
+                json!({"package": {"id": "policies", "version": "1"}}),
+            ),
+            ("cd_unpublish", json!({"id": "policies", "version": "1"})),
         ] {
             let err = translate_cloud_op(op, Some(tenant), &params).unwrap_err();
             assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {params}");

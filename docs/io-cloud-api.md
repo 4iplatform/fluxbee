@@ -1243,7 +1243,7 @@ is `active` or `failed`. Its conscious also needs a usable key of its AI provide
 | `cd_get` | `deployment_id` | the deployment |
 | `cd_list` | `grouping_kind`, `grouping_id`, both optional filters | your deployments |
 | `cd_remove` | exactly one of `deployment_id` and `grouping_id` | `{status, accepted: true, …}` |
-| `cd_catalog` | none | the sources, by kind, each with its versions and blanks |
+| `cd_catalog` | `kind`, `grouping_id`, both optional filters | the packages your tenant is offered, each with its kind, origin, title, description, versions and blanks |
 | `cd_tree` | none | your tenant's tree |
 
 #### `cd_deploy`
@@ -1306,8 +1306,19 @@ until they expire. The founding deployment alone, while its ED has others, answe
 
 #### `cd_catalog` / `cd_tree`
 
-`cd_catalog` lists the sources ready to deploy, by kind (`ed`, `infra`, `custom`), each with its
-versions and its blanks. `cd_tree` answers your tenant's tree, read when you ask: its general infra
+`cd_catalog` lists the packages ready to deploy that your tenant is offered (the Digital
+Executive's stage 3, release 3C): the ones Fluxbee ships and Archi's (origin `system` and
+`catalog`, offered to every tenant) and those Archi made for your tenant alone (origin `custom`).
+Each comes with its `kind`, `origin`, `title`, `description`, versions and blanks, the fields
+`cd_deploy`'s `params.blanks` takes. Its two params, both optional filters:
+
+- `params.kind`: `executive` (the base of an ED, deployed into a new ED), `capability` (an
+  extension of an ED, into that ED: `grouping` `{kind: ed, id}`) or `infrastructure` (for all your
+  EDs, into your tenant's own grouping);
+- `params.grouping_id`: one ED, its `grouping.id`: a capability offered to named EDs only is
+  listed only for one of them.
+
+`cd_tree` answers your tenant's tree, read when you ask: its general infra
 (none yet), its EDs (each with its document), each ED's parts (the identities that work for it,
 with their role, node and status) and its deployments (source, version, state, each agent's assets
 and each channel's credential key names). Never a secret.
@@ -1327,6 +1338,7 @@ and each channel's credential key names). Never a secret.
 | `DEPLOYMENT_NOT_REMOVABLE` | remove | the founding deployment while its ED has others | remove the ED (`grouping_id`) |
 | `HIVE_UNAVAILABLE` | deploy | the hive cannot reach the worker now: nothing was done | send it again with the same `request_key` |
 | `BUSY` | deploy, remove | another deployment of the same ED is under way: nothing was done | send it again shortly |
+| `CATALOG_NOT_READY` | deploy | the hive holds no package yet (a new installation, before Archi's first publish): nothing was done | send it again shortly with the same `request_key` |
 | `DEPLOY_UNAVAILABLE` | any | SY.deploy did not answer the hive within 10 s: unknown, as `ADMIN_UNAVAILABLE` is | a `cd_deploy` again with the same `request_key`; read `cd_get` before a `cd_remove` again |
 
 Match on the code: IO.cloud passes the hive's text as `error_detail` (§5.4).
@@ -1523,6 +1535,15 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### The Digital Executive's stage 3 (release 3C)
+
+- **`cd_catalog` lists packages and takes two filters** (§5.9): the packages your tenant is
+  offered, each with its `kind` (`executive`, `capability`, `infrastructure`), `origin`, `title`
+  and `description` besides its versions and blanks; `params.kind` and `params.grouping_id` narrow
+  it. Before this release they were refused with `INVALID_REQUEST`.
+- **`cd_deploy` may answer `CATALOG_NOT_READY`** (retryable) on a new installation, until the hive
+  holds its first package. No new op.
 
 ### The Digital Executive's release (stage 2, 2D)
 
