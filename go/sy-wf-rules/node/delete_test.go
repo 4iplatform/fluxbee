@@ -123,6 +123,42 @@ func TestDeleteWorkflowForceRemovesStateAndPackages(t *testing.T) {
 	}
 }
 
+// A delete that retires its WF node (a capability's door, removed by SY.deploy) never purges it: the
+// orchestrator's retire mode marks the node's ILK node_retired, and the workflow's state and packages
+// go as in any delete.
+func TestDeleteWorkflowRetireRetiresTheNodeInsteadOfPurgingIt(t *testing.T) {
+	svc := newTestService(t)
+	applyWorkflowForDelete(t, svc)
+	retired, killed := false, false
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: deployedWFNodeConfig,
+		killNodeFunc: func(context.Context, string, bool, bool) (map[string]any, error) {
+			killed = true
+			return map[string]any{"status": "ok"}, nil
+		},
+		retireNodeFunc: func(_ context.Context, nodeName string, force bool) (map[string]any, error) {
+			retired = true
+			if nodeName != "WF.invoice@motherbee" || !force {
+				t.Fatalf("want a forced retire of WF.invoice@motherbee, got %q force=%v", nodeName, force)
+			}
+			return map[string]any{"status": "ok"}, nil
+		},
+	}
+	svc.wfNodes = &fakeWFNodeClient{
+		countRunningInstancesFunc: func(string) (int, error) { return 0, nil },
+	}
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: true, Retire: true})
+	if err != nil {
+		t.Fatalf("DeleteWorkflow: %v", err)
+	}
+	if !retired || killed || result.WFNode.Action != "retired" {
+		t.Fatalf("want the node retired and never killed with a purge, got retired=%v killed=%v action=%q", retired, killed, result.WFNode.Action)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice")); !os.IsNotExist(err) {
+		t.Fatalf("expected local state removed, err=%v", err)
+	}
+}
+
 // applyWorkflowForDelete compiles and applies workflow "invoice" on this hive.
 func applyWorkflowForDelete(t *testing.T, svc *Service) {
 	t.Helper()

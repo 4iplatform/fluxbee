@@ -62,12 +62,21 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		if s.nodes == nil {
 			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: "admin client unavailable"}
 		}
-		if _, err := s.nodes.KillNode(ctx, snapshot.NodeName, true, true); err != nil {
+		action := "deleted"
+		var err error
+		if req.Retire {
+			// The node's ILK keeps its history, marked node_retired (DeleteWorkflowRequest.Retire).
+			action = "retired"
+			_, err = s.nodes.RetireNode(ctx, snapshot.NodeName, true)
+		} else {
+			_, err = s.nodes.KillNode(ctx, snapshot.NodeName, true, true)
+		}
+		if err != nil {
 			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: err.Error()}
 		}
 		result.WFNode = WFNodeActionResult{
 			NodeName: snapshot.NodeName,
-			Action:   "deleted",
+			Action:   action,
 			Status:   "ok",
 		}
 	}

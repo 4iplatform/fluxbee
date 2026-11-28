@@ -14,6 +14,7 @@ type fakeNodeClient struct {
 	restartNodeFunc   func(ctx context.Context, nodeName string) (map[string]any, error)
 	setNodeConfigFunc func(ctx context.Context, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error)
 	killNodeFunc      func(ctx context.Context, nodeName string, force, purgeInstance bool) (map[string]any, error)
+	retireNodeFunc    func(ctx context.Context, nodeName string, force bool) (map[string]any, error)
 	getNodeStatusFunc func(ctx context.Context, nodeName string) (map[string]any, error)
 	runCalls          int
 	restartCalls      int
@@ -56,6 +57,13 @@ func (f *fakeNodeClient) SetNodeConfig(ctx context.Context, nodeName string, con
 func (f *fakeNodeClient) KillNode(ctx context.Context, nodeName string, force, purgeInstance bool) (map[string]any, error) {
 	if f.killNodeFunc != nil {
 		return f.killNodeFunc(ctx, nodeName, force, purgeInstance)
+	}
+	return map[string]any{"status": "ok"}, nil
+}
+
+func (f *fakeNodeClient) RetireNode(ctx context.Context, nodeName string, force bool) (map[string]any, error) {
+	if f.retireNodeFunc != nil {
+		return f.retireNodeFunc(ctx, nodeName, force)
 	}
 	return map[string]any{"status": "ok"}, nil
 }

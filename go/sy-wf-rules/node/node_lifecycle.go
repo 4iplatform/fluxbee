@@ -28,6 +28,9 @@ type nodeClient interface {
 	RunNode(ctx context.Context, nodeName, runtimeName, version string, config map[string]any, launchedBy string) (map[string]any, error)
 	RestartNode(ctx context.Context, nodeName string) (map[string]any, error)
 	KillNode(ctx context.Context, nodeName string, force, purgeInstance bool) (map[string]any, error)
+	// RetireNode stops and removes the node by the orchestrator's retire mode (kill_node with
+	// retire_instance): its ILK is marked node_retired, never purged.
+	RetireNode(ctx context.Context, nodeName string, force bool) (map[string]any, error)
 	// GetNodeStatus is the orchestrator's node_status: lifecycle_state, health_state, last_error.
 	GetNodeStatus(ctx context.Context, nodeName string) (map[string]any, error)
 }
@@ -112,6 +115,13 @@ func (c *adminNodeClient) KillNode(ctx context.Context, nodeName string, force, 
 	return c.request(ctx, "kill_node", nodeName, map[string]any{
 		"force":          force,
 		"purge_instance": purgeInstance,
+	}, nodeDeleteTimeout)
+}
+
+func (c *adminNodeClient) RetireNode(ctx context.Context, nodeName string, force bool) (map[string]any, error) {
+	return c.request(ctx, "kill_node", nodeName, map[string]any{
+		"force":           force,
+		"retire_instance": true,
 	}, nodeDeleteTimeout)
 }
 

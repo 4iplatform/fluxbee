@@ -42,6 +42,11 @@ type GetStatusRequest struct {
 type DeleteWorkflowRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	Force        bool   `json:"force,omitempty"`
+	// Retire removes the WF node with the orchestrator's retire mode instead of a purge: its files
+	// go, and its ILK is marked node_retired and keeps its history (the Digital Executive's rule: an
+	// ILK with history is disabled, never deleted). SY.deploy asks for it when it removes a
+	// capability's door (docs/digital-executive-v1-stage-3.md §4).
+	Retire bool `json:"retire,omitempty"`
 }
 
 type WfRulesMetadata struct {

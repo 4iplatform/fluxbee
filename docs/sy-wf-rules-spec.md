@@ -382,6 +382,8 @@ With `force` or without, a delete whose read of the node's config (`get_node_con
 
 If `force: true`: kills the WF node (via orchestrator), deletes all state directories for that workflow. Instances are lost. This is the "nuclear option" for dev/testing.
 
+With `retire: true` (optional, any `force`): the WF node goes by the orchestrator's retire mode (`kill_node` with `retire_instance`) instead of a purge: its files go, and its ILK is marked `node_retired` and keeps its history; the workflow's state and packages go as in any delete, and the answer's `wf_node.action` is `retired`. SY.deploy sends it when it removes a capability's door (docs/digital-executive-v1-stage-3.md §4): an ILK with history is disabled, never deleted.
+
 ### 5.7 Query messages
 
 **`get_workflow`:**
