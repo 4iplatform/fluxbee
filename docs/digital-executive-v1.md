@@ -903,3 +903,20 @@ Options (b), a label over several agents, and (c), one node that does everything
   ends nothing does anything, and it is fast, since the CI is ready (released, read-only).
 - **Call 2, the bound:** yes. Cloud's list never goes through an AI: SY.deploy knows it.
 - **Call 3, releasing:** yes, only through Archi's chat, or it comes ready in the .deb.
+
+## 40. Notes, 2026-11-28 (later): a capability for every ED, and a result that comes later
+
+- **The operator:**
+  1. yes: a capability for all of a tenant's EDs goes into the tenant's grouping, and its WF takes
+     a request from any conscious of the tenant's EDs, checked against identity;
+  2. a request that takes long must reach the person: the WF programs a timer with the answer or the
+     message, the timer holding all the data to send what the WF sends; the simplest, maybe, left to
+     me to judge whether another way is better.
+- **My judgment:** the data lives where it already lives, in the WF's instance (its variables, kept
+  with the instance), and the timer only wakes it. A timer holding a message would be a second copy
+  of the instance's state, and a new kind of timer for SY.timer. Agreed with the operator's idea in
+  substance: the WF's program decides when, the data travels with the request.
+- **Facts read for it (2026-11-28):** a WF instance keeps variables (`set_variable`, `vars`) and
+  wakes on its own timers; io.wapp sends any message that carries `meta.context.io.reply_target`
+  (kind `wapp_post`), not only a reply to a message it just took; WhatsApp lets a business answer
+  freely within 24 hours of the person's last message.

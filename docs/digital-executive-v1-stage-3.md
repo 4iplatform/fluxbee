@@ -1,8 +1,8 @@
 # The Digital Executive v1, stage 3: solutions from Archi's CI, and capabilities
 
 **Status:** the build design, 2026-11-28, consolidated from the talk of the same day
-([notes](digital-executive-v1.md) §33–§39). Reviewed by the operator the same day (§11): its three
-calls decided, two points open. Nothing is built.
+([notes](digital-executive-v1.md) §33–§39). Reviewed by the operator the same day (§11): every point
+decided. Nothing is built.
 
 **What it builds:**
 
@@ -121,6 +121,11 @@ external system; `capability` (5), a capability's entry WF.
   which the compiler checks (A-118's loop cannot happen).
 - **`reply`, a new action:** the instance answers the request that started it, as the response to
   that request (its trace), never as a new message. The conscious gets it as its tool's result.
+- **For every ED or for one:** a capability for all of a tenant's EDs is deployed into the tenant's
+  grouping; its door's ILK has the role `capability` and works for no one person. Its WF's
+  `start_from` then takes the consciouses of its tenant's EDs: the WF checks the sender in identity's
+  SHM (its ILK works for a person of the WF's tenant, as its `conscious`), so no list of names is
+  rewritten as EDs come and go. A capability for one ED names that ED's conscious, as above.
 - **Its interface is its help:** the definition's `description`, its `input_schema`, and each
   action's description, which `HELP` already answers. A change of the WF's program changes nothing
   else.
@@ -136,6 +141,29 @@ external system; `capability` (5), a capability's entry WF.
     §11); a timeout or an error comes back as the tool's error, and the conscious answers the
     person with what it can.
 - **Only for its own ED's capabilities,** and only while `speaks_as` is confirmed.
+
+## 6.1 A result that comes later
+
+Decided (the operator, 2026-11-28): a request that takes long reaches the person.
+
+- **The request carries its conversation:** `ask_capability` adds, from the conscious's turn and
+  never from the model, the person's thread, the person's ILK, the IO node it came through and its
+  `reply_target`. The WF keeps it in its instance.
+- **The door answers at once that it is under way:** `reply` with `status: pending` and the
+  request's reference. The tool's result says so, and the conscious tells the person it will let
+  them know.
+- **The WF's timer wakes the instance** (the operator: the WF programs it). The data is the
+  instance's own; the timer only wakes it.
+- **`notify`, a new WF action:** the instance sends the result to the conscious that asked, as a
+  new message carrying the request's reference, the result and the conversation. Only to that
+  conscious; never to a person (a capability never talks with people).
+- **The conscious's turn on a result:** the AI SDK takes it as a turn in the person's conversation
+  (the person's thread, so cognition keeps one memory), and sends the conscious's answer to the IO it
+  names, with the person as `dst_ilk` and its `reply_target`, never back to the WF. So the WF never
+  gets an answer from the conscious, and A-118's loop cannot happen.
+- **The boundary:** the ED speaks to a person without being written to only to answer its own
+  earlier request, in that person's conversation. WhatsApp allows it within 24 hours of the
+  person's last message; past that, a template would be needed (left for later, §10).
 
 ## 7. Cloud
 
@@ -157,12 +185,20 @@ A person asks the ED for an invoice's state. The conscious, in its turn:
    through `IO.crm.ed4qm7k2xa@worker1` (a `connector`), and `reply`s `{state: "paid", date: …}`;
 4. the conscious answers the person, as the ED.
 
+If the CRM is slow, the WF answers `pending` at once, and the conscious says "lo reviso y te aviso".
+The WF's timer wakes it; when the CRM answers, it `notify`s the conscious with the result and the
+conversation; the conscious tells the person "la factura A-1032 está paga desde el 12", through
+the ED's WhatsApp, in the same conversation.
+
 ## 9. How it ships (METHOD §9)
 
 - **3A, shared:** identity's two roles in the SHM's copies and the SDKs (no layout change); the AI
-  SDK's `ask_capability` card and its call; the Go SDK's response to a request (for `reply`).
-- **3B, the WF:** `start_from` with the ED's conscious, the `reply` action, the compiler's check,
-  each action's description in `HELP` (wf-generic, SY.wf-rules).
+  SDK's `ask_capability` card and its call with the conversation it carries, and its turn on a
+  result, answered to the IO; the Go SDK's response to a request (for `reply`) and its check of a
+  conscious in identity's SHM.
+- **3B, the WF:** `start_from` with the ED's conscious or the tenant's consciouses, the `reply` and
+  `notify` actions, the instance keeping the request's conversation, the compiler's check, each
+  action's description in `HELP` (wf-generic, SY.wf-rules).
 - **3C, the packages:** Archi's release and CI, the system packages in the .deb, `cd_publish`
   and `cd_unpublish` (SY.admin, Archi); SY.deploy's catalog from publishes, kinds and attributes,
   the infra grouping, WF nodes in its step builder and their actions in its row; ai.generic's tool;
@@ -182,6 +218,7 @@ A person asks the ED for an invoice's state. The conscious, in its turn:
 | Loops between capabilities, a capability that asks another | When one needs it |
 | Upgrades of packages, waves, rollback | With the first new version |
 | An AI check of packages before a publish | Design §5.5 |
+| A result past WhatsApp's 24-hour window (a template) | When a capability needs it |
 
 ## 11. The operator's review (2026-11-28)
 
@@ -193,15 +230,6 @@ A person asks the ED for an invoice's state. The conscious, in its turn:
    it.
 3. **A release comes only through Archi's chat,** with the operator's CONFIRM, or ready in the .deb.
 
-**Open, to talk:**
-
-4. **One ED or all of them:** a capability is sometimes behind one ED, sometimes behind all of a
-   tenant's EDs. Proposed: a capability deployed for all of them goes into the tenant's grouping;
-   its door's ILK has the role `capability` and works for no one person; a conscious finds it as a
-   capability of its tenant; its WF's `start_from` takes the consciouses of its tenant's EDs, which
-   the WF checks against identity (the sender's ILK works for a person of its tenant, as its
-   `conscious`), so no list of names is rewritten as EDs come and go.
-5. **A request that takes long:** the door's timer wakes it, but the conscious waits 60 s at most.
-   Either the result comes later to the conscious as a new message, and the conscious tells the
-   person through the ED's IO; or the WF keeps it, and the conscious asks for it when the person
-   asks again.
+4. **For one ED or for all of a tenant's EDs** (§5).
+5. **A result that comes later reaches the person** (§6.1), the WF's timer waking its instance,
+   whose state holds the request's conversation.
