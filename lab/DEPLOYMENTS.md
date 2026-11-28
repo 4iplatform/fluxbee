@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ live, gate0260 50 PASS; A-372 (a worker's io.wapp provisions at its identity replica) fixed in 0.1.161; two tool FAILs re-run PASS | snapshot `pre-ed2d-0-1-160` · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
+| **0.1.161** | 2026-11-27 | `aec9d4b6` | motherbee + spokes (core), io.wapp alone: FINDINGS A-372, a writer is provisioned at the primary's SY.identity by default, as io.api does (a worker's io.wapp asked its own hive's replica, `NOT_PRIMARY`) | ✅ live, gate0261 29 PASS, no FAIL | snapshot `pre-a372-0-1-161` · `apt install fluxbee=0.1.160` (nothing one-way) |
+| **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ replaced by 0.1.161 (gate0260 50 PASS; A-372 fixed there) | snapshot `pre-ed2d-0-1-160` (deleted 2026-11-28) · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
 | **0.1.159** | 2026-11-27 | `91587ba0` | motherbee + spokes (core), three binaries, one branch each: the Digital Executive's stage 2, release 2C ([stage 2](../docs/digital-executive-v1-stage-2.md) §1, §9, §10). SY.identity: `ILK_CREATE_VIRTUAL` born with its id (idempotent, `ILK_ID_TAKEN`), `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` (migration v8, the file in `blob/people/`, its hash in the SHM), `ILK_DELETE`'s `node_retired` reason; the orchestrator: `kill_node`'s `retire_instance`, the people folder; SY.admin: `create_virtual_person`'s `ilk_id`, `set_ilk_works_for`, `set_person_document`, `kill_node`'s retire | ✅ replaced by 0.1.160 | snapshot `pre-ed2c-0-1-159` (deleted 2026-11-27) · `apt install fluxbee=0.1.158` (migration v8 only adds two columns) |
 | **0.1.158** | 2026-11-27 | `c285c567` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2B ([stage 2](../docs/digital-executive-v1-stage-2.md) §6.1, §7, §10): the AI SDK's `speaks_as` (an agent speaks as the person its config names while identity confirms it, its own ILK otherwise) and the IO family's `io.person_ilk` (an inbound message names the IO's person as `dst_ilk` while identity confirms it), unset everywhere; the identity SHM's last 8 bytes named `document_hash` | ✅ replaced by 0.1.159 | snapshot `pre-sdk-ed2-0-1-158` (deleted 2026-11-27) · `apt install fluxbee=0.1.157` (nothing one-way) |
 | **0.1.157** | 2026-11-27 | `105ee2f0` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2A ([stage 2](../docs/digital-executive-v1-stage-2.md) §1.1, §10): the identity SHM's version 7, every `IlkEntry` naming whom its ILK works for (`works_for`) and its role (`work_role`), 1184 bytes, in its three copies with one shared layout fixture; SY.identity's migration v7, record, replication and projection, the primary's relation standing on every replica push; nothing sets it yet. With A-367 (a Go SDK test's race) | ✅ replaced by 0.1.158 | snapshot `pre-shm7-0-1-157` (deleted 2026-11-27) · `apt install fluxbee=0.1.156` (migration v7 only adds two columns; SY.identity recreates its region at the version it runs) |
@@ -169,6 +170,31 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.161 — A-372: an ED's IO on a worker provisions its writer at the primary
+
+- **Date:** 2026-11-27 (ART) · **Previous version:** 0.1.160 · **Commit:** `aec9d4b6`.
+- **Scope:** motherbee and the three spokes, through the installation's update. io.wapp alone.
+- **Why:** FINDINGS A-372, seen in gate0260: a stranger writing to an ED whose IO runs on worker1
+  got no ILK, since io.wapp asked its own hive's SY.identity, a replica (`NOT_PRIMARY`).
+- **What changed (`coa/a-372`):** io.wapp's identity target defaults to `SY.identity@motherbee`, as
+  io.api's; `IO_WAPP_IDENTITY_TARGET` still overrides it. io.slack keeps its default until its
+  revamp (it runs on the motherbee).
+- **Build:** CI green on the branch `aec9d4b6`. Build on fb-build 00:17:25–00:26:18Z (8.9 min).
+- **The deploy:** the mark at 00:27:00Z; `ops deploy 0.1.161 --snapshot pre-a372-0-1-161 --drop
+  pre-ed2d-0-1-160` in 215 s; health clean.
+- **Checked on 8.x (the gate, gate0261, 00:31–00:36Z; `scratchpad/gate-tools/r161_gate.py` with
+  0.1.160's steps, git-ignored; 29 PASS, no FAIL, one model call):**
+  - the smoke; an ED born through Cloud's door, active 5.2 s after the order, read back confirmed;
+  - **a signed webhook, and SY.storage's two turns:** the inbound one from the writer's temporary
+    ILK in `pruebas` to the ED; the reply from the ED to the writer, written by the conscious;
+  - the ED removed in 3.3 s: the nodes gone, their ILKs `node_retired`, the ED marked, its document
+    and the credential kept;
+  - cleaned: the writer, the ED and its nodes' ILKs, the credential, the files, the smoke node.
+- **Stage 2 is complete:** a plain ED is born from Cloud's door, answers on WhatsApp as itself,
+  confirmed by identity, and is removed keeping its ILKs.
+- **Rollback:** snapshot `pre-a372-0-1-161`, or `apt install fluxbee=0.1.160` and 0.1.160's
+  `update_installation`: nothing one-way.
 
 ## 0.1.160 — SY.deploy and a plain ED's birth (the Digital Executive's stage 2, release 2D)
 

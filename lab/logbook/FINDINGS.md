@@ -592,7 +592,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-369 🔵 A full identity sync sends 256 ILKs a frame under a 16 MiB cap: 256 persons with documents near their 64 KiB limit would pass it and break a replica's full sync; real documents are about 1 KiB (low; identity; found 2026-11-27 building 0.1.159).
 - A-370 🔵 Purging a person leaves its document's files in `blob/people/` (low; identity; found 2026-11-27 building 0.1.159).
 - A-371 🔵 `ILK_SET_TENANT` does not check the relations that name the moved person: a node of the old tenant keeps working for someone of another tenant (low; identity; found 2026-11-27 building 0.1.159).
-- A-372 🔴 io.wapp (and io.slack) provision a writer at their own hive's SY.identity, a replica on a worker, which answers NOT_PRIMARY: an IO on a worker gives a stranger no temporary ILK and forwards with a null src_ilk; io.api asks the primary (Digital Executive; found 2026-11-28 in gate0260; io.wapp fixed in 0.1.161).
+- A-372 ✅ (io.wapp; io.slack waits for its revamp) io.wapp (and io.slack) provision a writer at their own hive's SY.identity, a replica on a worker, which answers NOT_PRIMARY: an IO on a worker gives a stranger no temporary ILK and forwards with a null src_ilk; io.api asks the primary (Digital Executive; found 2026-11-28 in gate0260; io.wapp fixed in 0.1.161).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1670,7 +1670,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-372 [IO/io.wapp, io.slack] 🔴 (found 2026-11-28 in gate0260, 0.1.160; seen in worker1's journal and SY.storage) — an IO on a worker provisions at its identity replica
+### A-372 [IO/io.wapp, io.slack] 🔴 ✅ io.wapp fixed in 0.1.161 (found 2026-11-28 in gate0260, 0.1.160; seen in worker1's journal and SY.storage) — an IO on a worker provisions at its identity replica
 
 - **What:** io.wapp's identity target defaults to `SY.identity@<its hive>`
   (`IO_WAPP_IDENTITY_TARGET`, `nodes/io/io-wapp/src/main.rs`), and so does io.slack's. On a worker
