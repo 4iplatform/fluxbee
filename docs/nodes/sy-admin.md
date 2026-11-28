@@ -294,7 +294,7 @@ caller and the action; a command with no stamped caller is refused too.
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
 | `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`, `set_hive_egress`, `clear_hive_egress`) and Fluxbee Cloud's (`publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link`; `MeshAccess::Cloud`) | `authorize_llm_usage_scope` |
 | `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`), io.web's exposure actions among them once the SDK's catalog lists them, and SY.deploy's six orders; payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
-| `SY.deploy@motherbee`, exactly | the steps of its deployments, by classes: a node's whole life (`run_node`, `start_node`, `restart_node`, `kill_node` plain or with `retire_instance`, never with `purge_instance`, `get_node_status`, `get_node_config`, `set_node_config`, `node_control_config_set`), a deployment's people (`create_virtual_person`, `set_person_document`, `set_ilk_works_for`, `set_ilk_definition`, `delete_ilk`, `restore_ilk`) and its tenant's keys (`vault_list`, `vault_assign`); nothing else ([SY.deploy's orders](#sydeploys-orders)) | `authorize_deploy_step` |
+| `SY.deploy@motherbee`, exactly | the steps of its deployments, by classes: a node's whole life (`run_node`, `start_node`, `restart_node`, `kill_node` plain or with `retire_instance`, never with `purge_instance`, `get_node_status`, `get_node_config`, `set_node_config`, `node_control_config_set`), a deployment's people (`create_virtual_person`, `set_person_document`, `set_ilk_works_for`, `set_ilk_definition`, `delete_ilk`, `restore_ilk`), its workflows (`wf_rules_compile_apply`, `wf_rules_delete`, `wf_rules_get_workflow`, `wf_rules_get_status`) and its tenant's keys (`vault_list`, `vault_assign`); nothing else ([SY.deploy's orders](#sydeploys-orders)) | `authorize_deploy_step` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
@@ -727,6 +727,17 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
   user OPA policy, hives, runtimes). `SY.deploy` on another hive, or another name, has no row.
   SY.admin stamps `launched_by: SY.deploy@motherbee` on its launches, as for any caller. The row's
   bounds (which nodes, which tenants) come later (§12).
+- **Its workflows** ([stage 3](../digital-executive-v1-stage-3.md) §4): a capability's door is a
+  WF, which SY.deploy deploys with `wf_rules_compile_apply` (`{workflow_name, definition,
+  auto_spawn: true, tenant_id}`, on the hive it names), reads with `wf_rules_get_workflow` and
+  `wf_rules_get_status`, and removes with `wf_rules_delete` (`{workflow_name, force: true}`). Each
+  goes to that hive's SY.wf-rules as any caller's does (`handle_wf_rules_http`,
+  `handle_wf_rules_query`), with `launched_by: SY.deploy@motherbee` on a deploy; SY.wf-rules then
+  publishes the workflow's package and launches or purges its `WF.*` node under its own rows
+  (`authorize_wf_rules_package`, `authorize_wf_rules_node`), and the run it asks for carries
+  SY.deploy as the node's launcher (`launcher_carried_by_wf_rules`), as it carries `operator` and
+  `archi`. A compile alone, an apply, a rollback, a check and the list of workflows stay out of the
+  row.
 
 ## A node's self-description
 

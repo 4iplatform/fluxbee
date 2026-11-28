@@ -6742,8 +6742,11 @@ const DEPLOY_NODE_ROLE: &str = "SY.deploy";
 /// the SY.admin actions its deployments' steps take, by classes, so that the next solutions need
 /// no new row. Out: the purges, of a node or of an ILK, which stay the operator's, and what the
 /// whole installation shares (routes, VPN rules, the user OPA policy, hives, runtimes), each with
-/// the first source that needs it. Its bounds (which nodes, which tenants) come later (§12).
-const DEPLOY_STEP_ACTIONS: [&str; 16] = [
+/// the first source that needs it. Its bounds (which nodes, which tenants) come later (§12). Stage
+/// 3 adds its workflows (docs/digital-executive-v1-stage-3.md §4): `wf_rules_delete` has
+/// SY.wf-rules purge the workflow's WF node under SY.wf-rules' own row, SY.deploy asking for no
+/// purge itself.
+const DEPLOY_STEP_ACTIONS: [&str; 20] = [
     // A node's whole life.
     "run_node",
     "start_node",
@@ -6760,6 +6763,15 @@ const DEPLOY_STEP_ACTIONS: [&str; 16] = [
     "set_ilk_definition",
     "delete_ilk",
     "restore_ilk",
+    // Its workflows (docs/digital-executive-v1-stage-3.md §4): a capability's door is a WF, deployed
+    // whole on the hive it names, read, and removed whole. Each goes to that hive's SY.wf-rules as
+    // any caller's does, which publishes the workflow's package and launches or purges its WF.*
+    // node under its own rows (`authorize_wf_rules_package`, `authorize_wf_rules_node`); a compile
+    // alone, an apply, a rollback, a check and the list stay out.
+    "wf_rules_compile_apply",
+    "wf_rules_delete",
+    "wf_rules_get_workflow",
+    "wf_rules_get_status",
     // Its tenant's keys.
     "vault_list",
     "vault_assign",
@@ -6776,7 +6788,8 @@ fn authorize_deploy_step(
     if !DEPLOY_STEP_ACTIONS.contains(&action) {
         return Err(format!(
             "{caller} may not ask for '{action}': SY.deploy's row holds a node's life, a \
-             deployment's people and its tenant's keys (docs/digital-executive-v1-stage-2.md §8)"
+             deployment's people, its workflows and its tenant's keys \
+             (docs/digital-executive-v1-stage-2.md §8, stage 3 §4)"
         ));
     }
     if action == "kill_node"
@@ -12122,15 +12135,21 @@ fn launched_by_for_caller(caller_l2_name: Option<&str>, admin_hive: &str) -> Str
     }
 }
 
-/// The launcher SY.wf-rules carries for a workflow deploy: `operator` or `archi`, the two the admin
-/// stamps on the wf_rules requests that reach it (the operator's HTTP and executor plans, Archi).
-/// Anything else, `cloud` above all (it would give Fluxbee Cloud's relay start and kill rights on
-/// the node), is not carried: the admin records SY.wf-rules itself.
+/// The launcher SY.wf-rules carries for a workflow deploy: `operator`, `archi` or
+/// `SY.deploy@<admin_hive>`, the three the admin stamps on the wf_rules requests that reach it (the
+/// operator's HTTP and executor plans, Archi, and SY.deploy's row deploying a capability's door,
+/// docs/digital-executive-v1-stage-3.md §4). Anything else, `cloud` above all (it would give
+/// Fluxbee Cloud's relay start and kill rights on the node), is not carried: the admin records
+/// SY.wf-rules itself.
 fn launcher_carried_by_wf_rules(
     params: &serde_json::Map<String, serde_json::Value>,
+    admin_hive: &str,
 ) -> Option<String> {
     match params.get("launched_by")?.as_str()?.trim() {
         launcher @ ("operator" | "archi") => Some(launcher.to_string()),
+        launcher if launcher == format!("{DEPLOY_NODE_ROLE}@{admin_hive}") => {
+            Some(launcher.to_string())
+        }
         _ => None,
     }
 }
@@ -12168,7 +12187,7 @@ fn stamp_relay_facts(
             // the admin stamped that on the wf_rules request (handle_wf_rules_http).
             let carried = match caller_l2_name {
                 Some(caller) if caller.starts_with(WF_RULES_ROLE_PREFIX) => {
-                    launcher_carried_by_wf_rules(object)
+                    launcher_carried_by_wf_rules(object, admin_hive)
                 }
                 _ => None,
             };
@@ -31006,13 +31025,24 @@ mod tests {
                 expected
             );
         }
-        // …but only `operator` or `archi`, the two the admin stamps on a workflow deploy; anything
-        // else, `cloud` above all, is recorded as SY.wf-rules.
+        // …but only `operator`, `archi` or SY.deploy on the motherbee, the three the admin stamps
+        // on a workflow deploy; anything else, `cloud` above all, is recorded as SY.wf-rules.
+        assert_eq!(
+            stamp_relay_facts(
+                "run_node",
+                serde_json::json!({"launched_by": "SY.deploy@motherbee"}),
+                Some("SY.wf-rules@worker1"),
+                "motherbee"
+            )["launched_by"],
+            "SY.deploy@motherbee"
+        );
         for carried in [
             serde_json::json!({"launched_by": "cloud"}),
             serde_json::json!({"launched_by": "WF.admin.internal.diag@motherbee"}),
             serde_json::json!({"launched_by": "system"}),
             serde_json::json!({"launched_by": ""}),
+            serde_json::json!({"launched_by": "SY.deploy@worker1"}),
+            serde_json::json!({"launched_by": "SY.deploy"}),
             serde_json::json!({}),
         ] {
             assert_eq!(
@@ -52693,9 +52723,9 @@ mod tests {
             .is_none());
     }
 
-    /// SY.deploy@motherbee's row (docs/digital-executive-v1-stage-2.md §8): every action of its three
-    /// classes, a node's kill_node plain or retiring, and nothing else, never a purge; its own name
-    /// exactly, on the motherbee alone.
+    /// SY.deploy@motherbee's row (docs/digital-executive-v1-stage-2.md §8, stage 3 §4): every action
+    /// of its four classes, a node's kill_node plain or retiring, and nothing else, never a purge of
+    /// its own; its own name exactly, on the motherbee alone.
     #[test]
     fn sy_deploy_on_the_motherbee_asks_for_its_row_alone() {
         let deploy = "SY.deploy@motherbee";
@@ -52714,11 +52744,15 @@ mod tests {
             "set_ilk_definition",
             "delete_ilk",
             "restore_ilk",
+            "wf_rules_compile_apply",
+            "wf_rules_delete",
+            "wf_rules_get_workflow",
+            "wf_rules_get_status",
             "vault_list",
             "vault_assign",
         ];
         assert_eq!(DEPLOY_STEP_ACTIONS, row);
-        // What a step names, as SY.deploy sends it (§5.2, §9).
+        // What a step names, as SY.deploy sends it (stage 2 §5.2, §9; stage 3 §4).
         let params = |action: &str| match action {
             "run_node" => json!({
                 "node_name": "AI.ed4qm7k2xa@worker1",
@@ -52729,11 +52763,34 @@ mod tests {
             "kill_node" => {
                 json!({ "node_name": "IO.wapp.ed4qm7k2xa@worker1", "retire_instance": true })
             }
+            "wf_rules_compile_apply" => json!({
+                "workflow_name": "billing.ed4qm7k2xa",
+                "definition": wf_rules_example_definition(),
+                "auto_spawn": true,
+                "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+            }),
+            "wf_rules_delete" => json!({ "workflow_name": "billing.ed4qm7k2xa", "force": true }),
+            "wf_rules_get_workflow" | "wf_rules_get_status" => {
+                json!({ "workflow_name": "billing.ed4qm7k2xa" })
+            }
             _ => json!({}),
         };
         for action in row {
             assert_eq!(
                 mesh_admits(deploy, action, None, &params(action)),
+                Ok(MeshAdmission::Admitted),
+                "{action}"
+            );
+        }
+        // A workflow on the hive it names: the target is SY.wf-rules', not SY.deploy's row's.
+        for action in [
+            "wf_rules_compile_apply",
+            "wf_rules_delete",
+            "wf_rules_get_workflow",
+            "wf_rules_get_status",
+        ] {
+            assert_eq!(
+                mesh_admits(deploy, action, Some("worker1"), &params(action)),
                 Ok(MeshAdmission::Admitted),
                 "{action}"
             );
@@ -52781,6 +52838,13 @@ mod tests {
             "vault_put",
             "vault_delete",
             "cd_deploy",
+            "cd_publish",
+            // A workflow's other changes and reads: a deploy is compiled and applied at once.
+            "wf_rules_compile",
+            "wf_rules_apply",
+            "wf_rules_rollback",
+            "wf_rules_check",
+            "wf_rules_list_workflows",
         ] {
             assert!(!row.contains(&action), "{action}");
             assert!(
@@ -52796,6 +52860,14 @@ mod tests {
             PRIMARY_HIVE_ID,
         );
         assert_eq!(launch["launched_by"], json!(deploy));
+        // …and of a workflow's node, which SY.wf-rules launches for the deploy SY.deploy asked for.
+        let wf_launch = stamp_relay_facts(
+            "run_node",
+            json!({ "node_name": "WF.billing.ed4qm7k2xa@worker1", "launched_by": deploy }),
+            Some("SY.wf-rules@worker1"),
+            PRIMARY_HIVE_ID,
+        );
+        assert_eq!(wf_launch["launched_by"], json!(deploy));
         // Another name, or SY.deploy on another hive, has no row.
         for other in [
             "SY.deploy@worker1",
@@ -53759,6 +53831,147 @@ mod tests {
                 result.envelope
             );
         }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// SY.deploy's workflow steps (docs/digital-executive-v1-stage-3.md §4) reach the SY.wf-rules of
+    /// the hive they name as any caller's do: a deploy as its CONFIG_SET compile_apply with
+    /// SY.deploy as the launcher, a removal as SY.wf-rules' delete_workflow command, a read as its
+    /// query; a compile alone stays refused, nothing sent.
+    #[tokio::test]
+    async fn sy_deploys_workflow_steps_reach_the_hives_sy_wf_rules() {
+        let (ctx, mut harness) = opa_test_admin("deploy-workflows");
+        let deploy = AdminOrigin::Mesh("SY.deploy@motherbee");
+        let wait = Duration::from_secs(5);
+        let workflow = "billing.ed4qm7k2xa";
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        fn l2_answer(sent: &Message, payload: Value) -> Message {
+            let mut reply = reply_to(sent, "", payload);
+            reply.meta.msg_type = format!("{}_response", sent.meta.msg_type);
+            reply.meta.msg = None;
+            reply.meta.action = sent.meta.action.clone();
+            reply
+        }
+
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "wf_rules_compile_apply",
+            Some("worker1"),
+            json!({
+                "workflow_name": workflow,
+                "definition": wf_rules_example_definition(),
+                "auto_spawn": true,
+                "tenant_id": tenant,
+            }),
+            deploy,
+        );
+        let wf_rules = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the deploy");
+            assert_eq!(sent.meta.msg.as_deref(), Some("CONFIG_SET"));
+            assert_eq!(dst_of(&sent), json!("SY.wf-rules@worker1"));
+            let config = &sent.payload["config"];
+            assert_eq!(config["operation"], json!("compile_apply"));
+            assert_eq!(config["workflow_name"], json!(workflow));
+            assert_eq!(config["tenant_id"], json!(tenant));
+            assert_eq!(config["auto_spawn"], json!(true));
+            assert_eq!(config["launched_by"], json!("SY.deploy@motherbee"));
+            harness
+                .inject(reply_to(
+                    &sent,
+                    "CONFIG_RESPONSE",
+                    json!({
+                        "ok": true,
+                        "node_name": "SY.wf-rules@worker1",
+                        "state": "configured",
+                        "config_version": 1,
+                        "wf_node": { "node_name": "WF.billing.ed4qm7k2xa@worker1", "action": "launched", "status": "ok" },
+                    }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, wf_rules);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "wf_rules_get_status",
+            Some("worker1"),
+            json!({ "workflow_name": workflow }),
+            deploy,
+        );
+        let wf_rules = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the read");
+            assert_eq!(dst_of(&sent), json!("SY.wf-rules@worker1"));
+            assert_eq!(sent.meta.msg_type, "query");
+            assert_eq!(sent.meta.action.as_deref(), Some("get_status"));
+            assert_eq!(sent.payload["workflow_name"], json!(workflow));
+            harness
+                .inject(l2_answer(
+                    &sent,
+                    json!({ "status": "ok", "workflow_name": workflow }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, wf_rules);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "wf_rules_delete",
+            Some("worker1"),
+            json!({ "workflow_name": workflow, "force": true }),
+            deploy,
+        );
+        let wf_rules = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the removal");
+            assert_eq!(dst_of(&sent), json!("SY.wf-rules@worker1"));
+            assert_eq!(sent.meta.msg_type, "command");
+            assert_eq!(sent.meta.action.as_deref(), Some("delete_workflow"));
+            assert_eq!(sent.payload["workflow_name"], json!(workflow));
+            assert_eq!(sent.payload["force"], json!(true));
+            harness
+                .inject(l2_answer(
+                    &sent,
+                    json!({
+                        "status": "ok",
+                        "deleted": true,
+                        "wf_node": { "node_name": "WF.billing.ed4qm7k2xa@worker1", "action": "deleted", "status": "ok" },
+                    }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, wf_rules);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "wf_rules_compile",
+            Some("worker1"),
+            json!({ "workflow_name": workflow, "definition": wf_rules_example_definition() }),
+            deploy,
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
         assert!(harness
             .next_outgoing_within(Duration::from_millis(100))
             .await
