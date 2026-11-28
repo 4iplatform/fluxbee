@@ -1,7 +1,8 @@
-//! SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2, §3, §5.1, §9): the six `cd_*`
-//! actions SY.admin forwards, each checked and answered at once. A write that is taken is recorded
-//! and journaled first, answered *accepted*, and run in the background by the runner
-//! (`runner.rs`), one deployment at a time, with a lock per grouping.
+//! SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2, §3, §5.1, §9; stage 3 §3, §4): the
+//! eight `cd_*` actions SY.admin forwards, each checked and answered at once. A write that is taken
+//! is recorded and journaled first, answered *accepted*, and run in the background by the runner
+//! (`runner.rs`), one deployment at a time, with a lock per grouping. Its catalog is what Archi
+//! published (`cd_publish`, `cd_unpublish`): each package's copy, and whether it is offered.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -13,13 +14,15 @@ use tokio::sync::mpsc;
 
 use json_router::agent_assets::sha256_hex;
 
+use json_router::solution_package::{
+    agent_providers, catalog_blanks, catalog_parts, check_blanks, compare_versions,
+    key_requirements, parse_package, parse_package_value, versions_kept, whatsapp_numbers,
+    without_nulls, Offer, PackageKind, ParsedPackage, Reading, GROUPING_ED, GROUPING_TENANT,
+    PACKAGE_MAX_BYTES, WORK_ROLE_CONSCIOUS,
+};
+
 use crate::desired::{desired_state, record_parts, DesiredState};
 use crate::ids;
-use crate::source::{
-    agent_providers, catalog_blanks, catalog_parts, check_blanks, compare_versions,
-    key_requirements, parse_source, versions_kept, whatsapp_numbers, without_nulls, ParsedSource,
-    NATIVE_SOURCES,
-};
 use crate::steps::MOTHERBEE;
 use crate::store::{
     DeploymentRecord, DeploymentState, GroupingRef, RecordNode, Removal, SourceRef, Store,
@@ -41,12 +44,19 @@ pub const NUMBER_TAKEN: &str = "NUMBER_TAKEN";
 pub const HIVE_UNAVAILABLE: &str = "HIVE_UNAVAILABLE";
 pub const BUSY: &str = "BUSY";
 pub const DEPLOYMENT_NOT_REMOVABLE: &str = "DEPLOYMENT_NOT_REMOVABLE";
+/// No package is published yet (stage 3 §3): retryable, as Archi publishes its packages at its
+/// start.
+pub const CATALOG_NOT_READY: &str = "CATALOG_NOT_READY";
+/// A publish's codes (stage 3 §3).
+pub const PACKAGE_INVALID: &str = "PACKAGE_INVALID";
+pub const PACKAGE_CHANGED: &str = "PACKAGE_CHANGED";
+pub const PACKAGE_TOO_LARGE: &str = "PACKAGE_TOO_LARGE";
 
 /// The actions, by kind: SY.admin sends a write as a `command`, a read as a `query`.
-pub const COMMANDS: &[&str] = &["cd_deploy", "cd_remove"];
+pub const COMMANDS: &[&str] = &["cd_deploy", "cd_remove", "cd_publish", "cd_unpublish"];
 pub const QUERIES: &[&str] = &["cd_get", "cd_list", "cd_catalog", "cd_tree"];
 
-/// The versions of each source kept (§3.3): the last three, and every one a deployment runs.
+/// The versions of each package kept (§3.3): the last three, and every one a deployment runs.
 pub const SOURCE_VERSIONS_KEPT: usize = 3;
 
 /// A listing's page: 100 deployments without a limit, 200 at most.
@@ -57,10 +67,12 @@ const LIST_MAX_LIMIT: usize = 200;
 const DEPLOYMENT_ID_FORM: &str =
     "deployment_id is a deployment's id: dp, a digit from 2 to 7 and 7 of [a-z2-7]";
 
-/// Whether `id` names a grouping: its ED's ILK, or a short id of any kind.
+/// Whether `id` names a grouping: its ED's ILK, its tenant's id (the tenant's grouping), or a short
+/// id of any kind.
 fn is_grouping_id(id: &str) -> bool {
     ids::is_ilk_id(id)
-        || ["ed", "infra", "test"]
+        || ids::is_tenant_id(id)
+        || ["ed", "tenant", "test"]
             .iter()
             .any(|kind| ids::is_short_id(id, kind))
 }
@@ -72,7 +84,7 @@ const MINT_TRIES: usize = 8;
 /// that changed nothing and may pass when asked again.
 pub fn error_answer(code: &str, message: impl Into<String>) -> Value {
     let mut answer = json!({"status": "error", "error_code": code, "message": message.into()});
-    if matches!(code, BUSY | HIVE_UNAVAILABLE) {
+    if matches!(code, BUSY | HIVE_UNAVAILABLE | CATALOG_NOT_READY) {
         answer["retryable"] = json!(true);
     }
     answer
@@ -128,13 +140,68 @@ pub enum Job {
     },
 }
 
+/// A version's publication (stage 3 §3): whether it is offered, and its offer, as the last publish
+/// or withdraw left it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Publication {
+    pub published: bool,
+    pub offer: Offer,
+    pub by: String,
+    pub at_ms: u64,
+}
+
+impl Publication {
+    fn to_value(&self, kind: PackageKind) -> Value {
+        json!({
+            "published": self.published,
+            "origin": self.offer.origin.as_str(),
+            "offered_to": self.offer.offered_to_value(kind),
+            "by": self.by,
+            "updated_at_ms": self.at_ms,
+        })
+    }
+
+    fn from_value(kind: PackageKind, value: &Value) -> Result<Publication, String> {
+        Ok(Publication {
+            published: value["published"].as_bool().unwrap_or(false),
+            offer: Offer::parse(kind, &value["origin"], &value["offered_to"])?,
+            by: value["by"].as_str().unwrap_or_default().to_string(),
+            at_ms: value["updated_at_ms"].as_u64().unwrap_or_default(),
+        })
+    }
+}
+
+/// A version SY.deploy keeps: its package, and its publication; a copy never published (one kept
+/// before stage 3) has none, and serves only the deployments that run it.
+#[derive(Debug, Clone)]
+pub struct CatalogEntry {
+    pub parsed: ParsedPackage,
+    pub publication: Option<Publication>,
+}
+
+impl CatalogEntry {
+    /// Its offer, while it is published.
+    pub fn offered(&self) -> Option<&Offer> {
+        self.publication
+            .as_ref()
+            .filter(|publication| publication.published)
+            .map(|publication| &publication.offer)
+    }
+}
+
+/// A grouping a deployment goes into that is there already, and its hive.
+struct Existing {
+    grouping: GroupingRef,
+    hive: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Inner {
     pub records: BTreeMap<String, DeploymentRecord>,
     /// The groupings with a run queued or under way: their lock.
     pub busy: BTreeSet<String>,
-    /// The sources the catalog holds, by id and version.
-    pub catalog: BTreeMap<(String, String), ParsedSource>,
+    /// The versions SY.deploy keeps, by id and version.
+    pub catalog: BTreeMap<(String, String), CatalogEntry>,
 }
 
 pub struct Deployer {
@@ -345,7 +412,7 @@ pub fn vault_list_call(
 }
 
 impl Deployer {
-    /// Opens SY.deploy's state: its records, its catalog (the native sources kept as copies, the
+    /// Opens SY.deploy's state: its records, its catalog (the copies and their publications, the
     /// versions beyond what is kept removed), and the runs to resume: every deployment left
     /// `deploying` or `removing`.
     pub fn open(
@@ -381,38 +448,37 @@ impl Deployer {
         Ok(deployer)
     }
 
-    /// The catalog: the native sources and the copies, the versions kept of each (§3.3), the
-    /// natives among them kept as copies and the copies beyond them removed.
+    /// The catalog: the copies and their publications, the versions kept of each (§3.3), the
+    /// copies beyond them removed with their publications.
     pub fn refresh_catalog(&self) -> Result<(), String> {
-        let mut known: BTreeMap<(String, String), ParsedSource> = BTreeMap::new();
-        for (id, version, bytes) in self.store.source_copies() {
+        let mut known: BTreeMap<(String, String), ParsedPackage> = BTreeMap::new();
+        let copies = self.store.source_copies();
+        let on_disk: BTreeSet<(String, String)> = copies
+            .iter()
+            .map(|(id, version, _)| (id.clone(), version.clone()))
+            .collect();
+        for (id, version, bytes) in copies {
             match std::str::from_utf8(&bytes)
                 .map_err(|err| err.to_string())
-                .and_then(parse_source)
+                .and_then(|raw| parse_package(raw, Reading::KeptCopy))
             {
-                Ok(parsed) if parsed.source.id == id && parsed.source.version == version => {
+                Ok(parsed) if parsed.package.id == id && parsed.package.version == version => {
                     known.insert((id, version), parsed);
                 }
                 Ok(_) => {
-                    tracing::error!(source = %id, version = %version, "a source copy names another source; it is left out")
+                    tracing::error!(package = %id, version = %version, "a package copy names another package; it is left out")
                 }
                 Err(err) => {
-                    tracing::error!(source = %id, version = %version, error = %err, "a source copy does not read; it is left out")
+                    tracing::error!(package = %id, version = %version, error = %err, "a package copy does not read; it is left out")
                 }
             }
         }
-        for raw in NATIVE_SOURCES {
-            let parsed =
-                parse_source(raw).map_err(|err| format!("a native source does not read: {err}"))?;
-            let key = (parsed.source.id.clone(), parsed.source.version.clone());
-            if let Some(copy) = known.get(&key) {
-                if copy.hash != parsed.hash {
-                    tracing::error!(source = %key.0, version = %key.1, "the copy of a native source differs from it: the copy is kept");
-                    continue;
-                }
-            }
-            known.insert(key, parsed);
-        }
+        let mut publications: BTreeMap<(String, String), Value> = self
+            .store
+            .publications()
+            .into_iter()
+            .map(|(id, version, state)| ((id, version), state))
+            .collect();
         let mut inner = lock(&self.inner);
         let in_use: BTreeSet<(String, String)> = inner
             .records
@@ -439,21 +505,47 @@ impl Deployer {
                 let Some(parsed) = known.remove(&key) else {
                     continue;
                 };
+                let state = publications.remove(&key);
                 if kept.contains(&version) {
-                    if let Err(err) = self
-                        .store
-                        .keep_source_copy(&id, &version, &parsed.canonical)
+                    let publication = match state
+                        .map(|state| Publication::from_value(parsed.package.kind, &state))
+                        .transpose()
                     {
-                        tracing::error!(source = %id, version = %version, error = %err, "a source's copy");
-                    }
-                    catalog.insert(key, parsed);
+                        Ok(publication) => publication,
+                        Err(err) => {
+                            tracing::error!(package = %id, version = %version, error = %err, "a version's publication does not read: it is not offered");
+                            None
+                        }
+                    };
+                    catalog.insert(
+                        key,
+                        CatalogEntry {
+                            parsed,
+                            publication,
+                        },
+                    );
                 } else if self.store.remove_source_copy(&id, &version).is_ok() {
-                    tracing::info!(source = %id, version = %version, "a source version beyond the ones kept was removed");
+                    self.store.remove_publication(&id, &version);
+                    tracing::info!(package = %id, version = %version, "a package version beyond the ones kept was removed");
                 }
+            }
+        }
+        // A publication whose copy is gone goes too; one whose copy does not read stays with it.
+        for (id, version) in publications.into_keys() {
+            if !on_disk.contains(&(id.clone(), version.clone())) {
+                self.store.remove_publication(&id, &version);
             }
         }
         inner.catalog = catalog;
         Ok(())
+    }
+
+    /// Whether SY.deploy takes deployments: it holds a published package (stage 3 §3).
+    pub fn catalog_ready(&self) -> bool {
+        lock(&self.inner)
+            .catalog
+            .values()
+            .any(|entry| entry.offered().is_some())
     }
 
     fn resume(&self) {
@@ -539,12 +631,13 @@ impl Deployer {
         lock(&self.inner).busy.remove(grouping_key);
     }
 
-    pub fn source_of(&self, record: &DeploymentRecord) -> Result<ParsedSource, String> {
+    /// The package a deployment runs, published or not: its copy, pinned by its hash.
+    pub fn source_of(&self, record: &DeploymentRecord) -> Result<ParsedPackage, String> {
         let inner = lock(&self.inner);
         let parsed = inner
             .catalog
             .get(&(record.source.id.clone(), record.source.version.clone()))
-            .cloned()
+            .map(|entry| entry.parsed.clone())
             .ok_or_else(|| {
                 format!(
                     "SY.deploy holds no copy of the source {} version {}",
@@ -569,6 +662,8 @@ impl Deployer {
         let answer = match (kind, action) {
             ("command", "cd_deploy") => self.cd_deploy(payload).await,
             ("command", "cd_remove") => self.cd_remove(payload),
+            ("command", "cd_publish") => self.cd_publish(payload),
+            ("command", "cd_unpublish") => self.cd_unpublish(payload),
             ("query", "cd_get") => self.cd_get(payload).await,
             ("query", "cd_list") => self.cd_list(payload).await,
             ("query", "cd_catalog") => self.cd_catalog(payload),
@@ -677,7 +772,7 @@ impl Deployer {
         };
         let hive_ask = text_field(&fields, "hive")?;
         // The order's content as read, so a field sent as null and one left out are the same.
-        let request_hash = sha256_hex(&crate::source::canonical_bytes(&json!({
+        let request_hash = sha256_hex(&json_router::solution_package::canonical_bytes(&json!({
             "tenant_id": tenant_id,
             "source": {"id": source_id, "version": source_version},
             "grouping": {"kind": grouping_kind, "id": grouping_id},
@@ -701,103 +796,121 @@ impl Deployer {
             return self.replay(existing, &caller);
         }
 
-        // The source: one SY.deploy carries, at a released version.
-        let parsed = {
+        // The catalog: what Archi published, or the copies kept before a restart.
+        if !self.catalog_ready() {
+            return Err(error_answer(
+                CATALOG_NOT_READY,
+                "SY.deploy holds no published package yet: Archi publishes its packages at its start",
+            ));
+        }
+        // The package: a published version, offered to the tenant.
+        let (parsed, offer) = {
             let inner = lock(&self.inner);
-            let mut versions: Vec<&ParsedSource> = inner
+            let mut versions: Vec<&CatalogEntry> = inner
                 .catalog
                 .iter()
-                .filter(|((id, _), _)| *id == source_id)
-                .map(|(_, parsed)| parsed)
+                .filter(|((id, _), entry)| {
+                    *id == source_id
+                        && entry
+                            .offered()
+                            .is_some_and(|offer| offer.tenants.admits(&tenant_id))
+                })
+                .map(|(_, entry)| entry)
                 .collect();
-            versions.sort_by(|a, b| compare_versions(&b.source.version, &a.source.version));
+            versions.sort_by(|a, b| {
+                compare_versions(&b.parsed.package.version, &a.parsed.package.version)
+            });
             match &source_version {
                 Some(version) => versions
                     .into_iter()
-                    .find(|parsed| parsed.source.version == *version),
+                    .find(|entry| entry.parsed.package.version == *version),
                 None => versions.into_iter().next(),
             }
-            .cloned()
+            .and_then(|entry| {
+                entry
+                    .offered()
+                    .cloned()
+                    .map(|offer| (entry.parsed.clone(), offer))
+            })
         }
         .ok_or_else(|| {
             error_answer(
                 SOURCE_NOT_FOUND,
-                "SY.deploy holds no such source, or no such version of it",
+                "SY.deploy offers the tenant no such package, or no such version of it",
             )
         })?;
-        let source = &parsed.source;
+        let package = &parsed.package;
 
-        // The grouping: of the tenant and of a kind the source fits; a new one only from a source
-        // that founds it.
-        if grouping_kind != source.kind {
+        // The grouping: of the kind the package deploys into. An executive makes a new ED's; a
+        // capability of one ED goes into that ED's; infrastructure and a capability of every ED
+        // into the tenant's, made by the first deployment that needs it.
+        let into = package.deploys_into();
+        if grouping_kind != into {
             return Err(error_answer(
                 INVALID_REQUEST,
                 format!(
-                    "the source {} deploys into a grouping of kind {}",
-                    source.id, source.kind
+                    "the package {} ({}) deploys into a grouping of kind {into}",
+                    package.id,
+                    package.kind.as_str()
                 ),
             ));
         }
-        if ids::grouping_prefix(&grouping_kind).is_none() {
-            return Err(error_answer(
-                INVALID_REQUEST,
-                format!("no grouping is of kind {grouping_kind}"),
-            ));
-        }
         let mut hive_of_grouping = None;
-        let grouping = match &grouping_id {
-            Some(id) => {
-                let founding = lock(&self.inner)
-                    .records
-                    .values()
-                    .find(|record| {
-                        record.founding
-                            && record.tenant_id == tenant_id
-                            && record.state != DeploymentState::Removed
-                            && record.grouping.kind == grouping_kind
-                            && (record.grouping.id == *id || record.grouping.short_id == *id)
-                    })
-                    .cloned()
-                    .ok_or_else(|| error_answer(NOT_FOUND, "no such grouping in the tenant"))?;
-                if source.founds.is_some() {
-                    return Err(error_answer(
-                        INVALID_REQUEST,
-                        format!(
-                            "the source {} founds a new grouping: name no grouping id",
-                            source.id
-                        ),
-                    ));
-                }
-                if lock(&self.inner).busy.contains(founding.grouping_key()) {
-                    return Err(error_answer(BUSY, "the grouping has a run under way"));
-                }
-                if hive_ask.as_ref().is_some_and(|hive| *hive != founding.hive) {
-                    return Err(error_answer(
-                        INVALID_REQUEST,
-                        "a grouping's deployments go to its hive",
-                    ));
-                }
-                hive_of_grouping = Some(founding.hive.clone());
-                Some(founding.grouping.clone())
+        let grouping = if package.kind == PackageKind::Executive {
+            if grouping_id.is_some() {
+                return Err(error_answer(
+                    INVALID_REQUEST,
+                    format!(
+                        "the package {} founds a new grouping: name no grouping id",
+                        package.id
+                    ),
+                ));
             }
-            None => {
-                if source.founds.is_none() {
-                    return Err(error_answer(
+            None
+        } else {
+            let existing = if into == GROUPING_ED {
+                let id = grouping_id.as_ref().ok_or_else(|| {
+                    error_answer(
                         INVALID_REQUEST,
-                        format!(
-                            "only a source that founds one makes a new grouping, not {}",
-                            source.id
-                        ),
-                    ));
+                        "a capability of one ED names its ED: grouping.id, its ILK or its short id",
+                    )
+                })?;
+                Some(self.ed_grouping(&tenant_id, id, &offer)?)
+            } else {
+                self.tenant_grouping(&tenant_id, grouping_id.as_deref())?
+            };
+            match existing {
+                Some(existing) => {
+                    if hive_ask.as_ref().is_some_and(|hive| *hive != existing.hive) {
+                        return Err(error_answer(
+                            INVALID_REQUEST,
+                            "a grouping's deployments go to its hive",
+                        ));
+                    }
+                    if let Some(running) = lock(&self.inner).records.values().find(|record| {
+                        record.grouping_key() == existing.grouping.short_id
+                            && record.state != DeploymentState::Removed
+                            && record.source.id == package.id
+                    }) {
+                        return Err(error_answer(
+                            INVALID_REQUEST,
+                            format!(
+                                "the grouping runs the package {} already, in the deployment {}",
+                                package.id, running.deployment_id
+                            ),
+                        ));
+                    }
+                    hive_of_grouping = Some(existing.hive);
+                    Some(existing.grouping)
                 }
-                None
+                None => None,
             }
         };
 
-        // The blanks: exactly the source's, each by its type.
-        check_blanks(source, &blanks)
+        // The blanks: exactly the package's, each by its type.
+        check_blanks(package, &blanks)
             .map_err(|err| error_answer(BLANK_INVALID, err.to_string()))?;
-        for number in whatsapp_numbers(source, &blanks) {
+        for number in whatsapp_numbers(package, &blanks) {
             let held = {
                 let inner = lock(&self.inner);
                 inner
@@ -817,14 +930,14 @@ impl Deployer {
         // The hive: a live worker with room under the router's 1024.
         let hive = match hive_of_grouping {
             Some(hive) => {
-                self.room_on(&hive, source.nodes.len())?;
+                self.room_on(&hive, package.nodes.len())?;
                 hive
             }
-            None => self.pick_hive(hive_ask.as_deref(), source.nodes.len())?,
+            None => self.pick_hive(hive_ask.as_deref(), package.nodes.len())?,
         };
-        // The runtimes: each pinned to its current version (§3.2).
+        // The runtimes: each pinned to its current version (§3.2); a WF's is SY.wf-rules'.
         let mut runtime_versions = BTreeMap::new();
-        for node in &source.nodes {
+        for node in package.nodes.iter().filter(|node| !node.is_wf()) {
             match self.world.runtime_current(&node.runtime) {
                 Ok(Some(version)) => {
                     runtime_versions.insert(node.role.clone(), version);
@@ -849,7 +962,7 @@ impl Deployer {
 
         // The ids: minted, and held by no SHM entry and no record.
         let (deployment_id, grouping, nodes) =
-            self.mint_ids(&parsed, &hive, grouping, &runtime_versions)?;
+            self.mint_ids(&parsed, &hive, grouping, &tenant_id, &runtime_versions)?;
         let now = self.world.now_ms();
         let mut record = DeploymentRecord {
             deployment_id: deployment_id.clone(),
@@ -858,11 +971,11 @@ impl Deployer {
             request_key,
             request_hash,
             source: SourceRef {
-                id: source.id.clone(),
-                version: source.version.clone(),
+                id: package.id.clone(),
+                version: package.version.clone(),
                 hash: parsed.hash.clone(),
             },
-            founding: source.founds.is_some(),
+            founding: package.founds.is_some(),
             blanks,
             hive,
             nodes,
@@ -904,6 +1017,98 @@ impl Deployer {
         }
         let _ = self.jobs.send(Job::Deploy(deployment_id));
         Ok(answer)
+    }
+
+    /// An ED's grouping a capability goes into: its founding deployment, active, of the tenant;
+    /// the package offered to that ED; and its conscious, which the door starts from.
+    fn ed_grouping(&self, tenant_id: &str, id: &str, offer: &Offer) -> Result<Existing, Value> {
+        let inner = lock(&self.inner);
+        let founding = inner
+            .records
+            .values()
+            .find(|record| {
+                record.founding
+                    && record.tenant_id == tenant_id
+                    && record.state != DeploymentState::Removed
+                    && record.grouping.kind == GROUPING_ED
+                    && (record.grouping.id == id || record.grouping.short_id == id)
+            })
+            .cloned()
+            .ok_or_else(|| error_answer(NOT_FOUND, "no such ED in the tenant"))?;
+        if inner.busy.contains(founding.grouping_key()) {
+            return Err(error_answer(BUSY, "the grouping has a run under way"));
+        }
+        drop(inner);
+        if founding.state != DeploymentState::Active {
+            return Err(error_answer(
+                INVALID_REQUEST,
+                format!(
+                    "the ED's founding deployment is {}, not active",
+                    founding.state.as_str()
+                ),
+            ));
+        }
+        if !offer.eds.admits(&founding.grouping.short_id) {
+            return Err(error_answer(
+                SOURCE_NOT_FOUND,
+                "SY.deploy offers that ED no such package",
+            ));
+        }
+        let conscious = founding
+            .nodes
+            .iter()
+            .find(|node| node.work_role == WORK_ROLE_CONSCIOUS)
+            .map(|node| node.node_name.clone())
+            .ok_or_else(|| error_answer(INVALID_REQUEST, "the ED has no conscious"))?;
+        Ok(Existing {
+            grouping: GroupingRef {
+                conscious: Some(conscious),
+                ..founding.grouping.clone()
+            },
+            hive: founding.hive,
+        })
+    }
+
+    /// The tenant's grouping (stage 3 §4): the one its deployments that are not removed name, or
+    /// none yet, when the first deployment that needs it makes it. An id names it: the tenant's
+    /// id or its short id.
+    fn tenant_grouping(
+        &self,
+        tenant_id: &str,
+        id: Option<&str>,
+    ) -> Result<Option<Existing>, Value> {
+        let inner = lock(&self.inner);
+        let live = inner
+            .records
+            .values()
+            .find(|record| {
+                record.tenant_id == tenant_id
+                    && record.grouping.kind == GROUPING_TENANT
+                    && record.state != DeploymentState::Removed
+            })
+            .cloned();
+        match (live, id) {
+            (Some(record), Some(id)) if record.grouping.id != id && record.grouping.short_id != id => {
+                Err(error_answer(NOT_FOUND, "no such grouping in the tenant"))
+            }
+            (None, Some(_)) => Err(error_answer(
+                NOT_FOUND,
+                "the tenant has no grouping of its own yet: name no grouping id, and the first deployment makes it",
+            )),
+            (Some(record), _) => {
+                if inner.busy.contains(record.grouping_key()) {
+                    return Err(error_answer(BUSY, "the grouping has a run under way"));
+                }
+                Ok(Some(Existing {
+                    grouping: GroupingRef {
+                        conscious: None,
+                        ..record.grouping.clone()
+                    },
+                    hive: record.hive,
+                }))
+            }
+            (None, None) => Ok(None),
+        }
     }
 
     /// The same order again (§2.1, §2.2): the same deployment; a failed one resumes where it
@@ -1027,11 +1232,11 @@ impl Deployer {
     async fn check_keys(
         &self,
         tenant_id: &str,
-        parsed: &ParsedSource,
+        parsed: &ParsedPackage,
         blanks: &Value,
     ) -> Result<(), Value> {
-        let providers = agent_providers(&parsed.source);
-        let credentials = key_requirements(&parsed.source, blanks);
+        let providers = agent_providers(&parsed.package);
+        let credentials = key_requirements(&parsed.package, blanks);
         let mut reads = Vec::new();
         for provider in &providers {
             reads.push(vault_list_call(
@@ -1089,13 +1294,16 @@ impl Deployer {
         Ok(())
     }
 
-    /// The ids of a new deployment: its id, its grouping's (for a new one: its short id and its
-    /// person's ILK), and each node's name and ILK, none held by an SHM entry or a record.
+    /// The ids of a new deployment: its id, its grouping's (for a new ED's: its short id and its
+    /// person's ILK; for a new tenant's: its short id), and each node's name and ILK (a WF's is
+    /// the orchestrator's), none held by an SHM entry or a record. In a grouping that is there
+    /// already the names are fixed: one that is taken refuses the deployment.
     fn mint_ids(
         &self,
-        parsed: &ParsedSource,
+        parsed: &ParsedPackage,
         hive: &str,
         grouping: Option<GroupingRef>,
+        tenant_id: &str,
         runtime_versions: &BTreeMap<String, String>,
     ) -> Result<(String, GroupingRef, Vec<RecordNode>), Value> {
         let ilks = self.world.identity().map_err(|err| {
@@ -1134,6 +1342,9 @@ impl Deployer {
             .collect();
         drop(inner);
         let ilk_free = |ilk: &str| !held_ilks.contains(ilk) && !recorded_ilks.contains(ilk);
+        let package = &parsed.package;
+        let kind = package.deploys_into();
+        let fixed = grouping.is_some();
         let mut rng = rand::thread_rng();
         let deployment_id = (0..MINT_TRIES)
             .map(|_| ids::mint_deployment_id(&mut rng))
@@ -1143,51 +1354,82 @@ impl Deployer {
             let grouping = match &grouping {
                 Some(grouping) => grouping.clone(),
                 None => {
-                    let short_id =
-                        ids::mint_short_id(&mut rng, &parsed.source.kind).ok_or_else(|| {
-                            error_answer(INVALID_REQUEST, "the grouping kind has no short id")
-                        })?;
+                    let short_id = ids::mint_short_id(&mut rng, kind).ok_or_else(|| {
+                        error_answer(INVALID_REQUEST, "the grouping kind has no short id")
+                    })?;
                     if recorded_shorts.contains(&short_id) {
                         continue;
                     }
-                    let person = ids::mint_ilk_id();
-                    if !ilk_free(&person) {
-                        continue;
-                    }
+                    // An ED's grouping is its person; a tenant's is the tenant.
+                    let id = if kind == GROUPING_ED {
+                        let person = ids::mint_ilk_id();
+                        if !ilk_free(&person) {
+                            continue;
+                        }
+                        person
+                    } else {
+                        tenant_id.to_string()
+                    };
                     GroupingRef {
-                        kind: parsed.source.kind.clone(),
-                        id: person,
+                        kind: kind.to_string(),
+                        id,
                         short_id,
+                        conscious: None,
                     }
                 }
             };
-            let nodes: Vec<RecordNode> = parsed
-                .source
+            let nodes: Vec<RecordNode> = package
                 .nodes
                 .iter()
-                .map(|node| RecordNode {
-                    role: node.role.clone(),
-                    node_name: ids::node_name(
+                .map(|node| {
+                    let node_name = ids::node_name(
                         &node.kind,
                         node.middle.as_deref(),
                         &grouping.short_id,
                         hive,
-                    ),
-                    ilk_id: ids::mint_ilk_id(),
-                    runtime: node.runtime.clone(),
-                    runtime_version: runtime_versions
-                        .get(&node.role)
-                        .cloned()
-                        .unwrap_or_default(),
-                    work_role: node.work_role.clone(),
+                    );
+                    match ids::workflow_name(&node_name).map(str::to_string) {
+                        Some(workflow) if node.is_wf() => RecordNode {
+                            role: node.role.clone(),
+                            node_name,
+                            ilk_id: String::new(),
+                            runtime: format!("wf.{workflow}"),
+                            runtime_version: String::new(),
+                            work_role: node.work_role.clone(),
+                        },
+                        _ => RecordNode {
+                            role: node.role.clone(),
+                            node_name,
+                            ilk_id: ids::mint_ilk_id(),
+                            runtime: node.runtime.clone(),
+                            runtime_version: runtime_versions
+                                .get(&node.role)
+                                .cloned()
+                                .unwrap_or_default(),
+                            work_role: node.work_role.clone(),
+                        },
+                    }
                 })
                 .collect();
-            let free = nodes.iter().all(|node| {
-                ilk_free(&node.ilk_id)
-                    && !held_names.contains(&node.node_name)
-                    && !recorded_names.contains(&node.node_name)
+            let taken = nodes.iter().find(|node| {
+                held_names.contains(&node.node_name) || recorded_names.contains(&node.node_name)
             });
-            if free {
+            if let Some(taken) = taken {
+                if fixed {
+                    return Err(error_answer(
+                        INVALID_REQUEST,
+                        format!(
+                            "the node name {} is taken in the grouping: by a node of another deployment, or by one a removed deployment left marked",
+                            taken.node_name
+                        ),
+                    ));
+                }
+                continue;
+            }
+            if nodes
+                .iter()
+                .all(|node| node.ilk_id.is_empty() || ilk_free(&node.ilk_id))
+            {
                 return Ok((deployment_id, grouping, nodes));
             }
         }
@@ -1215,7 +1457,7 @@ impl Deployer {
         if grouping_id.as_deref().is_some_and(|id| !is_grouping_id(id)) {
             return Err(error_answer(
                 INVALID_REQUEST,
-                "grouping_id is a grouping's id (its ED's ILK, ilk:<uuid>) or its short id",
+                "grouping_id is a grouping's id (its ED's ILK, ilk:<uuid>, or its tenant's, tnt:<uuid>) or its short id",
             ));
         }
         let in_scope = |record: &DeploymentRecord| {
@@ -1234,11 +1476,18 @@ impl Deployer {
                 (Some(record.clone()), record.grouping_key().to_string())
             }
             (None, Some(id)) => {
+                // A tenant's id names every grouping the tenant had: the one not removed first.
                 let record = inner
                     .records
                     .values()
                     .filter(|record| in_scope(record))
-                    .find(|record| record.grouping.id == *id || record.grouping.short_id == *id)
+                    .filter(|record| record.grouping.id == *id || record.grouping.short_id == *id)
+                    .max_by_key(|record| {
+                        (
+                            record.state != DeploymentState::Removed,
+                            record.created_at_ms,
+                        )
+                    })
                     .ok_or_else(|| error_answer(NOT_FOUND, "no such grouping"))?;
                 (None, record.grouping_key().to_string())
             }
@@ -1404,9 +1653,10 @@ impl Deployer {
     /// took, and how it ended.
     pub fn progress(&self, deployment_id: &str) -> Value {
         let journal = self.store.read_journal(deployment_id);
+        // A run that continues another (a read again after a WF's compile) is part of its try.
         let start = journal
             .iter()
-            .rposition(|entry| entry["event"] == "run")
+            .rposition(|entry| entry["event"] == "run" && entry["continues"] != json!(true))
             .unwrap_or(0);
         let steps: Vec<Value> = journal[start..]
             .iter()
@@ -1555,22 +1805,74 @@ impl Deployer {
         Ok(answer)
     }
 
+    /// The published packages the caller's tenant is offered (stage 3 §4): system and catalog ones
+    /// to every tenant, a custom one to its tenant; by kind; with a grouping (an ED), only the
+    /// capabilities its `eds` offers that ED.
     fn cd_catalog(&self, payload: Value) -> Answer {
-        let (_caller, fields) = split_order(payload)?;
-        only_fields(&fields, &["tenant_id", "kind"], "cd_catalog")?;
-        let kind = text_field(&fields, "kind")?;
+        let (caller, fields) = split_order(payload)?;
+        only_fields(&fields, &["tenant_id", "kind", "grouping_id"], "cd_catalog")?;
+        let tenant = match scoped_tenant(&caller, text_field(&fields, "tenant_id")?) {
+            Ok(tenant) => tenant,
+            // Another tenant than the one claimed is offered nothing.
+            Err(_) => return Ok(json!({"status": "ok", "sources": []})),
+        };
+        let kind = text_field(&fields, "kind")?
+            .map(|kind| {
+                PackageKind::parse(&kind, true).ok_or_else(|| {
+                    error_answer(
+                        INVALID_REQUEST,
+                        "kind is one of executive, capability and infrastructure",
+                    )
+                })
+            })
+            .transpose()?;
         let inner = lock(&self.inner);
-        let mut by_id: BTreeMap<String, Vec<&ParsedSource>> = BTreeMap::new();
-        for ((id, _), parsed) in &inner.catalog {
-            if kind.as_ref().is_none_or(|kind| parsed.source.kind == *kind) {
-                by_id.entry(id.clone()).or_default().push(parsed);
+        let ed = match text_field(&fields, "grouping_id")? {
+            Some(id) => Some(
+                inner
+                    .records
+                    .values()
+                    .find(|record| {
+                        record.founding
+                            && record.state != DeploymentState::Removed
+                            && record.grouping.kind == GROUPING_ED
+                            && tenant
+                                .as_ref()
+                                .is_none_or(|tenant| record.tenant_id == *tenant)
+                            && (record.grouping.id == id || record.grouping.short_id == id)
+                    })
+                    .map(|record| record.grouping.short_id.clone())
+                    .ok_or_else(|| error_answer(NOT_FOUND, "no such ED in the tenant"))?,
+            ),
+            None => None,
+        };
+        let mut by_id: BTreeMap<String, Vec<&CatalogEntry>> = BTreeMap::new();
+        for ((id, _), entry) in &inner.catalog {
+            let Some(offer) = entry.offered() else {
+                continue;
+            };
+            let package = &entry.parsed.package;
+            let offered = tenant
+                .as_ref()
+                .is_none_or(|tenant| offer.tenants.admits(tenant))
+                && kind.is_none_or(|kind| package.kind == kind)
+                && ed.as_ref().is_none_or(|ed| {
+                    package.kind != PackageKind::Capability
+                        || package.deploys_into() != GROUPING_ED
+                        || offer.eds.admits(ed)
+                });
+            if offered {
+                by_id.entry(id.clone()).or_default().push(entry);
             }
         }
         let sources: Vec<Value> = by_id
             .into_iter()
             .map(|(id, mut versions)| {
-                versions.sort_by(|a, b| compare_versions(&b.source.version, &a.source.version));
-                let newest = versions[0];
+                versions.sort_by(|a, b| {
+                    compare_versions(&b.parsed.package.version, &a.parsed.package.version)
+                });
+                let newest = &versions[0].parsed.package;
+                let offer = versions[0].offered();
                 let in_use = |version: &str| {
                     inner
                         .records
@@ -1584,22 +1886,179 @@ impl Deployer {
                 };
                 json!({
                     "id": id,
-                    "kind": newest.source.kind,
-                    "title": newest.source.title,
-                    "description": newest.source.description,
-                    "founds": newest.source.founds.is_some(),
-                    "newest": newest.source.version,
-                    "versions": versions.iter().map(|parsed| json!({
-                        "version": parsed.source.version,
-                        "hash": parsed.hash,
-                        "blanks": catalog_blanks(&parsed.source),
-                        "parts": catalog_parts(&parsed.source),
-                        "deployments": in_use(&parsed.source.version),
+                    "kind": newest.kind.as_str(),
+                    "origin": offer.map(|offer| offer.origin.as_str()),
+                    "offered_to": offer.map(|offer| offer.offered_to_value(newest.kind)),
+                    "deploys_into": newest.deploys_into(),
+                    "title": newest.title,
+                    "description": newest.description,
+                    "founds": newest.founds.is_some(),
+                    "newest": newest.version,
+                    "blanks": catalog_blanks(newest),
+                    "versions": versions.iter().map(|entry| json!({
+                        "version": entry.parsed.package.version,
+                        "hash": entry.parsed.hash,
+                        "blanks": catalog_blanks(&entry.parsed.package),
+                        "parts": catalog_parts(&entry.parsed.package),
+                        "deployments": in_use(&entry.parsed.package.version),
                     })).collect::<Vec<_>>(),
                 })
             })
             .collect();
         Ok(json!({"status": "ok", "sources": sources}))
+    }
+
+    // --- cd_publish, cd_unpublish (stage 3 §3) -------------------------------------------------
+
+    /// A publish's caller: Archi or the operator, through SY.admin; never a tenant's claim.
+    fn publisher(caller: &Caller) -> Result<(), Value> {
+        match caller.tenant_id {
+            Some(_) => Err(error_answer(
+                INVALID_REQUEST,
+                "a package is published by Archi or the operator, never for a claimed tenant",
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Takes a released package: checks it, keeps its copy (written once), and offers it. The same
+    /// version again is `already`; the same version with another content, `PACKAGE_CHANGED`. A
+    /// copy kept before stage 3 (kind `ed`, no offer) takes the offer of the publish of its
+    /// content, its bytes and the hash its deployments pin unchanged.
+    fn cd_publish(&self, payload: Value) -> Answer {
+        let (caller, fields) = split_order(payload)?;
+        only_fields(&fields, &["package"], "cd_publish")?;
+        Self::publisher(&caller)?;
+        let package = match fields.get("package") {
+            Some(package @ Value::Object(_)) => package,
+            _ => {
+                return Err(error_answer(
+                    INVALID_REQUEST,
+                    "package is required, the package's JSON object",
+                ))
+            }
+        };
+        let size = serde_json::to_vec(package)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if size > PACKAGE_MAX_BYTES {
+            return Err(error_answer(
+                PACKAGE_TOO_LARGE,
+                format!("the package is {size} bytes: a package is at most {PACKAGE_MAX_BYTES}"),
+            ));
+        }
+        let parsed = parse_package_value(package, Reading::Publish)
+            .map_err(|why| error_answer(PACKAGE_INVALID, why))?;
+        let id = parsed.package.id.clone();
+        let version = parsed.package.version.clone();
+        let changed = || {
+            error_answer(
+                PACKAGE_CHANGED,
+                format!(
+                    "SY.deploy keeps {id} version {version} with another content: a change is a new version"
+                ),
+            )
+        };
+        let existing = lock(&self.inner)
+            .catalog
+            .get(&(id.clone(), version.clone()))
+            .map(|entry| entry.parsed.clone());
+        let (kept, hash) = match existing {
+            Some(copy) if copy.hash == parsed.hash => ("already", copy.hash),
+            Some(copy)
+                if copy.package.offer.is_none() && copy.content_hash == parsed.content_hash =>
+            {
+                ("already", copy.hash)
+            }
+            Some(_) => return Err(changed()),
+            None => match self
+                .store
+                .keep_source_copy(&id, &version, &parsed.canonical)
+            {
+                Ok(true) => ("new", parsed.hash.clone()),
+                Ok(false) => ("already", parsed.hash.clone()),
+                Err(_) => return Err(changed()),
+            },
+        };
+        let offer = parsed
+            .package
+            .offer
+            .clone()
+            .ok_or_else(|| error_answer(PACKAGE_INVALID, "a package names its offer"))?;
+        let publication = Publication {
+            published: true,
+            offer,
+            by: caller.by.clone(),
+            at_ms: self.world.now_ms(),
+        };
+        self.store
+            .save_publication(&id, &version, &publication.to_value(parsed.package.kind))
+            .map_err(|err| error_answer(BUSY, err))?;
+        self.refresh_catalog()
+            .map_err(|err| error_answer(BUSY, err))?;
+        tracing::info!(package = %id, version = %version, kept, by = %caller.by, "a package was published");
+        Ok(json!({
+            "status": "ok",
+            "kept": kept,
+            "id": id,
+            "version": version,
+            "hash": hash,
+        }))
+    }
+
+    /// Withdraws a version: it is no longer offered; the deployments that run it keep it.
+    fn cd_unpublish(&self, payload: Value) -> Answer {
+        let (caller, fields) = split_order(payload)?;
+        only_fields(&fields, &["id", "version"], "cd_unpublish")?;
+        Self::publisher(&caller)?;
+        let id = text_field(&fields, "id")?
+            .ok_or_else(|| error_answer(INVALID_REQUEST, "id is required"))?;
+        let version = text_field(&fields, "version")?
+            .ok_or_else(|| error_answer(INVALID_REQUEST, "version is required"))?;
+        let (entry, deployments) = {
+            let inner = lock(&self.inner);
+            let entry = inner
+                .catalog
+                .get(&(id.clone(), version.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    error_answer(SOURCE_NOT_FOUND, "SY.deploy keeps no such package version")
+                })?;
+            let deployments = inner
+                .records
+                .values()
+                .filter(|record| {
+                    record.state != DeploymentState::Removed
+                        && record.source.id == id
+                        && record.source.version == version
+                })
+                .count();
+            (entry, deployments)
+        };
+        if let Some(mut publication) = entry.publication {
+            if publication.published {
+                publication.published = false;
+                publication.by = caller.by.clone();
+                publication.at_ms = self.world.now_ms();
+                self.store
+                    .save_publication(
+                        &id,
+                        &version,
+                        &publication.to_value(entry.parsed.package.kind),
+                    )
+                    .map_err(|err| error_answer(BUSY, err))?;
+                self.refresh_catalog()
+                    .map_err(|err| error_answer(BUSY, err))?;
+                tracing::info!(package = %id, version = %version, by = %caller.by, deployments, "a package was withdrawn");
+            }
+        }
+        Ok(json!({
+            "status": "ok",
+            "id": id,
+            "version": version,
+            "published": false,
+            "deployments": deployments,
+        }))
     }
 
     async fn cd_tree(&self, payload: Value) -> Answer {
@@ -1645,14 +2104,14 @@ impl Deployer {
     }
 }
 
-/// The WhatsApp numbers a deployment holds: its blanks' of its source's number type, or, for a
-/// source the catalog no longer holds, any `phone_number_id` among its blanks.
+/// The WhatsApp numbers a deployment holds: its blanks' of its package's number type, or, for a
+/// package the catalog no longer holds, any `phone_number_id` among its blanks.
 fn record_numbers(
     record: &DeploymentRecord,
-    catalog: &BTreeMap<(String, String), ParsedSource>,
+    catalog: &BTreeMap<(String, String), CatalogEntry>,
 ) -> Vec<String> {
     match catalog.get(&(record.source.id.clone(), record.source.version.clone())) {
-        Some(parsed) => whatsapp_numbers(&parsed.source, &record.blanks),
+        Some(entry) => whatsapp_numbers(&entry.parsed.package, &record.blanks),
         None => record
             .blanks
             .as_object()

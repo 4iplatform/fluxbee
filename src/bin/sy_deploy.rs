@@ -1,11 +1,15 @@
-//! SY.deploy, the CD node (docs/digital-executive-v1-stage-2.md §3, docs/nodes/sy-deploy.md): it
-//! deploys user solutions from their sources into groupings, step by step through SY.admin, and
-//! records what it did. Motherbee only. It takes its orders from `SY.admin@motherbee` alone, the
-//! six `cd_*` actions SY.admin forwards; it keeps its state in plain files under
-//! `/var/lib/fluxbee/state/sy-deploy`; it keeps no ED data, which lives in identity.
+//! SY.deploy, the CD node (docs/digital-executive-v1-stage-2.md §3, stage 3 §3 and §4,
+//! docs/nodes/sy-deploy.md): it deploys solutions from the packages Archi publishes into groupings,
+//! step by step through SY.admin, and records what it did. Motherbee only. It takes its orders from
+//! `SY.admin@motherbee` alone, the eight `cd_*` actions SY.admin forwards; it keeps its state in
+//! plain files under `/var/lib/fluxbee/state/sy-deploy`; it keeps no ED data, which lives in
+//! identity. Its package format is the core library's (`json_router::solution_package`).
 
 #[path = "sy_deploy/desired.rs"]
 mod desired;
+#[cfg(test)]
+#[path = "sy_deploy/fixtures.rs"]
+mod fixtures;
 #[path = "sy_deploy/ids.rs"]
 mod ids;
 #[path = "sy_deploy/mesh.rs"]
@@ -14,8 +18,6 @@ mod mesh;
 mod runner;
 #[path = "sy_deploy/service.rs"]
 mod service;
-#[path = "sy_deploy/source.rs"]
-mod source;
 #[path = "sy_deploy/steps.rs"]
 mod steps;
 #[path = "sy_deploy/store.rs"]

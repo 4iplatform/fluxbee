@@ -3,6 +3,11 @@
 //! what is missing (`build_steps`), so a retry, a restart or a resume converges and never replays.
 //! A step that fails for good leaves the deployment `failed`, with the step and its error; nothing
 //! is undone by itself.
+//!
+//! A WF node's ILK is the orchestrator's (stage 3 §4): after its `wf_rules_compile_apply` the run
+//! reads the nodes again, takes the ILK from the WF's status into the record, and goes on with its
+//! relation. A WF is removed with `wf_rules_delete` in its retire mode, the rest with
+//! `kill_node`'s retire: every node's ILK is marked, never purged.
 
 use std::time::Instant;
 
@@ -14,9 +19,9 @@ use crate::desired::DesiredState;
 use crate::service::{secrets_of, vault_list_call, Deployer, Job};
 use crate::steps::{
     build_steps, NodeObserved, NodePresence, Observed, Step, StepKind, ACTION_WAIT, KILL_WAIT,
-    MOTHERBEE,
+    MOTHERBEE, WF_WAIT,
 };
-use crate::store::{DeploymentState, Failure};
+use crate::store::{DeploymentState, Failure, RecordNode};
 use crate::world::{AdminCall, AdminOutcome};
 
 /// The codes of an answer that changed nothing and may pass when asked again, beside the answers
@@ -34,6 +39,8 @@ const RETRYABLE_CODES: &[&str] = &[
     "RUNTIME_NOT_PRESENT",
     "RUNTIME_MANIFEST_BUSY",
     "NODE_STATUS_GET_FAILED",
+    // SY.wf-rules made the definition current and its node does not run it yet.
+    "WF_NODE_NOT_DEPLOYED",
 ];
 
 /// How much of an answer the journal keeps.
@@ -200,7 +207,7 @@ impl Deployer {
         if record.state != DeploymentState::Deploying {
             return;
         }
-        let desired = match self.desired_for(&record) {
+        let mut desired = match self.desired_for(&record) {
             Ok(desired) => desired,
             Err(err) => {
                 self.fail(
@@ -215,6 +222,9 @@ impl Deployer {
         };
         let tries = self.tries();
         let mut attempt = 0;
+        // The reads again a plan asks for (after a WF's compile), within one try.
+        let mut reads_again = 0;
+        let mut continues = false;
         loop {
             attempt += 1;
             let observed = match self.observe(&desired).await {
@@ -232,18 +242,43 @@ impl Deployer {
                     continue;
                 }
             };
+            match self.learn_wf_ilks(deployment_id, &observed) {
+                Ok(Some(learned)) => desired = learned,
+                Ok(None) => {}
+                Err(err) => {
+                    self.fail(
+                        deployment_id,
+                        "deploy",
+                        "desired_state",
+                        "SOURCE_NOT_FOUND",
+                        &err,
+                    );
+                    return;
+                }
+            }
             let steps = build_steps(&desired, &observed);
-            self.journal(
-                deployment_id,
-                json!({
-                    "event": "run",
-                    "operation": "deploy",
-                    "attempt": attempt,
-                    "plan": steps.iter().map(|step| step.label.clone()).collect::<Vec<_>>(),
-                }),
-            );
+            let mut run = json!({
+                "event": "run",
+                "operation": "deploy",
+                "attempt": attempt,
+                "plan": steps.iter().map(|step| step.label.clone()).collect::<Vec<_>>(),
+            });
+            if continues {
+                run["continues"] = json!(true);
+            }
+            self.journal(deployment_id, run);
+            continues = false;
             let mut retry = None;
+            let mut read_again = None;
             for step in &steps {
+                if let StepKind::Reobserve { .. } = step.kind {
+                    self.journal(
+                        deployment_id,
+                        json!({"event": "step", "phase": "done", "step": step.label, "duration_ms": 0}),
+                    );
+                    read_again = Some(step.label.clone());
+                    break;
+                }
                 if step.kind == StepKind::RecordActive {
                     let at_ms = self.world.now_ms();
                     self.journal(
@@ -284,8 +319,22 @@ impl Deployer {
                     }
                 }
             }
+            if let Some(label) = read_again {
+                reads_again += 1;
+                if reads_again <= desired.nodes.len() + 1 {
+                    // A read again is part of this try, not another one.
+                    attempt -= 1;
+                    continues = true;
+                    continue;
+                }
+                retry = Some((
+                    label,
+                    "NODE_NOT_READY".to_string(),
+                    "a WF's node is not read as running after its compile".to_string(),
+                ));
+            }
             let Some((label, code, detail)) = retry else {
-                // The steps always end with the record's; this is never reached.
+                // The steps always end with the record's or a read again; this is never reached.
                 return;
             };
             if attempt >= tries {
@@ -296,9 +345,54 @@ impl Deployer {
         }
     }
 
+    /// A WF's ILK, which its status names once its node runs, written into its record (stage 3
+    /// §4); a node made again (compiled again after it was gone) names its new one. The desired
+    /// state again when one was learned.
+    fn learn_wf_ilks(
+        &self,
+        deployment_id: &str,
+        observed: &Observed,
+    ) -> Result<Option<DesiredState>, String> {
+        let Some(record) = self.record(deployment_id) else {
+            return Ok(None);
+        };
+        let learned: Vec<(String, String)> = record
+            .nodes
+            .iter()
+            .filter(|node| node.is_wf())
+            .filter_map(|node| {
+                let ilk = observed.nodes.get(&node.role)?.status_ilk.clone()?;
+                (!ilk.eq_ignore_ascii_case(&node.ilk_id)).then(|| (node.role.clone(), ilk))
+            })
+            .collect();
+        if learned.is_empty() {
+            return Ok(None);
+        }
+        let at_ms = self.world.now_ms();
+        let updated = self.update_record(deployment_id, |record| {
+            for (role, ilk) in &learned {
+                if let Some(node) = record.nodes.iter_mut().find(|node| node.role == *role) {
+                    node.ilk_id = ilk.clone();
+                }
+            }
+            record.updated_at_ms = at_ms;
+        });
+        for (role, ilk) in &learned {
+            self.journal(
+                deployment_id,
+                json!({"event": "learned", "role": role, "ilk_id": ilk}),
+            );
+        }
+        match updated {
+            Some(record) => self.desired_for(&record).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// What runs of `desired` (§5.2): the ILKs, the document's hash, the relations and the
-    /// definitions in the SHM; the assets on disk; each node through `get_node_status`; each key's
-    /// assignment through `vault_list`. An error is a code and its detail, for a retry.
+    /// definitions in the SHM; the assets on disk; each node through `get_node_status` (a WF's
+    /// ILK from it); each key's assignment through `vault_list`. An error is a code and its detail,
+    /// for a retry.
     pub async fn observe(&self, desired: &DesiredState) -> Result<Observed, (String, String)> {
         let ilks = self
             .world
@@ -317,35 +411,42 @@ impl Deployer {
             ..Observed::default()
         };
         for node in &desired.nodes {
-            let hive = node
-                .node_name
-                .rsplit_once('@')
-                .map(|(_, hive)| hive)
-                .unwrap_or(MOTHERBEE);
             let call = AdminCall {
                 action: "get_node_status".to_string(),
-                target: hive.to_string(),
+                target: node.hive().to_string(),
                 params: json!({"node_name": node.node_name}),
                 timeout: ACTION_WAIT,
             };
-            let presence = match self.admin.call(&call).await {
-                AdminOutcome::Ok(payload) => NodePresence::Present(
-                    payload["node_status"]["lifecycle_state"]
+            let (presence, status_ilk) = match self.admin.call(&call).await {
+                AdminOutcome::Ok(payload) => (
+                    NodePresence::Present(
+                        payload["node_status"]["lifecycle_state"]
+                            .as_str()
+                            .unwrap_or("UNKNOWN")
+                            .to_string(),
+                    ),
+                    payload["node_status"]["identity"]["ilk_id"]
                         .as_str()
-                        .unwrap_or("UNKNOWN")
-                        .to_string(),
+                        .filter(|ilk| crate::ids::is_ilk_id(ilk))
+                        .map(str::to_string),
                 ),
                 AdminOutcome::Refused { code, .. } if code == "NODE_NOT_FOUND" => {
-                    NodePresence::Absent
+                    (NodePresence::Absent, None)
                 }
                 AdminOutcome::Refused { code, detail, .. } => return Err((code, detail)),
                 AdminOutcome::Unanswered(why) => return Err(("NO_ANSWER".to_string(), why)),
+            };
+            // A WF's ILK is the one its status names: the orchestrator's.
+            let ilk_id = match (&status_ilk, node.is_wf()) {
+                (Some(status_ilk), true) => status_ilk.as_str(),
+                _ => node.ilk_id.as_str(),
             };
             observed.nodes.insert(
                 node.role.clone(),
                 NodeObserved {
                     presence,
-                    ilk: find(&node.ilk_id),
+                    ilk: find(ilk_id),
+                    status_ilk,
                 },
             );
             if let Some(definition) = &node.definition {
@@ -382,6 +483,12 @@ impl Deployer {
     }
 
     async fn execute(&self, desired: &DesiredState, step: &Step) -> StepOutcome {
+        if let StepKind::AwaitIlk { role } = &step.kind {
+            return StepOutcome::Retry {
+                code: "NODE_ILK_UNKNOWN".to_string(),
+                detail: format!("the WF of the role {role} runs and its status names no ILK yet"),
+            };
+        }
         if let StepKind::WriteAssets { role, hashes } = &step.kind {
             let Some(definition) = desired
                 .nodes
@@ -455,34 +562,41 @@ impl Deployer {
                     json!({"event": "run", "operation": "remove", "attempt": attempt}),
                 );
                 for node in record.nodes.iter().rev() {
-                    let label = format!("kill_node:{}", node.role);
-                    let call = AdminCall {
-                        action: "kill_node".to_string(),
-                        target: record.hive.clone(),
-                        params: json!({"node_name": node.node_name, "retire_instance": true}),
-                        timeout: KILL_WAIT,
+                    let (label, call) = removal_call(&record.hive, node);
+                    let gone = if node.is_wf() {
+                        "WORKFLOW_NOT_FOUND"
+                    } else {
+                        "NODE_NOT_FOUND"
                     };
                     let outcome = self
                         .journaled(deployment_id, &label, Some(&call), async {
                             match self.admin.call(&call).await {
-                                AdminOutcome::Refused { code, .. } if code == "NODE_NOT_FOUND" => {
+                                AdminOutcome::Refused { code, .. } if code == gone => {
                                     StepOutcome::Done(json!({"not_found": true}))
                                 }
                                 other => outcome_of(other),
                             }
                         })
                         .await;
+                    // A WF's ILK is the one its record learned, else the one the SHM holds for its
+                    // node.
+                    let ilk_id = if node.ilk_id.is_empty() {
+                        self.ilk_of_node(&node.node_name).unwrap_or_default()
+                    } else {
+                        node.ilk_id.clone()
+                    };
                     let mark = match outcome {
+                        // A workflow's delete retires its node, as a kill_node's retire does: an
+                        // ILK the SHM still holds as active, its mark failed or unknown, is
+                        // SY.deploy's to mark.
+                        StepOutcome::Done(_) if node.is_wf() => {
+                            !ilk_id.is_empty() && self.ilk_present(&ilk_id)
+                        }
                         // The orchestrator drops the node's map entry before it marks its ILK, so
                         // a mark it reports failed or unknown is SY.deploy's to make (0.1.159).
-                        StepOutcome::Done(answer) if answer["not_found"] == json!(true) => self
-                            .world
-                            .identity()
-                            .map(|ilks| {
-                                ilks.iter()
-                                    .any(|ilk| ilk.ilk_id.eq_ignore_ascii_case(&node.ilk_id))
-                            })
-                            .unwrap_or(true),
+                        StepOutcome::Done(answer) if answer["not_found"] == json!(true) => {
+                            self.ilk_present(&ilk_id)
+                        }
                         StepOutcome::Done(answer) => answer["ilk_retired"] != json!(true),
                         StepOutcome::Retry { code, detail } => {
                             if attempt >= tries {
@@ -500,7 +614,7 @@ impl Deployer {
                     if mark {
                         let label = format!("delete_ilk:{}", node.role);
                         if let Err((code, detail, retry)) = self
-                            .mark_ilk(deployment_id, &label, &node.ilk_id, tenant_id)
+                            .mark_ilk(deployment_id, &label, &ilk_id, tenant_id)
                             .await
                         {
                             if retry && attempt < tries {
@@ -556,6 +670,26 @@ impl Deployer {
         tracing::info!(deployments = ?deployment_ids, "a removal is done");
     }
 
+    /// Whether the SHM holds an ILK; when it cannot be read, taken as held, so the mark is sent.
+    fn ilk_present(&self, ilk_id: &str) -> bool {
+        self.world
+            .identity()
+            .map(|ilks| {
+                ilks.iter()
+                    .any(|ilk| ilk.ilk_id.eq_ignore_ascii_case(ilk_id))
+            })
+            .unwrap_or(true)
+    }
+
+    /// The ILK the SHM holds for a node, by its name.
+    fn ilk_of_node(&self, node_name: &str) -> Option<String> {
+        self.world.identity().ok().and_then(|ilks| {
+            ilks.into_iter()
+                .find(|ilk| ilk.handler_node.as_deref() == Some(node_name))
+                .map(|ilk| ilk.ilk_id)
+        })
+    }
+
     /// Marks an ILK with `delete_ilk` (never purged): an ILK already marked or gone is done.
     async fn mark_ilk(
         &self,
@@ -596,5 +730,31 @@ impl Deployer {
                 self.fail(deployment_id, "remove", step, code, detail);
             }
         }
+    }
+}
+
+/// How a node goes (stage 3 §4): a WF with its workflow's delete, forced, which takes its running
+/// instances with it, in its retire mode (SY.wf-rules removes the node with the orchestrator's
+/// retire, its ILK marked, never purged); any other node with `kill_node`'s retire.
+fn removal_call(hive: &str, node: &RecordNode) -> (String, AdminCall) {
+    match crate::ids::workflow_name(&node.node_name) {
+        Some(workflow) => (
+            format!("wf_rules_delete:{}", node.role),
+            AdminCall {
+                action: "wf_rules_delete".to_string(),
+                target: hive.to_string(),
+                params: json!({"workflow_name": workflow, "force": true, "retire": true}),
+                timeout: WF_WAIT,
+            },
+        ),
+        None => (
+            format!("kill_node:{}", node.role),
+            AdminCall {
+                action: "kill_node".to_string(),
+                target: hive.to_string(),
+                params: json!({"node_name": node.node_name, "retire_instance": true}),
+                timeout: KILL_WAIT,
+            },
+        ),
     }
 }

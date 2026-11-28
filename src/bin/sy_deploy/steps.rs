@@ -3,9 +3,13 @@
 //! for every source: a new kind of part is one more section here.
 //!
 //! The plain ED's ten steps, from nothing: the ED and its document first; then each node, in the
-//! source's order (the conscious before its IO), its assets, its launch (which makes its ILK), its
+//! package's order (the conscious before its IO), its assets, its launch (which makes its ILK), its
 //! relation and its definition; then the keys; then the record. What runs already is not sent
 //! again: a retry converges, it does not replay (§5.2).
+//!
+//! A WF node (stage 3 §4) is deployed by `wf_rules_compile_apply`, its definition with the blanks
+//! in place, which SY.wf-rules makes its node from; its ILK is the orchestrator's, so the plan stops
+//! there and SY.deploy reads the node again (`read_node`) before its relation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -21,6 +25,9 @@ pub const ACTION_WAIT: Duration = Duration::from_secs(40);
 
 /// A `kill_node`'s wait: SY.admin's is 180 s, for a teardown or a retire on a spoke.
 pub const KILL_WAIT: Duration = Duration::from_secs(190);
+
+/// A `wf_rules_compile_apply`'s and a `wf_rules_delete`'s wait: SY.admin's on SY.wf-rules is 75 s.
+pub const WF_WAIT: Duration = Duration::from_secs(90);
 
 /// SY.admin's own hive, where every identity and vault action goes.
 pub const MOTHERBEE: &str = "motherbee";
@@ -39,6 +46,9 @@ pub struct NodeObserved {
     pub presence: NodePresence,
     /// Its ILK in the identity SHM, once registered.
     pub ilk: Option<IlkView>,
+    /// The ILK its status names (`node_status.identity.ilk_id`): a WF's, which the orchestrator
+    /// mints.
+    pub status_ilk: Option<String>,
 }
 
 /// What runs, as SY.deploy reads it before it builds the steps (§5.2): the ILKs, the document's
@@ -63,6 +73,18 @@ pub enum StepKind {
         hashes: Vec<String>,
     },
     RunNode {
+        role: String,
+    },
+    /// A WF's definition compiled and applied, its node made by SY.wf-rules.
+    CompileWorkflow {
+        role: String,
+    },
+    /// The nodes read again before the plan goes on: a WF's ILK is known once its node runs.
+    Reobserve {
+        role: String,
+    },
+    /// A WF that runs and whose status names no ILK yet: tried again.
+    AwaitIlk {
         role: String,
     },
     StartNode {
@@ -99,14 +121,53 @@ fn admin(action: &str, target: &str, params: Value, timeout: Duration) -> Option
     })
 }
 
-fn node_hive(node: &DesiredNode) -> &str {
-    node.node_name
-        .rsplit_once('@')
-        .map(|(_, hive)| hive)
-        .unwrap_or(MOTHERBEE)
+fn start_step(node: &DesiredNode, hive: &str) -> Step {
+    Step {
+        kind: StepKind::StartNode {
+            role: node.role.clone(),
+        },
+        label: format!("start_node:{}", node.role),
+        call: admin(
+            "start_node",
+            hive,
+            json!({"node_name": node.node_name}),
+            ACTION_WAIT,
+        ),
+    }
 }
 
-/// The steps still missing, in order, the record's last.
+/// The node's relation, unless identity holds it already: whom it works for (the ED, or nobody
+/// for the door of a capability of every ED) and as what.
+fn push_relation(steps: &mut Vec<Step>, node: &DesiredNode, ilk: Option<&IlkView>) {
+    let Some(relation) = &node.relation else {
+        return;
+    };
+    let related = ilk.is_some_and(|ilk| {
+        ilk.works_for == relation.works_for
+            && ilk.work_role.as_deref() == Some(relation.work_role.as_str())
+    });
+    if !related {
+        steps.push(Step {
+            kind: StepKind::SetWorksFor {
+                role: node.role.clone(),
+            },
+            label: format!("set_ilk_works_for:{}", node.role),
+            call: admin(
+                "set_ilk_works_for",
+                MOTHERBEE,
+                json!({
+                    "ilk_id": node.ilk_id,
+                    "works_for": relation.works_for,
+                    "work_role": relation.work_role,
+                }),
+                ACTION_WAIT,
+            ),
+        });
+    }
+}
+
+/// The steps still missing, in order, the record's last; or, while a WF's ILK is not known yet,
+/// up to the read of its node.
 pub fn build_steps(desired: &DesiredState, observed: &Observed) -> Vec<Step> {
     let mut steps = Vec::new();
     if let Some(person) = &desired.person {
@@ -167,7 +228,54 @@ pub fn build_steps(desired: &DesiredState, observed: &Observed) -> Vec<Step> {
                 });
             }
         }
-        let hive = node_hive(node);
+        let hive = node.hive();
+        if node.is_wf() {
+            match seen.map(|seen| &seen.presence) {
+                None | Some(NodePresence::Absent) => {
+                    steps.push(Step {
+                        kind: StepKind::CompileWorkflow {
+                            role: node.role.clone(),
+                        },
+                        label: format!("wf_rules_compile_apply:{}", node.role),
+                        call: admin(
+                            "wf_rules_compile_apply",
+                            hive,
+                            json!({
+                                "workflow_name": crate::ids::workflow_name(&node.node_name),
+                                "definition": node.workflow,
+                                "auto_spawn": true,
+                                "tenant_id": desired.tenant_id,
+                            }),
+                            WF_WAIT,
+                        ),
+                    });
+                    steps.push(Step {
+                        kind: StepKind::Reobserve {
+                            role: node.role.clone(),
+                        },
+                        label: format!("read_node:{}", node.role),
+                        call: None,
+                    });
+                    return steps;
+                }
+                Some(NodePresence::Present(lifecycle)) if lifecycle == "STOPPED" => {
+                    steps.push(start_step(node, hive))
+                }
+                Some(NodePresence::Present(_)) => {}
+            }
+            if node.ilk_id.is_empty() {
+                steps.push(Step {
+                    kind: StepKind::AwaitIlk {
+                        role: node.role.clone(),
+                    },
+                    label: format!("await_ilk:{}", node.role),
+                    call: None,
+                });
+                return steps;
+            }
+            push_relation(&mut steps, node, ilk);
+            continue;
+        }
         match seen.map(|seen| &seen.presence) {
             None | Some(NodePresence::Absent) => steps.push(Step {
                 kind: StepKind::RunNode {
@@ -188,42 +296,12 @@ pub fn build_steps(desired: &DesiredState, observed: &Observed) -> Vec<Step> {
                     ACTION_WAIT,
                 ),
             }),
-            Some(NodePresence::Present(lifecycle)) if lifecycle == "STOPPED" => steps.push(Step {
-                kind: StepKind::StartNode {
-                    role: node.role.clone(),
-                },
-                label: format!("start_node:{}", node.role),
-                call: admin(
-                    "start_node",
-                    hive,
-                    json!({"node_name": node.node_name}),
-                    ACTION_WAIT,
-                ),
-            }),
+            Some(NodePresence::Present(lifecycle)) if lifecycle == "STOPPED" => {
+                steps.push(start_step(node, hive))
+            }
             Some(NodePresence::Present(_)) => {}
         }
-        let related = ilk.is_some_and(|ilk| {
-            ilk.works_for.as_deref() == Some(desired.grouping.id.as_str())
-                && ilk.work_role.as_deref() == Some(node.work_role.as_str())
-        });
-        if !related {
-            steps.push(Step {
-                kind: StepKind::SetWorksFor {
-                    role: node.role.clone(),
-                },
-                label: format!("set_ilk_works_for:{}", node.role),
-                call: admin(
-                    "set_ilk_works_for",
-                    MOTHERBEE,
-                    json!({
-                        "ilk_id": node.ilk_id,
-                        "works_for": desired.grouping.id,
-                        "work_role": node.work_role,
-                    }),
-                    ACTION_WAIT,
-                ),
-            });
-        }
+        push_relation(&mut steps, node, ilk);
         if let Some(definition) = &node.definition {
             let hashes = |assets: &[crate::desired::DesiredAsset]| -> Vec<String> {
                 assets.iter().map(|asset| asset.hash.clone()).collect()
@@ -291,8 +369,10 @@ pub fn build_steps(desired: &DesiredState, observed: &Observed) -> Vec<Step> {
 mod tests {
     use super::*;
     use crate::desired::desired_state;
-    use crate::desired::tests::{plain_record, CHANNEL, CONSCIOUS, PERSON};
-    use crate::source::tests::plain_ed;
+    use crate::desired::tests::{
+        billing_record, plain_record, AGENT, CHANNEL, CONNECTOR, CONSCIOUS, PERSON,
+    };
+    use crate::fixtures::{billing, plain_ed};
 
     fn desired() -> DesiredState {
         desired_state(&plain_ed(), &plain_record()).expect("desired")
@@ -346,6 +426,7 @@ mod tests {
                     NodeObserved {
                         presence: NodePresence::Present("RUNNING".to_string()),
                         ilk: Some(node_ilk(&desired.nodes[0], true)),
+                        status_ilk: None,
                     },
                 ),
                 (
@@ -353,6 +434,7 @@ mod tests {
                     NodeObserved {
                         presence: NodePresence::Present("RUNNING".to_string()),
                         ilk: Some(node_ilk(&desired.nodes[1], false)),
+                        status_ilk: None,
                     },
                 ),
             ]),
@@ -522,6 +604,134 @@ mod tests {
         assert_eq!(
             labels(&build_steps(&desired, &other)),
             ["set_ilk_works_for:channel", "record_active"]
+        );
+    }
+
+    const DOOR: &str = "ilk:550e8400-e29b-41d4-a716-446655440006";
+
+    fn running(ilk: IlkView) -> NodeObserved {
+        NodeObserved {
+            presence: NodePresence::Present("RUNNING".to_string()),
+            ilk: Some(ilk),
+            status_ilk: None,
+        }
+    }
+
+    fn working_for(ilk_id: &str, role: &str) -> IlkView {
+        IlkView {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            works_for: Some(PERSON.to_string()),
+            work_role: Some(role.to_string()),
+            ..IlkView::default()
+        }
+    }
+
+    #[test]
+    fn a_capability_runs_its_agent_and_connector_then_compiles_its_door_and_reads_it_again() {
+        let desired = desired_state(&billing(), &billing_record()).expect("desired");
+        let steps = build_steps(&desired, &Observed::default());
+        assert_eq!(
+            labels(&steps),
+            [
+                "write_assets:billing",
+                "run_node:billing",
+                "set_ilk_works_for:billing",
+                "set_ilk_definition:billing",
+                "run_node:crm",
+                "set_ilk_works_for:crm",
+                "wf_rules_compile_apply:door",
+                "read_node:door",
+            ]
+        );
+        assert_eq!(
+            steps[2].call.as_ref().expect("call").params,
+            json!({"ilk_id": AGENT, "works_for": PERSON, "work_role": "agent"})
+        );
+        assert_eq!(
+            steps[5].call.as_ref().expect("call").params,
+            json!({"ilk_id": CONNECTOR, "works_for": PERSON, "work_role": "connector"})
+        );
+        let compile = steps[6].call.clone().expect("the compile");
+        assert_eq!(
+            (compile.action.as_str(), compile.target.as_str()),
+            ("wf_rules_compile_apply", "worker1")
+        );
+        assert_eq!(compile.timeout, WF_WAIT);
+        assert_eq!(compile.params["workflow_name"], json!("billing.ed4qm7k2xa"));
+        assert_eq!(compile.params["auto_spawn"], json!(true));
+        assert_eq!(compile.params["tenant_id"], json!(desired.tenant_id));
+        assert_eq!(
+            compile.params["definition"]["start_from"],
+            json!(["AI.ed4qm7k2xa@worker1"])
+        );
+        assert!(steps[7].call.is_none());
+
+        // The door runs, its ILK read from its status into the record: its relation, the
+        // connector's key, the record.
+        let mut record = billing_record();
+        record.nodes[2].ilk_id = DOOR.to_string();
+        let desired = desired_state(&billing(), &record).expect("desired");
+        let agent_ilk = IlkView {
+            role_hash: desired.nodes[0]
+                .definition
+                .as_ref()
+                .and_then(|d| d.role.as_ref())
+                .map(|asset| asset.hash.clone()),
+            ..working_for(AGENT, "agent")
+        };
+        let mut observed = Observed {
+            nodes: BTreeMap::from([
+                ("billing".to_string(), running(agent_ilk)),
+                (
+                    "crm".to_string(),
+                    running(working_for(CONNECTOR, "connector")),
+                ),
+                (
+                    "door".to_string(),
+                    running(IlkView {
+                        ilk_id: DOOR.to_string(),
+                        ..IlkView::default()
+                    }),
+                ),
+            ]),
+            assets_present: desired.nodes[0]
+                .definition
+                .as_ref()
+                .expect("definition")
+                .assets()
+                .iter()
+                .map(|asset| asset.hash.clone())
+                .collect(),
+            ..Observed::default()
+        };
+        let steps = build_steps(&desired, &observed);
+        assert_eq!(
+            labels(&steps),
+            [
+                "set_ilk_works_for:door",
+                "vault_assign:crm",
+                "record_active"
+            ]
+        );
+        assert_eq!(
+            steps[0].call.as_ref().expect("call").params,
+            json!({"ilk_id": DOOR, "works_for": PERSON, "work_role": "capability"})
+        );
+        observed
+            .nodes
+            .insert("door".to_string(), running(working_for(DOOR, "capability")));
+        observed
+            .vault_assigned
+            .insert("acme-crm".to_string(), vec![CONNECTOR.to_string()]);
+        assert_eq!(labels(&build_steps(&desired, &observed)), ["record_active"]);
+
+        // A door that runs with no ILK in its status yet is waited for.
+        let desired = desired_state(&billing(), &billing_record()).expect("desired");
+        let steps = build_steps(&desired, &observed);
+        assert_eq!(
+            labels(&steps).last().map(String::as_str),
+            Some("await_ilk:door")
         );
     }
 }

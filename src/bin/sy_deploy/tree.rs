@@ -1,7 +1,10 @@
-//! Cloud's tree (docs/digital-executive-v1-stage-2.md §3.4), read when it is asked: a tenant's
-//! general infra (its deployments of kind `infra`), its EDs (the tenant's virtual persons in the
-//! identity SHM, each with its document), each ED's parts (the ILKs whose `works_for` names it) and
-//! its deployments (SY.deploy's records of its grouping). Key names only, never a secret.
+//! Cloud's tree (docs/digital-executive-v1-stage-2.md §3.4, stage 3 §7), read when it is asked: a
+//! tenant's general infra (its tenant grouping's deployments: its infrastructure and its
+//! capabilities of every ED), its EDs (the tenant's virtual persons in the identity SHM, each with
+//! its document), each ED's parts (the ILKs whose `works_for` names it: its conscious, its
+//! channels, its capabilities' doors, agents and connectors) and its deployments (SY.deploy's
+//! records of its grouping, the executive's and each capability's). Key names only, never a
+//! secret.
 
 use serde_json::{json, Value};
 
@@ -18,6 +21,7 @@ fn deployment_leaf(record: &DeploymentRecord) -> Value {
             "role": node.role,
             "node_name": node.node_name,
             "ilk_id": node.ilk_id,
+            "work_role": node.work_role,
             "runtime": node.runtime,
             "runtime_version": node.runtime_version,
         })).collect::<Vec<_>>(),
@@ -52,7 +56,7 @@ pub fn assemble_tree(
     });
     let infra: Vec<Value> = records
         .iter()
-        .filter(|record| record.grouping.kind == "infra")
+        .filter(|record| record.grouping.kind == json_router::solution_package::GROUPING_TENANT)
         .map(|record| deployment_leaf(record))
         .collect();
     let mut persons: Vec<&IlkView> = ilks

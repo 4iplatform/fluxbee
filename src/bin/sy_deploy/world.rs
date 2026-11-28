@@ -140,6 +140,8 @@ pub mod fake {
         pub nodes: BTreeMap<String, FakeNode>,
         /// key -> (tenant, resource_type, owner ILK, assigned ILKs)
         pub secrets: BTreeMap<String, (String, String, Option<String>, Vec<String>)>,
+        /// SY.wf-rules' workflows, by hive and name: their definition.
+        pub workflows: BTreeMap<(String, String), Value>,
         /// Every call, in order.
         pub calls: Vec<AdminCall>,
         /// Actions that answer no answer, as many times as named.
@@ -161,7 +163,7 @@ pub mod fake {
 
     impl Fake {
         /// The motherbee with one live worker, `worker1`, the tenant `pruebas` with an anthropic
-        /// key and a WhatsApp credential, and the runtimes current.
+        /// key, a WhatsApp credential and a CRM's key, and the runtimes current.
         pub fn installation() -> Fake {
             let fake = Fake::default();
             {
@@ -183,6 +185,9 @@ pub mod fake {
                 state
                     .runtimes
                     .insert("io.wapp".to_string(), "0.1.159".to_string());
+                state
+                    .runtimes
+                    .insert("io.api".to_string(), "0.1.159".to_string());
                 state.secrets.insert(
                     "pruebas-anthropic".to_string(),
                     (
@@ -195,6 +200,10 @@ pub mod fake {
                 state.secrets.insert(
                     "acme-laura-wapp".to_string(),
                     (TENANT.to_string(), "whatsapp".to_string(), None, Vec::new()),
+                );
+                state.secrets.insert(
+                    "acme-crm".to_string(),
+                    (TENANT.to_string(), "api_key".to_string(), None, Vec::new()),
                 );
                 state.retire_marks = true;
                 state.now_ms = 1_700_000_000_000;
@@ -215,6 +224,7 @@ pub mod fake {
                     let what = call
                         .params
                         .get("node_name")
+                        .or_else(|| call.params.get("workflow_name"))
                         .or_else(|| call.params.get("ilk_id"))
                         .or_else(|| call.params.get("key"))
                         .and_then(Value::as_str)
@@ -277,7 +287,7 @@ pub mod fake {
                     let ilk_id = text("ilk_id");
                     let document = params["document"].clone();
                     let hash = json_router::agent_assets::sha256_hex(
-                        &crate::source::canonical_bytes(&document),
+                        &json_router::solution_package::canonical_bytes(&document),
                     );
                     let Some(ilk) = state.ilks.get_mut(&ilk_id) else {
                         return refused("PERSON_NOT_FOUND");
@@ -334,7 +344,11 @@ pub mod fake {
                         Some(node) => AdminOutcome::Ok(json!({
                             "status": "ok",
                             "node_name": node_name,
-                            "node_status": {"lifecycle_state": node.lifecycle, "health_state": "HEALTHY"}
+                            "node_status": {
+                                "lifecycle_state": node.lifecycle,
+                                "health_state": "HEALTHY",
+                                "identity": {"ilk_id": node.ilk_id, "tenant_id": node.tenant_id}
+                            }
                         })),
                         None => refused("NODE_NOT_FOUND"),
                     }
@@ -443,6 +457,68 @@ pub mod fake {
                         "node_name": node_name,
                         "ilk_retired": marks,
                         "vault_secrets_kept": true
+                    }))
+                }
+                // SY.wf-rules makes the WF node from its definition, and the orchestrator its ILK.
+                "wf_rules_compile_apply" => {
+                    let workflow = text("workflow_name");
+                    let node_name = format!("WF.{workflow}@{}", call.target);
+                    state.workflows.insert(
+                        (call.target.clone(), workflow.clone()),
+                        params["definition"].clone(),
+                    );
+                    if !state.nodes.contains_key(&node_name) {
+                        let ilk_id = format!("ilk:{}", uuid::Uuid::new_v4());
+                        state.nodes.insert(
+                            node_name.clone(),
+                            FakeNode {
+                                hive: call.target.clone(),
+                                lifecycle: "RUNNING".to_string(),
+                                ilk_id: ilk_id.clone(),
+                                tenant_id: text("tenant_id"),
+                                config: json!({}),
+                            },
+                        );
+                        state.ilks.insert(
+                            ilk_id.clone(),
+                            IlkView {
+                                ilk_id,
+                                ilk_type: "agent".to_string(),
+                                tenant_id: text("tenant_id"),
+                                handler_node: Some(node_name.clone()),
+                                ..IlkView::default()
+                            },
+                        );
+                    }
+                    AdminOutcome::Ok(json!({
+                        "ok": true,
+                        "node_name": format!("SY.wf-rules@{}", call.target),
+                        "wf_node": {"node_name": node_name, "action": "restarted", "status": "ok"}
+                    }))
+                }
+                // The workflow's delete, in its retire mode, removes its node and marks its ILK
+                // (no longer active in the SHM), as a kill_node's retire does when it marks.
+                "wf_rules_delete" => {
+                    let workflow = text("workflow_name");
+                    if state
+                        .workflows
+                        .remove(&(call.target.clone(), workflow.clone()))
+                        .is_none()
+                    {
+                        return refused("WORKFLOW_NOT_FOUND");
+                    }
+                    let node_name = format!("WF.{workflow}@{}", call.target);
+                    let marks = state.retire_marks && params["retire"] == json!(true);
+                    if let Some(node) = state.nodes.remove(&node_name) {
+                        if marks {
+                            state.ilks.remove(&node.ilk_id);
+                        }
+                    }
+                    AdminOutcome::Ok(json!({
+                        "status": "ok",
+                        "deleted": true,
+                        "wf_node": {"node_name": node_name, "action": "deleted", "status": "ok"},
+                        "packages_left": []
                     }))
                 }
                 "delete_ilk" => {

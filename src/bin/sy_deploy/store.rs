@@ -2,7 +2,9 @@
 //! - `deployments/<deployment_id>.json`, each deployment's record, written to a temporary file and
 //!   renamed;
 //! - `journal/<deployment_id>.jsonl`, appended before and after each step;
-//! - `sources/<source_id>/<version>.json`, the catalog's immutable copies (§3.3).
+//! - `sources/<source_id>/<version>.json`, the packages' immutable copies (§3.3);
+//! - `published/<source_id>/<version>.json`, whether each kept version is published, and its offer
+//!   (stage 3 §3: a publish writes it, a withdraw marks it not published).
 //!
 //! No secret in any: a credential is its key's name.
 
@@ -14,12 +16,16 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A grouping as a deployment names it: its kind, its id (an ED's ILK) and its short id.
+/// A grouping as a deployment names it: its kind (`ed` or `tenant`), its id (an ED's ILK, or the
+/// tenant's id) and its short id; for a capability of one ED, the node name of the ED's conscious,
+/// which its door starts from (`grouping.conscious`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupingRef {
     pub kind: String,
     pub id: String,
     pub short_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conscious: Option<String>,
 }
 
 /// The source a deployment runs, pinned with its content's hash.
@@ -30,7 +36,9 @@ pub struct SourceRef {
     pub hash: String,
 }
 
-/// A node a deployment made, with its ILK and its pinned runtime version (§3.2).
+/// A node a deployment made, with its ILK and its pinned runtime version (§3.2). A WF node's ILK
+/// is the orchestrator's: empty until SY.deploy reads it from the node's status, after its
+/// `wf_rules_compile_apply`; its runtime is `wf.<workflow>`, which SY.wf-rules versions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecordNode {
     pub role: String,
@@ -39,6 +47,12 @@ pub struct RecordNode {
     pub runtime: String,
     pub runtime_version: String,
     pub work_role: String,
+}
+
+impl RecordNode {
+    pub fn is_wf(&self) -> bool {
+        self.node_name.starts_with("WF.")
+    }
 }
 
 /// The assets of one agent's definition, by hash.
@@ -223,10 +237,15 @@ impl Store {
         self.root.join("sources")
     }
 
+    fn published_dir(&self) -> PathBuf {
+        self.root.join("published")
+    }
+
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.deployments_dir())?;
         fs::create_dir_all(self.journal_dir())?;
-        fs::create_dir_all(self.sources_dir())
+        fs::create_dir_all(self.sources_dir())?;
+        fs::create_dir_all(self.published_dir())
     }
 
     /// Every record on disk; one that does not read is named in the second list and left alone.
@@ -334,33 +353,7 @@ impl Store {
 
     /// Every source copy: its id, its version and its bytes.
     pub fn source_copies(&self) -> Vec<(String, String, Vec<u8>)> {
-        let mut out = Vec::new();
-        let Ok(ids) = fs::read_dir(self.sources_dir()) else {
-            return out;
-        };
-        for id_entry in ids.flatten() {
-            let id = id_entry.file_name().to_string_lossy().into_owned();
-            if !safe_name(&id) || !id_entry.path().is_dir() {
-                continue;
-            }
-            let Ok(versions) = fs::read_dir(id_entry.path()) else {
-                continue;
-            };
-            for version_entry in versions.flatten() {
-                let file = version_entry.file_name().to_string_lossy().into_owned();
-                let Some(version) = file.strip_suffix(".json") else {
-                    continue;
-                };
-                if !safe_name(version) {
-                    continue;
-                }
-                if let Ok(bytes) = fs::read(version_entry.path()) {
-                    out.push((id.clone(), version.to_string(), bytes));
-                }
-            }
-        }
-        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-        out
+        versioned_files(&self.sources_dir())
     }
 
     pub fn remove_source_copy(&self, id: &str, version: &str) -> Result<(), String> {
@@ -369,6 +362,74 @@ impl Store {
             .ok_or("a source's id or version names no file")?;
         fs::remove_file(path).map_err(|err| err.to_string())
     }
+
+    fn published_path(&self, id: &str, version: &str) -> Option<PathBuf> {
+        (safe_name(id) && safe_name(version)).then(|| {
+            self.published_dir()
+                .join(id)
+                .join(format!("{version}.json"))
+        })
+    }
+
+    /// Writes whether a kept version is published, and its offer.
+    pub fn save_publication(&self, id: &str, version: &str, state: &Value) -> Result<(), String> {
+        let path = self
+            .published_path(id, version)
+            .ok_or("a package's id or version names no file")?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(|err| err.to_string())?;
+        write_whole(&path, &bytes)
+            .map_err(|err| format!("the package's publication could not be written: {err}"))
+    }
+
+    /// Every version's publication: its id, its version and its state; one that does not read is
+    /// left out.
+    pub fn publications(&self) -> Vec<(String, String, Value)> {
+        versioned_files(&self.published_dir())
+            .into_iter()
+            .filter_map(|(id, version, bytes)| {
+                serde_json::from_slice(&bytes)
+                    .ok()
+                    .map(|state| (id, version, state))
+            })
+            .collect()
+    }
+
+    pub fn remove_publication(&self, id: &str, version: &str) {
+        if let Some(path) = self.published_path(id, version) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Every `<dir>/<id>/<version>.json`: its id, its version and its bytes.
+fn versioned_files(dir: &Path) -> Vec<(String, String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(ids) = fs::read_dir(dir) else {
+        return out;
+    };
+    for id_entry in ids.flatten() {
+        let id = id_entry.file_name().to_string_lossy().into_owned();
+        if !safe_name(&id) || !id_entry.path().is_dir() {
+            continue;
+        }
+        let Ok(versions) = fs::read_dir(id_entry.path()) else {
+            continue;
+        };
+        for version_entry in versions.flatten() {
+            let file = version_entry.file_name().to_string_lossy().into_owned();
+            let Some(version) = file.strip_suffix(".json") else {
+                continue;
+            };
+            if !safe_name(version) {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(version_entry.path()) {
+                out.push((id.clone(), version.to_string(), bytes));
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    out
 }
 
 #[cfg(test)]
@@ -413,6 +474,29 @@ pub mod tests {
         );
         store.remove_source_copy("plain-ed", "1").expect("removed");
         assert!(store.source_copies().is_empty());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn a_publication_is_written_again_and_removed() {
+        let store = temp_store();
+        store
+            .save_publication("billing", "1", &json!({"published": true}))
+            .expect("saved");
+        store
+            .save_publication("billing", "1", &json!({"published": false}))
+            .expect("saved again");
+        assert_eq!(
+            store.publications(),
+            [(
+                "billing".to_string(),
+                "1".to_string(),
+                json!({"published": false})
+            )]
+        );
+        assert!(store.save_publication("../x", "1", &json!({})).is_err());
+        store.remove_publication("billing", "1");
+        assert!(store.publications().is_empty());
         let _ = fs::remove_dir_all(store.root());
     }
 }

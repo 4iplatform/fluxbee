@@ -1,6 +1,9 @@
-//! The desired state (docs/digital-executive-v1-stage-2.md §3): a source plus its blanks' values,
-//! with every name and id made concrete. It is computed from the deployment's record (its ids, its
-//! hive, its pinned runtime versions) and the source's copy, so a restart computes the same.
+//! The desired state (docs/digital-executive-v1-stage-2.md §3, stage 3 §4): a package plus its
+//! blanks' values, with every name and id made concrete: the grouping's refs first (the ED's ILK,
+//! its short id, its tenant, its hive, its conscious), then each node's name and ILK, each agent's
+//! assets, each config and WF definition, and whom each node works for. It is computed from the
+//! deployment's record (its ids, its hive, its pinned runtime versions) and the package's copy, so
+//! a restart computes the same.
 
 use std::collections::BTreeMap;
 
@@ -11,10 +14,12 @@ use json_router::agent_assets::{
     build_skill_asset_value, prepare_agent_asset, sha256_hex,
 };
 
-use crate::source::{
-    asset_ref, canonical_bytes, node_ilk_ref, node_name_ref, resolve_template, ParsedSource,
-    REF_GROUPING_ILK, REF_GROUPING_SHORT_ID, REF_HIVE, REF_TENANT,
+use json_router::solution_package::{
+    asset_ref, canonical_bytes, node_ilk_ref, node_name_ref, resolve_template, resolve_workflow,
+    ParsedPackage, NODE_WF, REF_GROUPING_CONSCIOUS, REF_GROUPING_HIVE, REF_GROUPING_ILK,
+    REF_GROUPING_SHORT_ID, REF_GROUPING_TENANT, WORK_ROLE_CAPABILITY,
 };
+
 use crate::store::{DeploymentRecord, GroupingRef, RecordAssets, RecordVault};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,12 +56,41 @@ pub struct DesiredNode {
     pub role: String,
     pub kind: String,
     pub node_name: String,
+    /// Its ILK; a WF's is empty until SY.deploy reads it from the node's status.
     pub ilk_id: String,
     pub runtime: String,
     pub runtime_version: String,
     pub work_role: String,
+    /// An AI's or an IO's config; `{}` for a WF.
     pub config: Value,
+    /// An agent's definition: its assets.
     pub definition: Option<DesiredDefinition>,
+    /// A WF's definition, with its blanks and SY.deploy's refs in place.
+    pub workflow: Option<Value>,
+    /// Whom it works for, and as what (`set_ilk_works_for`); `None` for a node that carries no
+    /// relation (an infrastructure's, an agent's or a connector's of every ED).
+    pub relation: Option<Relation>,
+}
+
+impl DesiredNode {
+    pub fn is_wf(&self) -> bool {
+        self.kind == NODE_WF
+    }
+
+    pub fn hive(&self) -> &str {
+        self.node_name
+            .rsplit_once('@')
+            .map(|(_, hive)| hive)
+            .unwrap_or(crate::steps::MOTHERBEE)
+    }
+}
+
+/// A node's relation in identity: the person it works for (the ED; nobody for the door of a
+/// capability of every ED), and its role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relation {
+    pub works_for: Option<String>,
+    pub work_role: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -152,33 +186,46 @@ fn text(value: Value, what: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{what} resolves to a non-empty string"))
 }
 
+/// Whether a grouping is an ED's: its id is the ED's ILK, which its nodes work for.
+pub fn is_ed_grouping(grouping: &GroupingRef) -> bool {
+    grouping.kind == "ed"
+}
+
 /// The desired state of `record`'s deployment of `parsed`. Its errors name what does not resolve:
-/// a blank whose value does not make a valid asset, or a record that lacks a node of the source.
+/// a blank whose value does not make a valid asset, or a record that lacks a node of the package.
 pub fn desired_state(
-    parsed: &ParsedSource,
+    parsed: &ParsedPackage,
     record: &DeploymentRecord,
 ) -> Result<DesiredState, String> {
-    let source = &parsed.source;
+    let package = &parsed.package;
     let blanks = &record.blanks;
+    let ed = is_ed_grouping(&record.grouping);
     let mut refs: BTreeMap<String, Value> = BTreeMap::new();
-    refs.insert(REF_GROUPING_ILK.to_string(), json!(record.grouping.id));
+    if ed {
+        refs.insert(REF_GROUPING_ILK.to_string(), json!(record.grouping.id));
+    }
     refs.insert(
         REF_GROUPING_SHORT_ID.to_string(),
         json!(record.grouping.short_id),
     );
-    refs.insert(REF_HIVE.to_string(), json!(record.hive));
-    refs.insert(REF_TENANT.to_string(), json!(record.tenant_id));
-    for node in &source.nodes {
+    refs.insert(REF_GROUPING_TENANT.to_string(), json!(record.tenant_id));
+    refs.insert(REF_GROUPING_HIVE.to_string(), json!(record.hive));
+    if let Some(conscious) = &record.grouping.conscious {
+        refs.insert(REF_GROUPING_CONSCIOUS.to_string(), json!(conscious));
+    }
+    for node in &package.nodes {
         let made = record
             .node(&node.role)
             .ok_or_else(|| format!("the record holds no node of the role '{}'", node.role))?;
         refs.insert(node_name_ref(&node.role), json!(made.node_name));
-        refs.insert(node_ilk_ref(&node.role), json!(made.ilk_id));
+        if !node.is_wf() {
+            refs.insert(node_ilk_ref(&node.role), json!(made.ilk_id));
+        }
     }
     // The assets first: the person's document and the configs may name them.
     let mut definitions: BTreeMap<String, DesiredDefinition> = BTreeMap::new();
-    for node in &source.nodes {
-        let Some(spec) = &node.definition else {
+    for node in &package.nodes {
+        let Some(spec) = &node.assets else {
             continue;
         };
         let make = |template: &Value| desired_asset(template, blanks, &refs);
@@ -202,7 +249,7 @@ pub fn desired_state(
         }
         definitions.insert(node.role.clone(), definition);
     }
-    let person = match &source.founds {
+    let person = match &package.founds {
         Some(founds) => {
             let display_name = text(
                 resolve_template(&founds.person.display_name, blanks, &refs)?,
@@ -229,25 +276,45 @@ pub fn desired_state(
         }
         None => None,
     };
-    let mut nodes = Vec::with_capacity(source.nodes.len());
-    for node in &source.nodes {
+    let mut nodes = Vec::with_capacity(package.nodes.len());
+    for node in &package.nodes {
         let made = record
             .node(&node.role)
             .ok_or_else(|| format!("the record holds no node of the role '{}'", node.role))?;
+        // In an ED's grouping every node works for the ED, in its role; in a tenant's, only the
+        // door of a capability of every ED carries a relation, to nobody (0.1.162).
+        let relation = if ed {
+            Some(Relation {
+                works_for: Some(record.grouping.id.clone()),
+                work_role: node.work_role.clone(),
+            })
+        } else {
+            (node.work_role == WORK_ROLE_CAPABILITY).then(|| Relation {
+                works_for: None,
+                work_role: node.work_role.clone(),
+            })
+        };
+        let workflow = node
+            .workflow
+            .as_ref()
+            .map(|template| resolve_workflow(template, blanks, &refs))
+            .transpose()?;
         nodes.push(DesiredNode {
             role: node.role.clone(),
             kind: node.kind.clone(),
             node_name: made.node_name.clone(),
             ilk_id: made.ilk_id.clone(),
-            runtime: node.runtime.clone(),
+            runtime: made.runtime.clone(),
             runtime_version: made.runtime_version.clone(),
             work_role: node.work_role.clone(),
             config: resolve_template(&node.config, blanks, &refs)?,
             definition: definitions.remove(&node.role),
+            workflow,
+            relation,
         });
     }
-    let mut vault = Vec::with_capacity(source.vault.len());
-    for entry in &source.vault {
+    let mut vault = Vec::with_capacity(package.vault.len());
+    for entry in &package.vault {
         let key = text(
             resolve_template(&entry.key, blanks, &refs)?,
             "a vault entry's key",
@@ -306,7 +373,7 @@ pub fn record_parts(desired: &DesiredState) -> (BTreeMap<String, RecordAssets>, 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::source::tests::{plain_blanks, plain_ed};
+    use crate::fixtures::{billing, billing_blanks, every_ed, plain_blanks, plain_ed};
     use crate::store::{DeploymentState, RecordNode, SourceRef};
 
     pub const PERSON: &str = "ilk:550e8400-e29b-41d4-a716-446655440001";
@@ -321,6 +388,7 @@ pub mod tests {
                 kind: "ed".to_string(),
                 id: PERSON.to_string(),
                 short_id: "ed4qm7k2xa".to_string(),
+                conscious: None,
             },
             tenant_id: crate::world::fake::TENANT.to_string(),
             request_key: "cloud-ed-7f3a".to_string(),
@@ -459,6 +527,130 @@ pub mod tests {
         assert_eq!(def(&laura).role, def(&ana).role);
         assert_eq!(def(&laura).handbooks, def(&ana).handbooks);
         assert_ne!(def(&laura).personality, def(&ana).personality);
+    }
+
+    pub const AGENT: &str = "ilk:550e8400-e29b-41d4-a716-446655440004";
+    pub const CONNECTOR: &str = "ilk:550e8400-e29b-41d4-a716-446655440005";
+
+    /// The billing capability's record, into the plain ED's grouping: its agent, its connector, and
+    /// its door, whose ILK is not known yet.
+    pub fn billing_record() -> DeploymentRecord {
+        let parsed = billing();
+        let mut record = plain_record();
+        record.deployment_id = "dp3bbbbbbb".to_string();
+        record.request_key = "cloud-billing-1".to_string();
+        record.grouping.conscious = Some("AI.ed4qm7k2xa@worker1".to_string());
+        record.source = SourceRef {
+            id: "billing".to_string(),
+            version: "1".to_string(),
+            hash: parsed.hash.clone(),
+        };
+        record.founding = false;
+        record.blanks = billing_blanks();
+        record.nodes = vec![
+            RecordNode {
+                role: "billing".to_string(),
+                node_name: "AI.billing.ed4qm7k2xa@worker1".to_string(),
+                ilk_id: AGENT.to_string(),
+                runtime: "ai.generic".to_string(),
+                runtime_version: "0.1.159".to_string(),
+                work_role: "agent".to_string(),
+            },
+            RecordNode {
+                role: "crm".to_string(),
+                node_name: "IO.crm.ed4qm7k2xa@worker1".to_string(),
+                ilk_id: CONNECTOR.to_string(),
+                runtime: "io.api".to_string(),
+                runtime_version: "0.1.159".to_string(),
+                work_role: "connector".to_string(),
+            },
+            RecordNode {
+                role: "door".to_string(),
+                node_name: "WF.billing.ed4qm7k2xa@worker1".to_string(),
+                ilk_id: String::new(),
+                runtime: "wf.billing.ed4qm7k2xa".to_string(),
+                runtime_version: String::new(),
+                work_role: "capability".to_string(),
+            },
+        ];
+        record
+    }
+
+    #[test]
+    fn a_capability_s_desired_state_has_the_ed_s_conscious_at_its_door_and_every_node_working_for_the_ed(
+    ) {
+        let desired = desired_state(&billing(), &billing_record()).expect("desired");
+        assert!(desired.person.is_none());
+        let [agent, connector, door] = &desired.nodes[..] else {
+            panic!("three nodes: {:?}", desired.nodes)
+        };
+        assert_eq!(
+            agent.config["crm"],
+            json!("IO.crm.ed4qm7k2xa@worker1"),
+            "the agent names its connector"
+        );
+        assert!(agent.definition.as_ref().is_some_and(|d| d.role.is_some()));
+        assert_eq!(
+            connector.config["dst_node"],
+            json!("AI.billing.ed4qm7k2xa@worker1")
+        );
+        assert!(door.is_wf() && door.ilk_id.is_empty() && door.config == json!({}));
+        let workflow = door.workflow.as_ref().expect("its definition");
+        assert_eq!(workflow["start_from"], json!(["AI.ed4qm7k2xa@worker1"]));
+        let send = &workflow["states"][0]["entry_actions"][0];
+        assert_eq!(send["target"], json!("AI.billing.ed4qm7k2xa@worker1"));
+        assert_eq!(send["vars"]["number"], json!({"$ref": "input.number"}));
+        for (node, role) in [
+            (agent, "agent"),
+            (connector, "connector"),
+            (door, "capability"),
+        ] {
+            assert_eq!(
+                node.relation,
+                Some(Relation {
+                    works_for: Some(PERSON.to_string()),
+                    work_role: role.to_string()
+                }),
+                "{}",
+                node.role
+            );
+        }
+        assert_eq!(desired.vault[0].node_name, "IO.crm.ed4qm7k2xa@worker1");
+        assert_eq!(desired.vault[0].key, "acme-crm");
+    }
+
+    #[test]
+    fn a_capability_of_every_ed_has_only_its_door_working_for_nobody() {
+        let parsed = every_ed();
+        let mut record = billing_record();
+        record.grouping = GroupingRef {
+            kind: "tenant".to_string(),
+            id: crate::world::fake::TENANT.to_string(),
+            short_id: "tn4qm7k2xa".to_string(),
+            conscious: None,
+        };
+        record.source.hash = parsed.hash.clone();
+        for node in &mut record.nodes {
+            node.node_name = node.node_name.replace("ed4qm7k2xa", "tn4qm7k2xa");
+        }
+        let desired = desired_state(&parsed, &record).expect("desired");
+        let relations: Vec<Option<Relation>> =
+            desired.nodes.iter().map(|n| n.relation.clone()).collect();
+        assert_eq!(
+            relations,
+            [
+                None,
+                None,
+                Some(Relation {
+                    works_for: None,
+                    work_role: "capability".to_string()
+                })
+            ]
+        );
+        assert_eq!(
+            desired.nodes[2].workflow.as_ref().expect("wf")["start_from"],
+            json!([{"consciouses": "tenant"}])
+        );
     }
 
     #[test]

@@ -16,12 +16,12 @@ const ID_TAIL_LEN: usize = 7;
 /// A deployment's id: `dp` and the same eight characters' form as a short id's.
 pub const DEPLOYMENT_PREFIX: &str = "dp";
 
-/// The two letters of a grouping kind's short ids: `ed` for an ED; `in` and `ts` kept for infra and
-/// test.
+/// The two letters of a grouping kind's short ids: `ed` for an ED, `tn` for a tenant's (stage 3
+/// §4: its infrastructure and its capabilities of every ED); `ts` kept for test.
 pub fn grouping_prefix(kind: &str) -> Option<&'static str> {
     match kind {
         "ed" => Some("ed"),
-        "infra" => Some("in"),
+        "tenant" => Some("tn"),
         "test" => Some("ts"),
         _ => None,
     }
@@ -73,25 +73,24 @@ pub fn is_deployment_id(id: &str) -> bool {
     has_id_form(id, DEPLOYMENT_PREFIX)
 }
 
-/// Whether `id` is an ILK id, `ilk:<uuid>`.
-pub fn is_ilk_id(id: &str) -> bool {
-    id.strip_prefix("ilk:")
-        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
-}
+pub use json_router::solution_package::{is_ilk_id, is_tenant_id};
 
-/// Whether `id` is a tenant id, `tnt:<uuid>`.
-pub fn is_tenant_id(id: &str) -> bool {
-    id.strip_prefix("tnt:")
-        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
-}
-
-/// A node's name (design §5.5): `<KIND>.<middle.>?<short_id>@<hive>`, as `AI.ed4qm7k2xa@worker1` and
-/// `IO.wapp.ed4qm7k2xa@worker1`.
+/// A node's name (design §5.5): `<KIND>.<middle.>?<short_id>@<hive>`, as `AI.ed4qm7k2xa@worker1`,
+/// `IO.wapp.ed4qm7k2xa@worker1` and `WF.billing.ed4qm7k2xa@worker1`.
 pub fn node_name(kind: &str, middle: Option<&str>, short_id: &str, hive: &str) -> String {
     match middle {
         Some(middle) => format!("{kind}.{middle}.{short_id}@{hive}"),
         None => format!("{kind}.{short_id}@{hive}"),
     }
+}
+
+/// A WF node's workflow (stage 3 §4): its name without `WF.` and its hive, `<middle>.<short_id>`,
+/// unique per grouping, as SY.wf-rules names its node `WF.<workflow>@<hive>`.
+pub fn workflow_name(node_name: &str) -> Option<&str> {
+    node_name
+        .strip_prefix("WF.")
+        .and_then(|rest| rest.split_once('@'))
+        .map(|(workflow, _)| workflow)
 }
 
 /// Whether `key` is a request key (§2.1): the caller's own id, 1 to 64 characters of
@@ -119,13 +118,19 @@ mod tests {
             assert!(short.starts_with("ed"), "{short}");
             assert!(matches!(short.as_bytes()[2], b'2'..=b'7'), "{short}");
             assert!(is_short_id(&short, "ed"), "{short}");
-            assert!(!is_short_id(&short, "infra"), "{short}");
+            assert!(!is_short_id(&short, "tenant"), "{short}");
             let deployment = mint_deployment_id(&mut rng);
             assert_eq!(deployment.len(), 10, "{deployment}");
             assert!(is_deployment_id(&deployment), "{deployment}");
         }
         assert!(mint_short_id(&mut rng, "custom").is_none());
-        assert!(is_short_id("in2abcdefg", "infra"));
+        let tenant = mint_short_id(&mut rng, "tenant").expect("a tenant prefix");
+        assert!(
+            tenant.starts_with("tn") && is_short_id(&tenant, "tenant"),
+            "{tenant}"
+        );
+        assert!(!is_short_id(&tenant, "ed"));
+        assert!(mint_short_id(&mut rng, "infra").is_none());
         assert!(is_short_id("ts7aaaaaaa", "test"));
         assert!(is_ilk_id(&mint_ilk_id()));
     }
@@ -143,7 +148,7 @@ mod tests {
             "dp2abcdef0",
         ] {
             assert!(
-                !is_short_id(word, "ed") && !is_short_id(word, "infra") && !is_deployment_id(word),
+                !is_short_id(word, "ed") && !is_short_id(word, "tenant") && !is_deployment_id(word),
                 "{word}"
             );
         }
@@ -159,6 +164,10 @@ mod tests {
             node_name("IO", Some("wapp"), "ed4qm7k2xa", "worker1"),
             "IO.wapp.ed4qm7k2xa@worker1"
         );
+        let door = node_name("WF", Some("billing"), "ed4qm7k2xa", "worker1");
+        assert_eq!(door, "WF.billing.ed4qm7k2xa@worker1");
+        assert_eq!(workflow_name(&door), Some("billing.ed4qm7k2xa"));
+        assert_eq!(workflow_name("AI.ed4qm7k2xa@worker1"), None);
     }
 
     #[test]
