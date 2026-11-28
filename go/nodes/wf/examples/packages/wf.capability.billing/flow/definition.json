@@ -1,0 +1,188 @@
+{
+  "wf_schema_version": "1",
+  "workflow_type": "capability.billing",
+  "description": "Invoices: the state of an invoice, by its number, answered at once; or a reconciliation of a customer's invoices with its payments, which takes minutes and whose result comes later.",
+  "start_from": ["AI.ed4qm7k2xa@worker1"],
+  "request_actions": [
+    {"name": "invoice_state", "description": "The state of an invoice, by its number: paid, pending or overdue, and since when. Answered at once."},
+    {"name": "reconcile", "description": "Reconcile a customer's invoices with its payments, by the customer's id. The answer says it is under way; the result comes later."}
+  ],
+  "input_schema": {
+    "type": "object",
+    "required": ["action"],
+    "properties": {
+      "action": {"type": "string", "enum": ["invoice_state", "reconcile"]},
+      "number": {"type": "string", "minLength": 1},
+      "customer_id": {"type": "string", "minLength": 1}
+    },
+    "additionalProperties": false
+  },
+  "initial_state": "routing",
+  "terminal_states": ["answered", "refused", "failed"],
+  "idle_timeout": "1h",
+  "states": [
+    {
+      "name": "routing",
+      "description": "Each request action goes its own way; a request without the field its action needs is refused.",
+      "entry_actions": [
+        {"type": "emit_internal_event", "meta": {"msg": "ROUTE"}}
+      ],
+      "transitions": [
+        {
+          "event_match": {"msg": "ROUTE"},
+          "guard": "input.action == 'invoice_state' && has(input.number)",
+          "target_state": "reading"
+        },
+        {
+          "event_match": {"msg": "ROUTE"},
+          "guard": "input.action == 'reconcile' && has(input.customer_id)",
+          "target_state": "reconciling",
+          "actions": [
+            {"type": "reply", "status": "pending", "message": "The reconciliation is under way: its result comes in a few minutes."}
+          ]
+        },
+        {
+          "event_match": {"msg": "ROUTE"},
+          "guard": "true",
+          "target_state": "refused",
+          "actions": [
+            {"type": "reply", "status": "error", "error_code": "MISSING_FIELD", "message": "invoice_state takes a number, and reconcile a customer_id."}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "reading",
+      "description": "The billing agent reads the invoice in the CRM, through its connector, and the door answers within the conscious's turn.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "AI.billing.ed4qm7k2xa@worker1",
+          "meta": {"msg": "INVOICE_STATE"},
+          "payload": {"type": "text", "content": "Read this invoice's state in the CRM."},
+          "vars": {"number": {"$ref": "input.number"}},
+          "menu": {
+            "help": "Read the invoice whose number vars.number holds.",
+            "options": [
+              {
+                "name": "found",
+                "description": "The CRM has the invoice: its state, and the date of that state.",
+                "params": {
+                  "state": {"type": "string", "enum": ["paid", "pending", "overdue"]},
+                  "since": {"type": "string", "description": "The date of that state, YYYY-MM-DD."}
+                }
+              },
+              {"name": "not_found", "description": "The CRM has no invoice of that number."}
+            ]
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"},
+          "guard": "event.context.evaluation.option == 'found'",
+          "target_state": "answered",
+          "actions": [
+            {
+              "type": "reply",
+              "status": "done",
+              "result": {
+                "number": {"$ref": "input.number"},
+                "state": {"$ref": "event.context.evaluation.params.state"},
+                "since": {"$ref": "event.context.evaluation.params.since", "default": ""}
+              }
+            }
+          ]
+        },
+        {
+          "event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"},
+          "guard": "event.context.evaluation.option == 'not_found'",
+          "target_state": "refused",
+          "actions": [
+            {"type": "reply", "status": "error", "error_code": "INVOICE_NOT_FOUND", "message": "The CRM has no invoice of that number."}
+          ]
+        },
+        {
+          "event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"},
+          "guard": "true",
+          "target_state": "refused",
+          "actions": [
+            {"type": "reply", "status": "error", "error_code": "CRM_UNAVAILABLE", "message": "The billing agent could not read the CRM."}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "reconciling",
+      "description": "The billing agent reconciles the customer's invoices; the door gives the result to the conscious when it answers, and gives up after 30 minutes.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "AI.billing.ed4qm7k2xa@worker1",
+          "meta": {"msg": "RECONCILE"},
+          "payload": {"type": "text", "content": "Reconcile this customer's invoices with its payments in the CRM."},
+          "vars": {"customer_id": {"$ref": "input.customer_id"}},
+          "menu": {
+            "help": "Reconcile the customer whose id vars.customer_id holds.",
+            "options": [
+              {
+                "name": "reconciled",
+                "description": "The invoices and the payments are reconciled.",
+                "params": {
+                  "open_invoices": {"type": "integer", "description": "How many invoices stay unpaid."},
+                  "summary": {"type": "string", "description": "What the reconciliation found, in two sentences."}
+                }
+              },
+              {"name": "not_found", "description": "The CRM has no customer of that id."}
+            ]
+          }
+        },
+        {"type": "schedule_timer", "timer_key": "give_up", "fire_in": "30m"}
+      ],
+      "transitions": [
+        {
+          "event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"},
+          "guard": "event.context.evaluation.option == 'reconciled'",
+          "target_state": "answered",
+          "actions": [
+            {
+              "type": "notify",
+              "status": "done",
+              "result": {
+                "customer_id": {"$ref": "input.customer_id"},
+                "open_invoices": {"$ref": "event.context.evaluation.params.open_invoices", "default": 0},
+                "summary": {"$ref": "event.context.evaluation.params.summary", "default": ""}
+              }
+            }
+          ]
+        },
+        {
+          "event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"},
+          "guard": "true",
+          "target_state": "refused",
+          "actions": [
+            {"type": "notify", "status": "error", "error_code": "RECONCILE_FAILED", "message": "The billing agent could not reconcile the customer's invoices."}
+          ]
+        },
+        {
+          "event_match": {"msg": "TIMER_FIRED"},
+          "guard": "event.timer_key == 'give_up'",
+          "target_state": "refused",
+          "actions": [
+            {"type": "notify", "status": "error", "error_code": "TIMED_OUT", "message": "The reconciliation took more than 30 minutes."}
+          ]
+        }
+      ]
+    },
+    {"name": "answered"},
+    {"name": "refused"},
+    {
+      "name": "failed",
+      "description": "The engine's own failure: the request is answered error, by a reply when none went, or by a notify after a reply pending.",
+      "entry_actions": [
+        {"type": "reply", "status": "error", "error_code": "CAPABILITY_FAILED", "message": "The capability failed.", "on_error": "continue"},
+        {"type": "notify", "status": "error", "error_code": "CAPABILITY_FAILED", "message": "The capability failed.", "on_error": "continue"}
+      ]
+    }
+  ]
+}

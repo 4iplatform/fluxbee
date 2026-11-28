@@ -1,0 +1,8 @@
+{
+  "name": "wf.capability.billing",
+  "version": "0.0.1",
+  "type": "workflow",
+  "description": "A capability's door (wf-orchestration-v1 §5.6): the ED's conscious, AI.ed4qm7k2xa@worker1, asks it for an invoice's state, answered within the turn, or for a reconciliation that takes long, answered pending and given later by notify; its agent, AI.billing.ed4qm7k2xa@worker1, reads the CRM.",
+  "runtime_base": "wf.engine",
+  "config_template": "config/default-config.json"
+}

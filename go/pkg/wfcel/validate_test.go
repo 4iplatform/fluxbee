@@ -411,7 +411,8 @@ func TestValidateDefinitionRejectsNonTerminalFailedState(t *testing.T) {
 }
 
 // 0.1.91 (wf-orchestration-v1 §5.2.1, item 2): start_from is required, and names the nodes whose
-// messages start an instance, each with its hive, never a SY.* or RT.* node.
+// messages start an instance, each with its hive, never a SY.* or RT.* node. Since a capability's
+// door (§5.6) it may name an agent, the ED's conscious, or the consciouses marker (door_test.go).
 func TestValidateDefinitionStartFrom(t *testing.T) {
 	load := func(startFrom string) error {
 		t.Helper()
@@ -426,14 +427,13 @@ func TestValidateDefinitionStartFrom(t *testing.T) {
 		t.Fatalf("two starters: %v", err)
 	}
 	for startFrom, want := range map[string]string{
-		`"start_from": []`:                                                   "start_from: must name the nodes whose messages start an instance",
-		`"description": "x"`:                                                 "start_from: must name the nodes whose messages start an instance",
-		`"start_from": ["IO.api.sales"]`:                                     "start_from[0]: must be a node name with its hive",
-		`"start_from": ["IO.api.billing@motherbee", " IO.x@w "]`:             "start_from[1]: must be a node name with its hive",
-		`"start_from": ["SY.admin@motherbee"]`:                               "start_from[0]: must not be a SY.* / RT.* system node",
-		`"start_from": ["IO.api.billing@motherbee", "rt.gw@motherbee"]`:      "start_from[1]: must not be a SY.* / RT.* system node",
-		`"start_from": ["IO.api.billing@motherbee", "AI.billing@motherbee"]`: "start_from[1]: must not be an AI.* node: an agent only answers",
-		`"start_from": ["ai.sales@worker1"]`:                                 "start_from[0]: must not be an AI.* node",
+		`"start_from": []`:                                                  "start_from: must name the nodes whose messages start an instance",
+		`"description": "x"`:                                                "start_from: must name the nodes whose messages start an instance",
+		`"start_from": ["IO.api.sales"]`:                                    "start_from[0]: must be a node name with its hive",
+		`"start_from": ["IO.api.billing@motherbee", " IO.x@w "]`:            "start_from[1]: must be a node name with its hive",
+		`"start_from": ["SY.admin@motherbee"]`:                              "start_from[0]: must not be a SY.* / RT.* system node",
+		`"start_from": ["IO.api.billing@motherbee", "rt.gw@motherbee"]`:     "start_from[1]: must not be a SY.* / RT.* system node",
+		`"start_from": ["IO.api.billing@motherbee", {"consciouses": "ed"}]`: `start_from[1].consciouses: must be "tenant"`,
 	} {
 		assertErrorContains(t, load(startFrom), want)
 	}

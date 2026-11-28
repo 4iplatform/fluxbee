@@ -1,6 +1,9 @@
 package wfcel
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -23,10 +26,15 @@ type WorkflowDefinition struct {
 	WFSchemaVersion string `json:"wf_schema_version"`
 	WorkflowType    string `json:"workflow_type"`
 	Description     string `json:"description"`
-	// StartFrom names the nodes whose messages start an instance: a message from any other node
-	// starts none (wf-orchestration-v1 §5.2.1). Each is a node name with its hive, never a SY.* or
-	// RT.* node.
-	StartFrom      []string          `json:"start_from"`
+	// StartFrom says who starts an instance (wf-orchestration-v1 §5.2.1, §5.6): the nodes whose
+	// messages start one, and, for a capability's door, the consciouses whose CAPABILITY_REQUEST does.
+	// A message from any other node starts none. Each entry is a node name with its hive, never a SY.*
+	// or RT.* node, or the consciouses marker (StartFromEntry).
+	StartFrom StartFrom `json:"start_from"`
+	// RequestActions describe what a capability's door does (wf-orchestration-v1 §5.6): the requests
+	// its input takes, by name, each with what it does, which WF_HELP answers to the conscious as the
+	// door's actions. Only a door (TakesRequests) has them.
+	RequestActions []RequestAction   `json:"request_actions,omitempty"`
 	InputSchema    map[string]any    `json:"input_schema"`
 	InitialState   string            `json:"initial_state"`
 	TerminalStates []string          `json:"terminal_states"`
@@ -42,6 +50,70 @@ type WorkflowDefinition struct {
 	IdleTimeout    string `json:"idle_timeout,omitempty"`
 	inputValidator *jsonschema.Schema
 }
+
+// StartFrom is a definition's start_from: its entries, in the order written.
+type StartFrom []StartFromEntry
+
+// StartFromEntry is an entry of start_from, written as a JSON string or as an object:
+//   - a node name with its hive ("IO.api.sales@worker1"): Node. Its messages start an instance, but
+//     an agent's (AI.*): an agent only answers, so it starts one only with a capability request, as
+//     one ED's conscious (wf-orchestration-v1 §5.6);
+//   - the consciouses marker, {"consciouses": "tenant"}: Consciouses. The consciouses of the EDs of
+//     the WF's tenant start an instance with a capability request, each one checked in identity by
+//     the engine, so no list of names is rewritten as EDs come and go.
+type StartFromEntry struct {
+	Node        string `json:"-"`
+	Consciouses string `json:"consciouses,omitempty"`
+}
+
+// ConsciousesOfTenant is the consciouses marker's value: the consciouses of the EDs of the WF's
+// tenant.
+const ConsciousesOfTenant = "tenant"
+
+// UnmarshalJSON reads an entry as written: a JSON string is a node name, an object the consciouses
+// marker. fieldErrors names a malformed entry by its path before the decoder gets here.
+func (e *StartFromEntry) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '"' {
+		return json.Unmarshal(data, &e.Node)
+	}
+	var marker struct {
+		Consciouses *string `json:"consciouses"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&marker); err != nil || marker.Consciouses == nil {
+		return fmt.Errorf("start_from: %s", startFromEntryShape)
+	}
+	e.Consciouses = *marker.Consciouses
+	return nil
+}
+
+// MarshalJSON writes an entry as it is written in a definition.
+func (e StartFromEntry) MarshalJSON() ([]byte, error) {
+	if e.Consciouses != "" {
+		return json.Marshal(map[string]string{"consciouses": e.Consciouses})
+	}
+	return json.Marshal(e.Node)
+}
+
+// startFromEntryShape says what a start_from entry is.
+const startFromEntryShape = `an entry is a node name with its hive ("IO.api.sales@worker1") or {"consciouses": "tenant"}`
+
+// RequestAction is one request a capability's door takes: its name, the value its input names it by
+// (an input such as {"action": "invoice_state", "number": "A-1032"}), and, optionally, what it does.
+type RequestAction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// The statuses of a reply (wf-orchestration-v1 §5.6): done, with its result; pending, the result
+// comes later by notify; error, with its error_code. A notify is done or error.
+const (
+	AnswerDone    = "done"
+	AnswerPending = "pending"
+	AnswerError   = "error"
+)
 
 type StateDefinition struct {
 	Name         string                 `json:"name"`
@@ -208,7 +280,7 @@ type ActionDefinition struct {
 	Target string      `json:"target,omitempty"`
 	Meta   *ActionMeta `json:"meta,omitempty"`
 	// Message is the kept message a forward sends (keep_message's name); without it, a forward
-	// sends the event's message.
+	// sends the event's message. A reply's or a notify's message is its text (Status).
 	Message string `json:"message,omitempty"`
 	// Vars is an object, $ref-resolved, that a send_message or a forward writes in the WF's block
 	// (meta.context.wf.vars): the deterministic context the WF gives the receiver.
@@ -232,6 +304,14 @@ type ActionDefinition struct {
 	// Name is the variable a set_variable sets, or the name a keep_message keeps its message under.
 	Name  string `json:"name,omitempty"`
 	Value any    `json:"value,omitempty"`
+	// Status, Result, ErrorCode and Message are what a reply or a notify answers the capability
+	// request that started the instance (wf-orchestration-v1 §5.6): its status (AnswerDone,
+	// AnswerPending for a reply only, AnswerError), literal; its result, any value, $ref-resolved as a
+	// payload; with status error its error_code, a literal code; and its message, a literal text. A
+	// forward's message is instead the name of the kept message it sends.
+	Status    string `json:"status,omitempty"`
+	Result    any    `json:"result,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 	// OnError is the failure policy for this action (gap-2): "continue" logs the error and proceeds
 	// (legacy behavior), "fail" halts the transition and routes the instance to a loud terminal
 	// failure. Empty = the per-type default (EffectiveOnError): "fail" for the actions that drive the
@@ -257,8 +337,9 @@ func (a ActionDefinition) EffectiveOnError() string {
 	// State-driving actions default to fail-loud: a lost message, an unset variable, a dropped
 	// internal event (which was meant to trigger the next transition) or a message not kept (which a
 	// later forward sends) all leave the instance inconsistent — exactly what gap-2 eliminates.
-	// Timer ops stay best-effort by default.
-	case "send_message", "forward", "keep_message", "set_variable", "emit_internal_event":
+	// Timer ops stay best-effort by default. A reply or a notify that does not go leaves the
+	// conscious without its answer: it fails loudly too.
+	case "send_message", "forward", "keep_message", "set_variable", "emit_internal_event", "reply", "notify":
 		return OnErrorFail
 	default:
 		return OnErrorContinue

@@ -94,6 +94,7 @@ func normalizeActionNumbers(def *WorkflowDefinition) {
 			actions[i].FireIn = normalizeNumbers(actions[i].FireIn)
 			actions[i].FireAt = normalizeNumbers(actions[i].FireAt)
 			actions[i].Value = normalizeNumbers(actions[i].Value)
+			actions[i].Result = normalizeNumbers(actions[i].Result)
 			if actions[i].Meta != nil {
 				actions[i].Meta.Context = normalizeNumbers(actions[i].Meta.Context)
 			}
@@ -124,6 +125,8 @@ var (
 		"cancel_timer":        {"timer_key"},
 		"reschedule_timer":    {"timer_key", "fire_in", "fire_at"},
 		"set_variable":        {"name", "value"},
+		"reply":               {"status", "result", "error_code", "message"},
+		"notify":              {"status", "result", "error_code", "message"},
 	}
 	actionMetaFields = map[string][]string{
 		"send_message":        {"msg", "context"},
@@ -135,6 +138,10 @@ var (
 		"forward.name":     "a forward names the kept message it sends with message",
 		"forward.payload":  "a forward sends the message's payload as it was received",
 		"forward.meta.msg": "a forward keeps the message's own msg",
+		"reply.target":     "a reply answers the conscious whose request started the instance",
+		"reply.payload":    "a reply's answer is its result",
+		"notify.target":    "a notify goes to the conscious whose request started the instance",
+		"notify.payload":   "a notify's text is the engine's, rendering its result",
 	}
 	// The fields of a menu, of its options and of their params: the agent refuses a menu with any
 	// other.
@@ -158,7 +165,8 @@ func fieldErrors(data []byte) ValidationErrors {
 		Actions    []map[string]any `json:"actions"`
 	}
 	var doc struct {
-		States []struct {
+		StartFrom []any `json:"start_from"`
+		States    []struct {
 			EntryActions []map[string]any `json:"entry_actions"`
 			ExitActions  []map[string]any `json:"exit_actions"`
 			Transitions  []transition     `json:"transitions"`
@@ -175,6 +183,7 @@ func fieldErrors(data []byte) ValidationErrors {
 		}
 	}
 	var errs ValidationErrors
+	errs = append(errs, startFromFieldErrors(doc.StartFrom)...)
 	notOfType := func(path, actionType, field string) {
 		message := "is not a field of " + actionType
 		if hint, ok := fieldHints[actionType+"."+field]; ok {
@@ -240,6 +249,38 @@ func fieldErrors(data []byte) ValidationErrors {
 	_ = decodeNumbersAsWritten(data, &raw)
 	errs = append(errs, capitalErrors("", raw, reflect.TypeFor[WorkflowDefinition]())...)
 	return append(errs, numberErrors("", raw)...)
+}
+
+// startFromFieldErrors names, by their paths, the start_from entries that are neither a node name (a
+// JSON string) nor the consciouses marker, {"consciouses": "tenant"}: an object with another key, or
+// whose consciouses is not "tenant", or a value of another JSON type. A node name's own checks are
+// ValidateDefinition's.
+func startFromFieldErrors(entries []any) ValidationErrors {
+	var errs ValidationErrors
+	for i, entry := range entries {
+		path := fmt.Sprintf("start_from[%d]", i)
+		switch typed := entry.(type) {
+		case string:
+		case map[string]any:
+			if len(typed) == 0 {
+				errs = append(errs, ValidationError{Path: path, Message: startFromEntryShape})
+			}
+			for _, key := range sortedKeys(typed) {
+				switch {
+				case strings.EqualFold(key, "consciouses"):
+					// A key written with other capitals is capitalErrors'.
+					if value, _ := typed[key].(string); value != ConsciousesOfTenant {
+						errs = append(errs, ValidationError{Path: path + "." + key, Message: `must be "tenant": the consciouses of the EDs of the WF's tenant`})
+					}
+				default:
+					errs = append(errs, ValidationError{Path: path + "." + key, Message: "is not a field of the consciouses marker: " + startFromEntryShape})
+				}
+			}
+		default:
+			errs = append(errs, ValidationError{Path: path, Message: startFromEntryShape})
+		}
+	}
+	return errs
 }
 
 // decodeNumbersAsWritten decodes data into v with every number as written (json.Number).
@@ -410,9 +451,8 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	if len(def.StartFrom) == 0 {
 		errs = append(errs, ValidationError{Path: "start_from", Message: "must name the nodes whose messages start an instance"})
 	}
-	for i, name := range def.StartFrom {
-		errs = append(errs, validateStarter(fmt.Sprintf("start_from[%d]", i), name)...)
-	}
+	errs = append(errs, startFromErrors(def.StartFrom)...)
+	errs = append(errs, requestActionErrors(def)...)
 	if len(def.InputSchema) == 0 {
 		errs = append(errs, ValidationError{Path: "input_schema", Message: "must not be empty"})
 	} else {
@@ -507,6 +547,99 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	errs = append(errs, timerKeyErrors(def)...)
 	errs = append(errs, idleTimeoutErrors(def.IdleTimeout)...)
 	errs = append(errs, eventlessErrors(def)...)
+	errs = append(errs, doorErrors(def)...)
+	return errs
+}
+
+// startFromErrors checks start_from's entries: each a node name with its hive, never a SY.* or RT.*
+// node (validateNodeName), or the consciouses marker, written once, whose value is "tenant".
+func startFromErrors(entries StartFrom) ValidationErrors {
+	var errs ValidationErrors
+	markers := 0
+	for i, entry := range entries {
+		path := fmt.Sprintf("start_from[%d]", i)
+		if entry.Consciouses == "" {
+			errs = append(errs, validateNodeName(path, entry.Node)...)
+			continue
+		}
+		markers++
+		switch {
+		case entry.Consciouses != ConsciousesOfTenant:
+			errs = append(errs, ValidationError{Path: path + ".consciouses", Message: `must be "tenant": the consciouses of the EDs of the WF's tenant`})
+		case markers > 1:
+			errs = append(errs, ValidationError{Path: path, Message: "the consciouses marker is written once"})
+		}
+	}
+	return errs
+}
+
+// maxRequestActions is the most request actions a door declares, each named and described as a
+// menu's option is.
+const maxRequestActions = 16
+
+// requestActionErrors checks a definition's request_actions (wf-orchestration-v1 §5.6): only a
+// capability's door has them; up to maxRequestActions, each with a name of its own, lowercase as a
+// menu option's, and, when it has one, a description of maxMenuDescription characters at most.
+func requestActionErrors(def *WorkflowDefinition) ValidationErrors {
+	if len(def.RequestActions) == 0 {
+		return nil
+	}
+	if !def.TakesRequests() {
+		return ValidationErrors{{Path: "request_actions", Message: doorOnly("describe the requests a capability's door takes")}}
+	}
+	var errs ValidationErrors
+	if len(def.RequestActions) > maxRequestActions {
+		errs = append(errs, ValidationError{Path: "request_actions", Message: fmt.Sprintf("must hold %d actions at most", maxRequestActions)})
+	}
+	named := map[string]bool{}
+	for i, action := range def.RequestActions {
+		path := fmt.Sprintf("request_actions[%d]", i)
+		switch {
+		case !menuNamePattern.MatchString(action.Name):
+			errs = append(errs, ValidationError{Path: path + ".name", Message: "must be a lowercase name of 32 characters at most (" + menuNamePattern.String() + ")"})
+		case named[action.Name]:
+			errs = append(errs, ValidationError{Path: path + ".name", Message: fmt.Sprintf("must be unique in request_actions (%q is taken)", action.Name)})
+		}
+		named[action.Name] = true
+		errs = append(errs, validateMenuDescription(path+".description", action.Description, false)...)
+	}
+	return errs
+}
+
+// doorOnly says that what a definition writes is a capability's door's alone.
+func doorOnly(what string) string {
+	return what + `: only a capability's door, whose start_from names the ED's conscious (AI.*) or {"consciouses": "tenant"}`
+}
+
+// doorErrors checks what only a capability's door does (wf-orchestration-v1 §5.6):
+//   - reply and notify answer the capability request that started the instance, so they are a
+//     door's alone;
+//   - a door never sends a message (send_message, forward) to an agent its start_from names, the
+//     ED's conscious: a message asks an agent for a turn, whose answer comes back to its sender, and
+//     only reply and notify reach the conscious, which answers neither to the WF (A-118's loop cannot
+//     happen). With the consciouses marker no conscious is named in the definition, and the engine
+//     refuses, at run time, a send to the one that asked.
+func doorErrors(def *WorkflowDefinition) ValidationErrors {
+	var errs ValidationErrors
+	door := def.TakesRequests()
+	consciouses := map[string]bool{}
+	for _, entry := range def.StartFrom {
+		if IsAgent(entry.Node) {
+			consciouses[strings.ToUpper(strings.TrimSpace(entry.Node))] = true
+		}
+	}
+	def.eachAction(func(path string, action ActionDefinition) {
+		switch action.Type {
+		case "reply", "notify":
+			if !door {
+				errs = append(errs, ValidationError{Path: path + ".type", Message: doorOnly(action.Type + " answers the capability request that started the instance")})
+			}
+		case "send_message", "forward":
+			if consciouses[strings.ToUpper(strings.TrimSpace(action.Target))] {
+				errs = append(errs, ValidationError{Path: path + ".target", Message: "is a conscious whose requests start this WF (start_from): only reply and notify reach it, never a message, whose answer would come back to the WF as a new turn (the WF↔AI loop, FINDINGS A-118)"})
+			}
+		}
+	})
 	return errs
 }
 
@@ -577,6 +710,7 @@ func timerKeyErrors(def *WorkflowDefinition) ValidationErrors {
 // needs one goes to a state whose entry actions set it.
 var catchActions = map[string]bool{
 	"send_message": true, "forward": true, "keep_message": true, "set_variable": true, "emit_internal_event": true,
+	"reply": true, "notify": true,
 }
 
 // validateTransition checks a transition of a state, or of the catch (inCatch): its event_match, by
@@ -626,6 +760,8 @@ func validateTransition(path string, transition *TransitionDefinition, inCatch b
 //     (wf-orchestration-v1 §5.3.6: a keep_message, or a forward of the event, needs a src). Its own
 //     actions run on it, and with a target_state so do its target's entry actions and the exit
 //     actions of the state it leaves, which may be any state an instance waits in.
+//   - A capability's door (TakesRequests) starts an instance on a CAPABILITY_REQUEST, a system
+//     message and no message to keep or forward (§5.6): its initial state's entry actions run on it.
 func eventlessErrors(def *WorkflowDefinition) ValidationErrors {
 	stateAt := map[string]int{}
 	for i, state := range def.States {
@@ -651,6 +787,15 @@ func eventlessErrors(def *WorkflowDefinition) ValidationErrors {
 				continue
 			}
 			reported[actionPath] = true
+		}
+	}
+	if def.TakesRequests() {
+		if initial, ok := stateAt[def.InitialState]; ok {
+			check(fmt.Sprintf("states[%d].entry_actions", initial), def.States[initial].EntryActions, eventless{
+				on:         "the capability request that starts an instance (the initial state's entry actions)",
+				why:        "a system message and no message",
+				forwardFix: ": the request's input is the instance's input, and its payload event.payload",
+			})
 		}
 	}
 	// The msgs of the internal events an instance may get: AGENT_CALL_CAP, and those the definition
@@ -742,13 +887,47 @@ func (def *WorkflowDefinition) eachAction(visit func(path string, action ActionD
 }
 
 // StartsFrom reports whether a message from name, the router-stamped name of its sender, starts an
-// instance of def: name is in its start_from.
+// instance of def: name is a node of its start_from, and no agent's. An agent only answers
+// (wf-orchestration-v1 §1): one that start_from names, the ED's conscious, starts an instance only
+// with a capability request (TakesRequestsFrom), so its message, an answer above all, starts none
+// (the late answer of A-118's loop).
 func (def *WorkflowDefinition) StartsFrom(name string) bool {
-	if def == nil || name == "" {
+	if def == nil || name == "" || IsAgent(name) {
 		return false
 	}
 	for _, starter := range def.StartFrom {
-		if starter == name {
+		if starter.Consciouses == "" && starter.Node == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TakesRequestsFrom reports whether a CAPABILITY_REQUEST from name, the router-stamped name of its
+// sender, may start an instance of def, a capability's door (wf-orchestration-v1 §5.6): name is an
+// agent (AI.*) its start_from names, the ED's conscious, or any agent when start_from has the
+// consciouses marker. Whether name is a conscious of the right ED is identity's to say, which the
+// engine reads before it starts the instance.
+func (def *WorkflowDefinition) TakesRequestsFrom(name string) bool {
+	if def == nil || name == "" || !IsAgent(name) {
+		return false
+	}
+	for _, starter := range def.StartFrom {
+		if starter.Consciouses == ConsciousesOfTenant || (starter.Consciouses == "" && starter.Node == name) {
+			return true
+		}
+	}
+	return false
+}
+
+// TakesRequests reports whether def is a capability's door: its start_from names an agent, one ED's
+// conscious, or has the consciouses marker.
+func (def *WorkflowDefinition) TakesRequests() bool {
+	if def == nil {
+		return false
+	}
+	for _, starter := range def.StartFrom {
+		if starter.Consciouses != "" || IsAgent(starter.Node) {
 			return true
 		}
 	}
@@ -756,9 +935,10 @@ func (def *WorkflowDefinition) StartsFrom(name string) bool {
 }
 
 // Involves reports whether name, the router-stamped name of a message's sender, may drive an
-// instance of def: only the nodes written in it may (FINDINGS A-123), those of its start_from, of
-// an event_match.src, and the targets of its send_message and forward actions, the catch's
-// included.
+// instance of def: only the nodes written in it may (FINDINGS A-123), those of its start_from but an
+// agent (StartsFrom), of an event_match.src, and the targets of its send_message and forward
+// actions, the catch's included. A conscious that start_from names drives none with a message: it
+// starts an instance with a capability request, and only reply and notify reach it.
 func (def *WorkflowDefinition) Involves(name string) bool {
 	if def.StartsFrom(name) {
 		return true
@@ -861,19 +1041,6 @@ func validateNodeName(path, name string) ValidationErrors {
 	return nil
 }
 
-// validateStarter checks a start_from entry: a node name (validateNodeName), never an agent's. An
-// agent only answers (wf-orchestration-v1 §1), and one that starts instances and that the WF also
-// asks has its late answer start a new instance, which asks it again: a WF↔AI loop.
-func validateStarter(path, name string) ValidationErrors {
-	if errs := validateNodeName(path, name); len(errs) > 0 {
-		return errs
-	}
-	if IsAgent(name) {
-		return ValidationErrors{{Path: path, Message: "must not be an AI.* node: an agent only answers, and its late answer would start a new instance (a WF↔AI loop)"}}
-	}
-	return nil
-}
-
 func compileJSONSchema(schema map[string]any) (*jsonschema.Schema, error) {
 	data, err := json.Marshal(schema)
 	if err != nil {
@@ -948,6 +1115,8 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc, names
 			errs = append(errs, ValidationError{Path: path + ".timer_key", Message: "must not be empty"})
 		}
 		errs = append(errs, validateTimerFireSpec(path, action.FireIn, action.FireAt)...)
+	case "reply", "notify":
+		errs = append(errs, validateAnswer(path, action)...)
 	case "set_variable":
 		if !variablePattern.MatchString(action.Name) {
 			errs = append(errs, ValidationError{Path: path + ".name", Message: "must be a valid identifier"})
@@ -969,6 +1138,50 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc, names
 	}
 	errs = append(errs, names.refErrors(path, action)...)
 	return errs
+}
+
+// maxAnswerMessage is the longest message a reply or a notify gives, in Unicode code points, and
+// errorCodePattern the pattern of its error_code.
+const maxAnswerMessage = 1000
+
+var errorCodePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`)
+
+// validateAnswer checks a reply or a notify (wf-orchestration-v1 §5.6): its status, literal (done,
+// pending or error for a reply; done or error for a notify, the result that came later); with status
+// error an error_code, a literal code ([A-Za-z][A-Za-z0-9_.-], 64 characters at most), and with no
+// other; a message, when it has one, of maxAnswerMessage characters at most; its result, any value,
+// under the $ref rules of a payload.
+func validateAnswer(path string, action ActionDefinition) ValidationErrors {
+	var errs ValidationErrors
+	statuses := []string{AnswerDone, AnswerPending, AnswerError}
+	if action.Type == "notify" {
+		statuses = []string{AnswerDone, AnswerError}
+	}
+	switch {
+	case action.Status == "":
+		errs = append(errs, ValidationError{Path: path + ".status", Message: "is required: " + strings.Join(statuses, ", ")})
+	case !slices.Contains(statuses, action.Status):
+		message := "must be done, pending or error"
+		if action.Type == "notify" {
+			message = "must be done or error: a notify is the result that comes after a reply pending"
+		}
+		errs = append(errs, ValidationError{Path: path + ".status", Message: message})
+	}
+	switch {
+	case action.Status == AnswerError && strings.TrimSpace(action.ErrorCode) == "":
+		errs = append(errs, ValidationError{Path: path + ".error_code", Message: "is required with status error"})
+	case action.Status != AnswerError && action.ErrorCode != "":
+		errs = append(errs, ValidationError{Path: path + ".error_code", Message: "is only for status error"})
+	case action.ErrorCode != "" && !errorCodePattern.MatchString(action.ErrorCode):
+		errs = append(errs, ValidationError{Path: path + ".error_code", Message: "must be a code of 64 characters at most, without spaces (" + errorCodePattern.String() + ")"})
+	}
+	switch {
+	case action.Message != "" && strings.TrimSpace(action.Message) == "":
+		errs = append(errs, ValidationError{Path: path + ".message", Message: "must not be blank"})
+	case utf8.RuneCountInString(action.Message) > maxAnswerMessage:
+		errs = append(errs, ValidationError{Path: path + ".message", Message: fmt.Sprintf("must be %d characters at most", maxAnswerMessage)})
+	}
+	return append(errs, validateRefPayload(path+".result", action.Result)...)
 }
 
 // validateTarget checks the target of a send_message or a forward: a node name written in the
@@ -1266,6 +1479,7 @@ func (names menuNames) refErrors(path string, action ActionDefinition) Validatio
 		check("meta.context", action.Meta.Context)
 	}
 	check("vars", action.Vars)
+	check("result", action.Result)
 	check("fire_in", action.FireIn)
 	check("fire_at", action.FireAt)
 	return errs

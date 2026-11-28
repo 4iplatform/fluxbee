@@ -119,7 +119,8 @@ func (s *Service) loadWorkflow(req CompileRequest) (loadedWorkflow, error) {
 // hive than this one (COMPILE_ERROR, naming each path): a solution's WFs and agents run on one hive,
 // so the people's turns a WF relays reach its agents' cognition (cognition-hands-v1 §12.4). IO
 // nodes are the doors and may run on any hive. Every starter and target is a node name with its
-// hive, written in the definition, so the check sees them all.
+// hive, written in the definition, so the check sees them all: the ED's conscious a capability's door
+// names in start_from too. The consciouses marker of a door for all of its tenant's EDs names none.
 func checkSolutionOnHive(def *wfcel.WorkflowDefinition, hive string) error {
 	var refused []string
 	check := func(path, name string) {
@@ -144,8 +145,11 @@ func checkSolutionOnHive(def *wfcel.WorkflowDefinition, hive string) error {
 			actions(fmt.Sprintf("%s[%d].actions", path, j), transition.Actions)
 		}
 	}
-	for i, name := range def.StartFrom {
-		check(fmt.Sprintf("start_from[%d]", i), name)
+	// The consciouses marker names no node: identity says which consciouses a door takes.
+	for i, entry := range def.StartFrom {
+		if entry.Node != "" {
+			check(fmt.Sprintf("start_from[%d]", i), entry.Node)
+		}
 	}
 	for i, state := range def.States {
 		actions(fmt.Sprintf("states[%d].entry_actions", i), state.EntryActions)

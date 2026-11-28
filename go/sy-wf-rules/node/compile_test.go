@@ -699,3 +699,60 @@ func TestACheckIsAReadThatEchoesItsCheckID(t *testing.T) {
 		t.Fatalf("the checks took a version (next %d) or wrote a workflow", next)
 	}
 }
+
+// A capability's door (wf-orchestration-v1 §5.6): the shipped example compiles on its hive, and a
+// door that sends a message to the conscious its start_from names is a COMPILE_ERROR, naming the
+// path and why (A-118's loop), with nothing staged. The conscious is a node it names, on its hive;
+// the consciouses marker names none.
+func TestACapabilitysDoorCompiles(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "nodes", "wf", "examples", "packages", "wf.capability.billing", "flow", "definition.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	door := func(t *testing.T) map[string]any {
+		t.Helper()
+		var definition map[string]any
+		if err := json.Unmarshal(raw, &definition); err != nil {
+			t.Fatal(err)
+		}
+		return definition
+	}
+	onWorker1 := func(t *testing.T) *Service {
+		t.Helper()
+		svc := newTestService(t)
+		svc.cfg.HiveID, svc.cfg.NodeName = "worker1", "SY.wf-rules@worker1"
+		return svc
+	}
+	svc := onWorker1(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "billing.ed4qm7k2xa", Definition: door(t)}); err != nil {
+		t.Fatalf("the example door compiles: %v", err)
+	}
+
+	looping := door(t)
+	reading := looping["states"].([]any)[1].(map[string]any)
+	reading["entry_actions"] = append(reading["entry_actions"].([]any), map[string]any{
+		"type": "send_message", "target": "AI.ed4qm7k2xa@worker1", "meta": map[string]any{"msg": "TELL"},
+		"payload": map[string]any{"type": "text", "content": "the invoice is paid"},
+	})
+	svc = onWorker1(t)
+	const why = "states[1].entry_actions[1].target: is a conscious whose requests start this WF (start_from): only reply and notify reach it"
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "billing.ed4qm7k2xa", Definition: looping}); err == nil ||
+		!strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), why) || !strings.Contains(err.Error(), "A-118") {
+		t.Fatalf("a send to the conscious is refused at compile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "billing.ed4qm7k2xa", "staged", "definition.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no staged definition, got err=%v", err)
+	}
+
+	// On another hive, the conscious it names is refused; the marker names none.
+	svc = newTestService(t)
+	if _, err := svc.CheckWorkflow(CompileRequest{WorkflowName: "billing.ed4qm7k2xa", Definition: door(t)}); err == nil ||
+		!strings.Contains(err.Error(), "start_from[0]: AI.ed4qm7k2xa@worker1 is on another hive") {
+		t.Fatalf("a conscious on another hive: %v", err)
+	}
+	forTenant := door(t)
+	forTenant["start_from"] = []any{map[string]any{"consciouses": "tenant"}}
+	if _, err := onWorker1(t).CompileWorkflow(CompileRequest{WorkflowName: "billing.tenant", Definition: forTenant}); err != nil {
+		t.Fatalf("a door for the tenant's EDs: %v", err)
+	}
+}
