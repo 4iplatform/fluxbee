@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
-	"github.com/google/uuid"
 )
 
 // A capability's door (wf-orchestration-v1 §5.6; docs/digital-executive-v1-stage-3.md §5, §6.1): the
@@ -116,9 +114,9 @@ func testIdentity(doorFor string) fakeIdentity {
 			"ilk:ed1":  {Type: "human", TenantID: "tnt:t1"},
 			"ilk:ed2":  {Type: "human", TenantID: "tnt:t1"},
 			"ilk:ed3":  {Type: "human", TenantID: "tnt:t2"},
-			"ilk:c1":   {Type: "agent", TenantID: "tnt:t1", WorksFor: "ilk:ed1", WorkRole: "conscious"},
-			"ilk:c2":   {Type: "agent", TenantID: "tnt:t1", WorksFor: "ilk:ed2", WorkRole: "conscious"},
-			"ilk:c3":   {Type: "agent", TenantID: "tnt:t2", WorksFor: "ilk:ed3", WorkRole: "conscious"},
+			"ilk:c1":   {Type: "agent", TenantID: "tnt:t1", WorksFor: "ilk:ed1", WorkRole: workRoleConscious},
+			"ilk:c2":   {Type: "agent", TenantID: "tnt:t1", WorksFor: "ilk:ed2", WorkRole: workRoleConscious},
+			"ilk:c3":   {Type: "agent", TenantID: "tnt:t2", WorksFor: "ilk:ed3", WorkRole: workRoleConscious},
 			"ilk:a1":   {Type: "agent", TenantID: "tnt:t1", WorksFor: "ilk:ed1", WorkRole: "agent"},
 			"ilk:door": {Type: "system", TenantID: "tnt:t1", WorksFor: doorFor},
 		},
@@ -606,68 +604,4 @@ func TestTheExampleDoor(t *testing.T) {
 	if reply := requestAnswer(t, disp.sent[len(disp.sent)-1], "r-3"); reply["error_code"] != "MISSING_FIELD" {
 		t.Fatalf("a request without its field: %v", reply)
 	}
-}
-
-// The tenant of an ILK is read from the identity SHM's IlkEntry, right before its display name
-// (src/shm/mod.rs, and the layout fixture the Go SDK shares with Rust), under its seqlock.
-func TestAnILKsTenantIsReadFromTheIdentitySHM(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "fluxbee-go-sdk", "testdata", "identity_layout", "ilk_entry.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var layout struct {
-		Version int            `json:"version"`
-		Size    int            `json:"ilk_entry_size"`
-		Offsets map[string]int `json:"offsets"`
-	}
-	if err := json.Unmarshal(raw, &layout); err != nil {
-		t.Fatal(err)
-	}
-	if layout.Version != int(shmIdentityVersion) || layout.Size != shmIlkEntrySize || layout.Offsets["flags"] != shmIlkOffFlags ||
-		layout.Offsets["display_name"] != shmIlkOffTenantID+16 {
-		t.Fatalf("the layout the tenant is read with is the shared one: %+v", layout)
-	}
-
-	const maxTenants, maxIlks = 2, 3
-	offset := alignUp(alignUp(shmIdentityHeaderSize, shmIdentityRegionAlign)+shmTenantEntrySize*maxTenants, shmIdentityRegionAlign)
-	region := make([]byte, offset+maxIlks*shmIlkEntrySize)
-	le := func(at int, value uint32) {
-		region[at], region[at+1], region[at+2], region[at+3] = byte(value), byte(value>>8), byte(value>>16), byte(value>>24)
-	}
-	le(0, shmIdentityMagic)
-	le(shmHeaderVersion, shmIdentityVersion)
-	le(shmHeaderIlkCount, 2)
-	le(shmHeaderMaxIlks, maxIlks)
-	le(shmHeaderMaxTenants, maxTenants)
-	entry := func(i int, ilk, tenant string, active bool) {
-		at := offset + i*shmIlkEntrySize
-		copy(region[at:], uuidBytes(t, ilk))
-		copy(region[at+shmIlkOffTenantID:], uuidBytes(t, tenant))
-		if active {
-			region[at+shmIlkOffFlags] = byte(shmIlkFlagActive)
-		}
-	}
-	entry(0, "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", true)
-	entry(1, "33333333-3333-4333-8333-333333333333", "22222222-2222-4222-8222-222222222222", false)
-	path := filepath.Join(t.TempDir(), "jsr-identity-test")
-	if err := os.WriteFile(path, region, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if tenant, found, err := ilkTenantAt(path, "ilk:11111111-1111-4111-8111-111111111111"); err != nil || !found || tenant != "tnt:22222222-2222-4222-8222-222222222222" {
-		t.Fatalf("an active ILK's tenant: %q %v %v", tenant, found, err)
-	}
-	for _, ilk := range []string{"ilk:33333333-3333-4333-8333-333333333333", "ilk:44444444-4444-4444-8444-444444444444", "not an ilk"} {
-		if _, found, err := ilkTenantAt(path, ilk); found || err != nil {
-			t.Fatalf("%s: found %v, %v", ilk, found, err)
-		}
-	}
-	if _, found, err := ilkTenantAt(filepath.Join(t.TempDir(), "absent"), "ilk:11111111-1111-4111-8111-111111111111"); found || err != nil {
-		t.Fatalf("no region: %v %v", found, err)
-	}
-}
-
-func uuidBytes(t *testing.T, id string) []byte {
-	t.Helper()
-	parsed := uuid.MustParse(id)
-	return parsed[:]
 }

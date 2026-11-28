@@ -174,7 +174,7 @@ func (rt *NodeRuntime) checkConscious(sender, edILK string) (string, error) {
 		return "", fmt.Errorf("identity could not be read: %v", err)
 	case !found:
 		return "", fmt.Errorf("%s has no ILK in identity", sender)
-	case facts.WorkRole != "conscious" || facts.WorksFor == "":
+	case facts.WorkRole != workRoleConscious || facts.WorksFor == "":
 		return "", fmt.Errorf("%s is no ED's conscious in identity", sender)
 	case edILK != "" && !strings.EqualFold(facts.WorksFor, edILK):
 		return "", fmt.Errorf("%s is the conscious of %s, not of %s", sender, facts.WorksFor, edILK)
@@ -228,7 +228,7 @@ func (rt *NodeRuntime) fromAConscious(def *WorkflowDefinition, sender string) bo
 	if err != nil {
 		log.Printf("wf: identity could not be read for %q: %v", sender, err)
 	}
-	return found && facts.WorkRole == "conscious"
+	return found && facts.WorkRole == workRoleConscious
 }
 
 // identity is what the door reads identity through: the runtime's, or the identity SHM of the node's

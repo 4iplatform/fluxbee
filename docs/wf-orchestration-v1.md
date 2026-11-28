@@ -2202,14 +2202,12 @@ go/nodes/wf/wf-generic; the language's reference is docs/spec-systemnode-wf-v1_1
   takes, checked as a request is. With the help come its `actions`: the definition's
   `request_actions`, each a name and an optional description (`{"name": "invoice_state",
   "description": "The state of an invoice, by its number."}`).
-- **Open, for the integration with release 3A:**
-  - the Go SDK of 0.1.161 reads no ILK's tenant: the door reads it from the SHM itself
-    (go/nodes/wf/wf-generic/node/identity.go), its reads shaped as release 3A's
-    `sdk.LookupIlkByNode` and `sdk.LookupIlk` with `IlkFacts.TenantID`, which replace them at the
-    integration;
-  - `CAPABILITY_REQUEST` and its response are no protected system action
-    (src/router/system_policy.rs), so the router's system gate leaves them alone; stage 3's gate
-    checks the path live.
+- **Identity, through the Go SDK of release 3A:** the door reads the sender's ILK and its facts by
+  the sender's name (`sdk.LookupIlkByNode`), and an ILK's, its tenant included, with
+  `sdk.LookupIlk` (go/nodes/wf/wf-generic/node/identity.go).
+- **Open, for stage 3's gate:** `CAPABILITY_REQUEST` and its response are no protected system
+  action (src/router/system_policy.rs), so the router's system gate leaves them alone; the gate
+  checks the path live.
 
 ## 6. Docs that drift from the code
 
