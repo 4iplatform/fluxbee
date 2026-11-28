@@ -1601,6 +1601,170 @@
           "meaning": "SY.admin could not take the page down now. `retryable: true`: try again shortly; taking it down twice is harmless."
         }
       ]
+    },
+    {
+      "name": "ask_capability",
+      "summary": "Ask one of your executive's capabilities for data or an action, and get its answer.",
+      "when_to_use": "When the person asks for something a system behind you holds or does (an invoice, an order, a record): call it without `capability` to list your capabilities, what each does and its input; then call it with one of them and that input.",
+      "limits": [
+        "Only the capabilities of the executive you speak as, while identity confirms it.",
+        "It waits up to 60 s. `pending` means the result comes later, as a new message in this conversation: tell the person you will let them know.",
+        "The request carries this conversation by itself: `input` holds only what the capability's `input_schema` asks."
+      ],
+      "present_when": "the agent's config names the person it speaks as (`speaks_as`), a Digital Executive's conscious; it lists or asks a capability only while identity confirms that person",
+      "input": {
+        "additionalProperties": false,
+        "properties": {
+          "capability": {
+            "description": "The capability, by the name the list gives it: its door's node name, such as WF.billing.ed4qm7k2xa@worker1. Leave it out to list your capabilities.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "input": {
+            "description": "What the capability takes, by its input_schema. Only with `capability`; {} when absent.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "output": {
+        "description": "Without `capability`: `{status: \"ok\", capabilities: [{capability, description, input_schema, actions?}]}`. With one: its answer, `{status: \"done\" | \"pending\" | \"error\", request_id, capability, result?, error_code?, message?}`.",
+        "oneOf": [
+          {
+            "properties": {
+              "capabilities": {
+                "items": {
+                  "properties": {
+                    "actions": {
+                      "description": "Its actions and what each does, when it names them."
+                    },
+                    "capability": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "help_error": {
+                      "description": "Why its help could not be read now.",
+                      "type": "string"
+                    },
+                    "input_schema": {
+                      "description": "What its `input` takes, as a JSON schema."
+                    },
+                    "workflow_type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "capability"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "status": {
+                "const": "ok"
+              }
+            },
+            "required": [
+              "status",
+              "capabilities"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "capability": {
+                "type": "string"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "result": {
+                "description": "What the capability answered."
+              },
+              "status": {
+                "enum": [
+                  "done",
+                  "pending",
+                  "error"
+                ]
+              }
+            },
+            "required": [
+              "status",
+              "request_id",
+              "capability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "error_code": {
+                "enum": [
+                  "no_capabilities",
+                  "unknown_capability",
+                  "no_conversation",
+                  "capability_unavailable",
+                  "invalid_capability_answer"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "status": {
+                "const": "error"
+              }
+            },
+            "required": [
+              "status",
+              "error_code",
+              "message",
+              "retryable"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "code": "no_capabilities",
+          "meaning": "You speak as no executive that identity confirms now, so you have no capabilities: answer without them."
+        },
+        {
+          "code": "unknown_capability",
+          "meaning": "No capability of yours has that name; the message names the ones you have."
+        },
+        {
+          "code": "no_conversation",
+          "meaning": "The current message names no thread or no node it came through, which a request carries: nothing was asked."
+        },
+        {
+          "code": "capability_unavailable",
+          "meaning": "The capability did not answer: it cannot be reached, did not take the request, or took more than 60 s. A request that timed out may still run: do not ask again at once. `retryable` says whether asking again may help."
+        },
+        {
+          "code": "invalid_capability_answer",
+          "meaning": "The capability answered without a status: its answer is not used."
+        },
+        {
+          "code": "INVALID_INPUT",
+          "meaning": "The capability's own: `input` does not follow its input_schema. Fix it and ask again."
+        },
+        {
+          "code": "UNAUTHORIZED",
+          "meaning": "The capability's own: it does not take requests from you."
+        }
+      ]
     }
   ]
 }

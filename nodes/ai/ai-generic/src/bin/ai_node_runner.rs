@@ -11,19 +11,20 @@ use fluxbee_ai_sdk::errors::{ProviderError, ProviderErrorKind, PROVIDER_FAILURE_
 use fluxbee_ai_sdk::{
     ai_settings_at, build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, build_text_response,
-    control_request, create_function_calling_model, create_llm_client, extract_text,
-    installation_file_path, is_infrastructure_message, is_vault_secret_changed,
-    note_infrastructure_message, resolve_message_contract,
-    resolve_model_input_from_payload_with_options, set_reply_evaluation, AgentTool, AiAccount,
-    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiSdkError, AiSettings, AiSettingsSource,
-    AiUserArtifact, ContractAnswer, ControlRequest, FunctionCallingConfig, FunctionCallingModel,
-    FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput,
-    FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient,
-    LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings,
-    NodeRuntime, ResolvedModelInput, RuntimeConfig, RuntimeLoad, RuntimeLoadSnapshot,
-    SpeaksAsStatus, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool,
-    ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch,
-    UsageRecorder, MSG_PING, MSG_STATUS,
+    capability_result_of, capability_result_prompt_block, control_request,
+    create_function_calling_model, create_llm_client, extract_text, installation_file_path,
+    is_infrastructure_message, is_vault_secret_changed, note_infrastructure_message,
+    resolve_message_contract, resolve_model_input_from_payload_with_options, set_reply_evaluation,
+    AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiSdkError,
+    AiSettings, AiSettingsSource, AiUserArtifact, AskCapabilityTool, CapabilityConversation,
+    CapabilityDirectory, ContractAnswer, ControlRequest, FunctionCallingConfig,
+    FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
+    FunctionRunInput, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
+    LanceDbThreadStateStore, LlmClient, LlmRequest, MenuContract, Message, MessageContract,
+    ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, RuntimeLoad,
+    RuntimeLoadSnapshot, SpeaksAsStatus, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool,
+    ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog,
+    ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -311,6 +312,10 @@ struct GenericAiNode {
     router: Option<Arc<RouterDispatcher>>,
     /// Its AI runtime's load, which its `NODE_STATUS_GET` answer reports (FINDINGS A-290).
     runtime_load: RuntimeLoad,
+    /// What `ask_capability` keeps across turns, for a node whose config names the person it
+    /// speaks as (`speaks_as`), a Digital Executive's conscious (docs/digital-executive-v1-stage-3.md
+    /// §6): `None` for any other node, which then has no `ask_capability`.
+    capabilities: Option<Arc<CapabilityDirectory>>,
 }
 
 /// The files one message's tools make, for its reply (FINDINGS A-98, A-99). A file generator keeps
@@ -474,11 +479,35 @@ impl ReadBlobTool {
 #[derive(Debug, Default)]
 struct BehaviorContext {
     thread_id: Option<String>,
+    /// Whom the agent talks to in this turn: the message's sender, or, on a capability's result,
+    /// the person of the conversation it carries (docs/digital-executive-v1-stage-3.md §6.1). The
+    /// state tools are bound to that person's record, and the usage record names them.
     src_ilk: Option<String>,
     trace_id: Option<String>,
+    /// The conversation `ask_capability` carries (`CapabilityConversation::of_turn`), never the
+    /// model's.
+    conversation: Option<CapabilityConversation>,
     /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
     /// is never answered as retryable, since sending the message again would run the tool again.
     tool_ran: AtomicBool,
+}
+
+impl BehaviorContext {
+    /// The context of the turn `msg`. A capability's result, which the AI runtime lets through
+    /// only from one of the ED's capabilities, is a turn in the person's conversation: the agent
+    /// talks to that person, not to the door (docs/digital-executive-v1-stage-3.md §6.1).
+    fn of_message(msg: &Message) -> Self {
+        Self {
+            thread_id: extract_thread_id(msg),
+            src_ilk: match capability_result_of(msg) {
+                Some(result) => result.conversation.person_ilk,
+                None => extract_src_ilk(msg),
+            },
+            trace_id: Some(msg.routing.trace_id.clone()),
+            conversation: CapabilityConversation::of_turn(msg),
+            tool_ran: AtomicBool::new(false),
+        }
+    }
 }
 
 /// One message's answer: its reply and, under a response contract with a `text_field` or a WF's
@@ -767,12 +796,8 @@ impl AiNode for GenericAiNode {
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
         }
-        let behavior_ctx = BehaviorContext {
-            thread_id: extract_thread_id(&msg),
-            src_ilk: extract_src_ilk(&msg),
-            trace_id: Some(msg.routing.trace_id.clone()),
-            tool_ran: AtomicBool::new(false),
-        };
+        let capability_result = capability_result_of(&msg);
+        let behavior_ctx = BehaviorContext::of_message(&msg);
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let src_ilk_source = src_ilk_source(&msg);
             if behavior_ctx.src_ilk.is_none() {
@@ -845,12 +870,15 @@ impl AiNode for GenericAiNode {
             msg.meta.context.as_ref(),
             contract.as_ref().and_then(MessageContract::menu),
         );
+        let capability_block = capability_result_prompt_block(&msg);
         // What the model reads before the message: the memory block, the message's trace, the
-        // WF's block, then who sent the message, named as the recent turns name a speaker.
+        // WF's block, a capability's result, then who sent the message, named as the recent turns
+        // name a speaker.
         let prompt_blocks = [
             cognition_block.as_deref(),
             trace_block.as_deref(),
             wf_block.as_deref(),
+            capability_block.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -869,6 +897,7 @@ impl AiNode for GenericAiNode {
                 thread_id = ?behavior_ctx.thread_id,
                 memory_package = msg.meta.memory_package.is_some(),
                 wf_block = wf_block.is_some(),
+                capability_result = capability_result.is_some(),
                 input_len = input.len(),
                 input_preview = %text_preview(&input, 240),
                 "incoming user message"
@@ -1284,6 +1313,15 @@ impl GenericAiNode {
             registry.register(Arc::new(UnpublishHtmlTool {
                 router: vault.dispatcher().clone(),
             }))?;
+        }
+        // A Digital Executive's conscious asks its ED's capabilities, as the ED it speaks as while
+        // identity confirms it (docs/digital-executive-v1-stage-3.md §6).
+        if let Some(directory) = &self.capabilities {
+            registry.register(Arc::new(AskCapabilityTool::new(
+                directory.clone(),
+                self.runtime_load.speaks_as_person(),
+                ctx.conversation.clone(),
+            )))?;
         }
         Ok(())
     }
@@ -3893,6 +3931,7 @@ fn base_tool_cards() -> Vec<ToolCard> {
         ReadBlobTool::card(),
         PublishHtmlTool::card(),
         UnpublishHtmlTool::card(),
+        AskCapabilityTool::card(),
     ]
 }
 
@@ -5734,6 +5773,15 @@ async fn run_managed_node(
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let usage = UsageRecorder::start(dispatcher.clone());
     let installation_file = installation_file_of_hive(Path::new(&node_config_dir));
+    // `ask_capability` for a Digital Executive's conscious: a node whose config names the person
+    // it speaks as.
+    let capabilities = runtime_config.speaks_as.is_some().then(|| {
+        Arc::new(CapabilityDirectory::new(
+            dispatcher.clone(),
+            node_name.clone(),
+            self_ilk_id.clone(),
+        ))
+    });
     let ai_node = GenericAiNode {
         node_name,
         self_ilk_id,
@@ -5750,6 +5798,7 @@ async fn run_managed_node(
         runtime_version,
         router: Some(dispatcher.clone()),
         runtime_load: RuntimeLoad::new(),
+        capabilities,
     };
     spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
@@ -7853,6 +7902,7 @@ mod tests {
             runtime_version: Some("0.1.86".to_string()),
             router: None,
             runtime_load: RuntimeLoad::new(),
+            capabilities: None,
         }
     }
 
@@ -10919,6 +10969,73 @@ mod tests {
         assert_eq!(reply.meta.context, Some(context));
     }
 
+    /// docs/digital-executive-v1-stage-3.md §6.1: a capability's result, which the AI runtime lets
+    /// through only from one of the ED's capabilities, reaches the model behind its block, and the
+    /// turn is the person's: the state tools and the usage record name the person of the
+    /// conversation, and `ask_capability` carries that conversation, not the door's.
+    #[tokio::test]
+    async fn a_capabilitys_result_reaches_the_model_as_a_turn_of_the_persons_conversation() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let person = "ilk:22222222-2222-4222-8222-222222222222";
+        let conversation = json!({
+            "thread_id": "thread:ana",
+            "person_ilk": person,
+            "io_node": "IO.wapp.ed4qm7k2xa@worker1",
+            "reply_target": {"kind": "wapp_post", "address": "5491100000000"}
+        });
+        let mut msg = sample_user_request_with_context(
+            json!({"capability_result": {
+                "request_id": "req-1",
+                "capability": "WF.billing.ed4qm7k2xa@worker1",
+                "status": "done",
+                "result": {"state": "paid"},
+                "conversation": conversation
+            }}),
+            Some("ilk:33333333-3333-4333-8333-333333333333"),
+        );
+        msg.routing.src_l2_name = Some("WF.billing.ed4qm7k2xa@worker1".to_string());
+        msg.meta.thread_id = Some("thread:ana".to_string());
+        msg.payload = json!({"type": "text", "content": "Invoice A-1032 is paid."});
+
+        let ctx = BehaviorContext::of_message(&msg);
+        assert_eq!(ctx.src_ilk.as_deref(), Some(person));
+        assert_eq!(ctx.thread_id.as_deref(), Some("thread:ana"));
+        assert_eq!(
+            serde_json::to_value(ctx.conversation.as_ref().expect("a conversation")).unwrap(),
+            conversation
+        );
+        let block = capability_result_prompt_block(&msg).expect("the result's block");
+        let label = current_message_label(&msg, |_| None);
+        let reply = node
+            .on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(
+            reply.payload["content"],
+            format!("Echo: {block}\n\n{label}\nInvoice A-1032 is paid.")
+        );
+
+        // A message without a result reads as before: its sender is whom the agent talks to.
+        let mut plain = sample_user_request_with_context(json!({}), Some(person));
+        assert_eq!(capability_result_prompt_block(&plain), None);
+        let ctx = BehaviorContext::of_message(&plain);
+        assert_eq!(ctx.src_ilk.as_deref(), Some(person));
+        assert!(
+            ctx.conversation.is_none(),
+            "no thread and no node it came through"
+        );
+        plain.meta.thread_id = Some("thread:plain".to_string());
+        plain.routing.src_l2_name = Some("IO.sim.local@motherbee".to_string());
+        let conversation = BehaviorContext::of_message(&plain)
+            .conversation
+            .expect("a conversation");
+        assert_eq!(conversation.io_node, "IO.sim.local@motherbee");
+        assert_eq!(conversation.person_ilk.as_deref(), Some(person));
+    }
+
     /// The line ahead of `sample_user_request_with_context`'s message when a WF's sample context
     /// comes with it: its ILK, and where its cycle started, its trace's first entry.
     const SAMPLE_MESSAGE_LABEL: &str =
@@ -11845,6 +11962,12 @@ mod tests {
         node.thread_state_store = Some(Arc::new(LanceDbThreadStateStore::new(
             std::env::temp_dir().join(format!("ai-generic-tools-{}", Uuid::new_v4())),
         )));
+        // A Digital Executive's conscious: its config names the person it speaks as.
+        node.capabilities = Some(Arc::new(CapabilityDirectory::new(
+            dispatcher.clone(),
+            "AI.generic@motherbee",
+            Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+        )));
         let every_condition = BehaviorContext {
             src_ilk: Some("ilk:22222222-2222-4222-8222-222222222222".to_string()),
             ..BehaviorContext::default()
@@ -11862,8 +11985,9 @@ mod tests {
             sorted(cards.iter().map(ToolCard::model_definition).collect())
         );
 
-        // No interlocutor and no identity: the state tools and the publishing tools are not
-        // there; the generators, get_current_time and read_blob always are.
+        // No interlocutor, no identity and no person it speaks as: the state tools, the publishing
+        // tools and ask_capability are not there; the generators, get_current_time and read_blob
+        // always are.
         let mut bare = test_node();
         bare.router = Some(dispatcher);
         let mut names = bare

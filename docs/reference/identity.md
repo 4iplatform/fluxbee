@@ -816,8 +816,8 @@ converges to the union of the mesh.
 | IO nodes | A sender's ILK before provisioning (`resolve_ilk_from_hive_id`); with `io.person_ilk` set, their own ILK's `works_for` and `work_role` and the person's tenant (`IdentityResolver::ilk_entry`, `nodes/io/common`). |
 | IO.cloud | Its fast `get_ilk` and `list_ilks` reads (`CLOUD_LOCAL_OPS` in `crates/fluxbee_sdk/src/cloud.rs`). |
 | ai.generic | Its own ILK and definition hashes. |
-| AI SDK runtime | With `RuntimeConfig.speaks_as` set, its own ILK's `works_for` and `work_role`, every 10 s (`crates/fluxbee_ai_sdk/src/speaks_as.rs`). |
-| Go SDK | `go/fluxbee-go-sdk/identity_shm.go`. |
+| AI SDK runtime | With `RuntimeConfig.speaks_as` set, its own ILK's `works_for` and `work_role`, every 10 s (`crates/fluxbee_ai_sdk/src/speaks_as.rs`); the ED's capabilities, the ILKs whose `work_role` is `capability` for the ED or for nobody of its node's tenant, for `ask_capability` and for a capability's result (`crates/fluxbee_ai_sdk/src/capabilities.rs`, [digital-executive-v1-stage-3](../digital-executive-v1-stage-3.md) §2, §6). |
+| Go SDK | `go/fluxbee-go-sdk/identity_shm.go`: an ILK's facts by its id (`LookupIlk`) or its node's name (`LookupIlkByNode`), its tenant among them, and whether a node is a person's conscious (`IsConsciousOf`), which a capability's door checks. |
 
 ---
 

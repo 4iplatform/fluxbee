@@ -274,6 +274,13 @@ reads nothing of the hive's ([hive-config-update-v1](../../../docs/hive-config-u
   block after the trace and before the message: `vars` as JSON, cut at 8 KiB with a line that says
   so, and the menu.
   - Text and multimodal input alike: as parts, each block is a text part of its own, first.
+- **A capability's result** (`meta.context.capability_result`, stage 3 §6.1), which the AI runtime
+  lets through only from one of the ED's capabilities: the node shows it to the model as a block
+  after the WF's (whose result it is, that it answers an earlier request of this conversation,
+  its status, its result's JSON cut at 8 KiB, or its error), and the turn is the person's: the
+  state tools and the usage record name the conversation's person, and `ask_capability` carries
+  that conversation. The runtime sends the answer to the conversation's IO node, never to the
+  door.
 - **Its reply** carries the agent's own ILK as `src_ilk`, or the person its config names and
   identity confirms ([`config.speaks_as`](#configspeaks_as)), never one copied from the message;
   and the sender's as `dst_ilk`. A control reply and a vault call keep the agent's own ILK, and the
@@ -447,7 +454,15 @@ rendered from the card, and so are the catalog and the `NODE_HELP` answer.
     is not 64 lowercase hex characters is `not_found` before SY.admin is asked, never a retryable
     failure. The journal names the publication's id, never the URL, which is the key to the page
     (FINDINGS A-95); the reply that carries the URL is logged by its files' names and its text's
-    length, never its text.
+    length, never its text;
+  - `ask_capability` when its config names the person it speaks as
+    ([`config.speaks_as`](#configspeaks_as)), a Digital Executive's conscious
+    ([digital-executive-v1-stage-3](../../../docs/digital-executive-v1-stage-3.md) §6). It lists
+    the ED's capabilities from identity, each with its door's help, and asks one within the turn,
+    waiting up to 60 s; the request carries the turn's conversation, never the model's. While
+    identity does not confirm the person it answers `no_capabilities`. The AI SDK's
+    `capabilities` module holds its logic; the node registers it with the ED its runtime confirms
+    at the turn's start.
 - **The journal holds no permission to read:** the "incoming user message" line previews the
   input with every `/public/<key>` as `/public/<redacted>` and every blob name as `<blob>` (A-95,
   A-106), and `read_blob` logs a failure without the blob's name.
