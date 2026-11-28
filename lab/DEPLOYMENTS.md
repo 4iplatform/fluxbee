@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.162** | 2026-11-27 | `7da4782b` | motherbee + spokes (core), shared code: the Digital Executive's stage 3, release 3A ([stage 3](../docs/digital-executive-v1-stage-3.md) §2, §6, §6.1): identity's roles `connector` (4) and `capability` (5, which may work for nobody: a capability for all of a tenant's EDs) in the SHM's three copies and SY.identity; the AI SDK's `ask_capability` (an ED's capabilities from identity, their doors' help, a `CAPABILITY_REQUEST` with the turn's conversation, 60 s) and the turn on a later result answered to the person's IO; ai.generic registers it for a conscious; the Go SDK's `LookupIlkByNode`, `IsConsciousOf`, the ILK's tenant | ✅ live, gate0262 35 PASS (one tool FAIL re-read PASS) | snapshot `pre-ed3a-0-1-162` · `apt install fluxbee=0.1.161` (nothing one-way) |
+| **0.1.163** | 2026-11-28 | `27909748` | motherbee + spokes (core), the WF engine and SY.wf-rules: the Digital Executive's stage 3, release 3B ([stage 3](../docs/digital-executive-v1-stage-3.md) §5, §6.1): a capability's door, a WF that `start_from` the ED's conscious (or `{"consciouses": "tenant"}`), checked in identity; `reply` (`CAPABILITY_REQUEST_RESPONSE`, done, pending or error) and `notify` (a later result to the conscious that asked); `request_actions` in its `WF_HELP`; the compiler refusing any other send to a starter conscious; only a request from a conscious gets in | ✅ live, gate0263 30 PASS, no FAIL | snapshot `pre-ed3b-0-1-163` · `apt install fluxbee=0.1.162` (the WF store's schema v8 adds a column) |
+| **0.1.162** | 2026-11-27 | `7da4782b` | motherbee + spokes (core), shared code: the Digital Executive's stage 3, release 3A ([stage 3](../docs/digital-executive-v1-stage-3.md) §2, §6, §6.1): identity's roles `connector` (4) and `capability` (5, which may work for nobody: a capability for all of a tenant's EDs) in the SHM's three copies and SY.identity; the AI SDK's `ask_capability` (an ED's capabilities from identity, their doors' help, a `CAPABILITY_REQUEST` with the turn's conversation, 60 s) and the turn on a later result answered to the person's IO; ai.generic registers it for a conscious; the Go SDK's `LookupIlkByNode`, `IsConsciousOf`, the ILK's tenant | ✅ replaced by 0.1.163 | snapshot `pre-ed3a-0-1-162` (deleted 2026-11-28) · `apt install fluxbee=0.1.161` (nothing one-way) |
 | **0.1.161** | 2026-11-27 | `aec9d4b6` | motherbee + spokes (core), io.wapp alone: FINDINGS A-372, a writer is provisioned at the primary's SY.identity by default, as io.api does (a worker's io.wapp asked its own hive's replica, `NOT_PRIMARY`) | ✅ replaced by 0.1.162 | snapshot `pre-a372-0-1-161` (deleted 2026-11-28) · `apt install fluxbee=0.1.160` (nothing one-way) |
 | **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ replaced by 0.1.161 (gate0260 50 PASS; A-372 fixed there) | snapshot `pre-ed2d-0-1-160` (deleted 2026-11-28) · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
 | **0.1.159** | 2026-11-27 | `91587ba0` | motherbee + spokes (core), three binaries, one branch each: the Digital Executive's stage 2, release 2C ([stage 2](../docs/digital-executive-v1-stage-2.md) §1, §9, §10). SY.identity: `ILK_CREATE_VIRTUAL` born with its id (idempotent, `ILK_ID_TAKEN`), `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` (migration v8, the file in `blob/people/`, its hash in the SHM), `ILK_DELETE`'s `node_retired` reason; the orchestrator: `kill_node`'s `retire_instance`, the people folder; SY.admin: `create_virtual_person`'s `ilk_id`, `set_ilk_works_for`, `set_person_document`, `kill_node`'s retire | ✅ replaced by 0.1.160 | snapshot `pre-ed2c-0-1-159` (deleted 2026-11-27) · `apt install fluxbee=0.1.158` (migration v8 only adds two columns) |
@@ -171,6 +172,42 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.163 — a capability's door: a WF the ED's conscious asks (the Digital Executive's stage 3, release 3B)
+
+- **Date:** 2026-11-28 (ART) · **Previous version:** 0.1.162 · **Commit:** `27909748`.
+- **Scope:** motherbee and the three spokes. The WF engine (wf-generic), SY.wf-rules and their
+  shared language (`go/pkg/wfcel`).
+- **Why:** stage 3 §5 (the operator, 2026-11-28): every capability's entry is a WF, a normal one.
+- **What changed (`coa/ed3-wf3`, one builder's five commits):** `start_from` takes an `AI.*` name or
+  the marker `{"consciouses": "tenant"}`, and a `CAPABILITY_REQUEST` from it starts an instance
+  after identity's check (the sender's node works for `ed_ilk` as its conscious; a door of one ED
+  serves that ED, a door for every ED a person of its tenant); the instance keeps the request
+  (store schema v8, replayed after a crash); `reply` and `notify`; `request_actions` described in
+  `WF_HELP`, which a starter conscious may ask; the compiler refuses a `send_message`/`forward` to a
+  starter conscious; from a conscious only a request gets in, anything else is dropped unanswered
+  (A-118's loop); the example `wf.capability.billing`; the WF docs and Archi's handbook.
+- **Build:** CI green on the branch and on the head `27909748`. Build on fb-build
+  02:53:13–02:59:45Z (6.5 min).
+- **The deploy:** `ops deploy 0.1.163 --snapshot pre-ed3b-0-1-163 --drop pre-ed3a-0-1-162` in 228 s;
+  health clean.
+- **Checked on 8.x (the gate, gate0263, 03:04–03:09Z; `scratchpad/gate-tools/r163_gate.py`,
+  git-ignored; 30 PASS, no FAIL; the conscious's model calls only):**
+  - the smoke; an ED born through Cloud's door (active 4.5 s after the order), read back confirmed;
+  - **a door with no agent behind it** (`WF.gate.billing.<short>@worker1`) deployed for the ED in
+    4.6 s, set to work for it as its `capability`;
+  - **within the turn:** "¿cuál es el estado de la factura A-1032?": the conscious listed its
+    capabilities, asked the door (an instance answered in 0.3 s), and answered the person "La
+    factura A-1032 figura como pagada, desde el 12/11/2026";
+  - **a result that comes later:** "¿podés reconciliar las facturas del cliente C-77?": the door
+    answered `pending` and the ED said so; its timer woke it 60 s later; `notify` gave the result to
+    the conscious, which wrote to the person on the same thread "¡Listo! … Quedan 2 facturas
+    impagas";
+  - the door deleted, the ED removed in 3.4 s; cleaned.
+- **Next:** 3C, the packages: Archi's CI with its system packages, `cd_publish`, SY.deploy's catalog
+  by kind, WF nodes in its steps, `plain-ed` out of its binary.
+- **Rollback:** snapshot `pre-ed3b-0-1-163`, or `apt install fluxbee=0.1.162` and 0.1.162's
+  `update_installation`: the WF store's schema v8 adds a column the older engine does not read.
 
 ## 0.1.162 — capabilities, the shared code: two roles and the conscious's tool (the Digital Executive's stage 3, release 3A)
 
