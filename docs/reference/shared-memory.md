@@ -325,8 +325,10 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `personality_hash` (sha256; all zeros = none); `created_at`, `updated_at`; since version 7,
   `works_for`, the 16 bytes of the person's ILK the ILK works for (all zeros = nobody), and
   `work_role`, its role to that person (`ILK_WORK_ROLE_*`: 0 none, 1 conscious, 2 channel,
-  3 agent), written together or not at all
-  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1); last,
+  3 agent, 4 connector, 5 capability), written together or not at all
+  ([digital-executive-v1-stage-2](../digital-executive-v1-stage-2.md) §1.1), but for a capability
+  of every ED of its tenant: 5 and all zeros
+  ([digital-executive-v1-stage-3](../digital-executive-v1-stage-3.md) §2); last,
   `document_hash`, a person's document: the first 8 bytes of its SHA-256, its 16-hex prefix,
   which names its file in the people folder (all zeros = none; §1.2), written by SY.identity from
   the Digital Executive's release 2C and all zeros until then; the Rust SDK reads it as

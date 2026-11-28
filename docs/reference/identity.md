@@ -60,7 +60,7 @@ Where identity lives:
 | `channels` | Its ICHs (`ChannelRecord`, §2.5). |
 | `deleted_at_ms`, `deleted_reason` | The delete mark (§2.8). The reason is `direct` for a delete, and `retired: node` or `retired: hive` for a retired system ILK (§2.9); the column holds 16 characters. |
 | `virtual` | A virtual person, a Digital Executive (§2.10). On the wire only when true. |
-| `works_for`, `work_role` | Whom a node's ILK works for (a person's `ilk:<uuid>`) and its role to that person: `conscious`, `channel` or `agent` (§2.10). On the wire only when set. |
+| `works_for`, `work_role` | Whom a node's ILK works for (a person's `ilk:<uuid>`) and its role to that person: `conscious`, `channel`, `agent`, `connector` or `capability` (§2.10); a `capability` with no `works_for` is one of every ED of its tenant. On the wire only when set. |
 | `document`, `document_hash` | A person's document, a JSON object, and the SHA-256 of its canonical bytes, 64 hex (§2.10). On the wire only when set. |
 
 Two identification keys are unique, and the database enforces both
@@ -391,15 +391,20 @@ it sent (FINDINGS A-232).
 **`ILK_SET_WORKS_FOR {ilk_id, works_for, work_role, change_reason?}`** (`set_ilk_works_for`):
 
 - Whom a node's ILK works for, and its role. `works_for` and `work_role` are always named: an
-  `ilk:<uuid>` and `conscious`, `channel` or `agent` set it, two nulls clear it. A request that
-  leaves either out is refused (`INVALID_REQUEST`), so nothing clears a relation by omission.
+  `ilk:<uuid>` and `conscious`, `channel`, `agent`, `connector` (an IO to an external system) or
+  `capability` (a capability's entry WF) set it, two nulls clear it. `null` and `capability` make
+  the ILK a capability of every ED of its tenant
+  ([digital-executive-v1-stage-3](../digital-executive-v1-stage-3.md) §2): the one role that names
+  no person. A request that leaves either out is refused (`INVALID_REQUEST`), so nothing clears a
+  relation by omission.
 - The ILK is an active `agent`, a node's (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`). The person is an
   active `human`, real or virtual (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`), of the ILK's own tenant
-  (`TENANT_MISMATCH`). A person without a role, a role without a person and an unknown role are
-  `INVALID_REQUEST`.
+  (`TENANT_MISMATCH`). A person without a role, a role without a person (but `capability`) and an
+  unknown role are `INVALID_REQUEST`.
 - `change_reason` goes to the log with the change (`identity set whom an ILK works for`).
 - Answers `{ilk_id, works_for, work_role}`. The SHM entry gets the person's 16 bytes and the role's
-  byte (`apply_work_relation_to_ilk_entry`, §6).
+  byte, all zeros and the role's byte for a capability of every ED
+  (`apply_work_relation_to_ilk_entry`, §6).
 - A replica's push never changes it: the primary's relation stands, and an ILK the primary does
   not hold yet comes in with none (`with_primary_work_relation`).
 

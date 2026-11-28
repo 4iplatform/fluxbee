@@ -34,7 +34,7 @@ use json_router::shm::{
     IdentityRegionLimits, IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry,
     TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
     IDENTITY_DEFINITION_MAX_HANDBOOKS, IDENTITY_DEFINITION_MAX_SKILLS, ILK_FLAG_VIRTUAL,
-    ILK_WORK_ROLE_NONE,
+    ILK_WORK_ROLE_CAPABILITY, ILK_WORK_ROLE_NONE,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -197,6 +197,9 @@ const ILK_ID_TAKEN: &str = "ILK_ID_TAKEN";
 const PERSON_NOT_FOUND: &str = "PERSON_NOT_FOUND";
 /// ILK_SET_WORKS_FOR naming a person of another tenant than the ILK's.
 const TENANT_MISMATCH: &str = "TENANT_MISMATCH";
+/// The one role an ILK may hold toward nobody: a capability's entry WF for every ED of its tenant
+/// (docs/digital-executive-v1-stage-3.md §2).
+const WORK_ROLE_CAPABILITY: &str = "capability";
 /// A person's document failed to reach the people folder: nothing changed.
 const DOCUMENT_WRITE_FAILED: &str = "DOCUMENT_WRITE_FAILED";
 /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): its schema, its size once
@@ -684,7 +687,9 @@ struct IlkRecord {
     )]
     is_virtual: bool,
     /// The person this ILK works for, its ILK (`ilk:<uuid>`), and the ILK's role to that person:
-    /// `conscious`, `channel` or `agent` (docs/digital-executive-v1-stage-2.md §1.1). Replicated
+    /// `conscious`, `channel`, `agent`, `connector` or `capability`
+    /// (docs/digital-executive-v1-stage-2.md §1.1; a `capability` with no person is one of every
+    /// ED of its tenant, docs/digital-executive-v1-stage-3.md §2). Replicated
     /// from the primary like any field, and projected into the identity SHM (version 7). `None` for
     /// an ILK that works for nobody, until `ILK_SET_WORKS_FOR` sets them on the primary. Absent on
     /// the wire when `None`, so a record or a delta from a binary that predates them reads as
@@ -2086,11 +2091,13 @@ impl IdentityStore {
     /// ILK_SET_WORKS_FOR (docs/digital-executive-v1-stage-2.md §1.1): whom a node's ILK works for,
     /// and its role. The ILK is an active `agent`, a node's (`ILK_NOT_FOUND`, `INVALID_ILK_TYPE`). A
     /// person and a role set it: the person is an active `human`, real or virtual, of the ILK's own
-    /// tenant (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`). Two nulls clear it. A role
-    /// that is not `conscious`, `channel` or `agent`, a person without a role and a role without a
-    /// person answer `INVALID_REQUEST`. It checks everything before it changes anything. Answers
-    /// `{ilk_id, works_for, work_role}`, and whether the record changed: the same relation again
-    /// changes nothing.
+    /// tenant (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`). The role `capability`
+    /// alone may name no person: a capability of every ED of the ILK's tenant
+    /// (docs/digital-executive-v1-stage-3.md §2). Two nulls clear it. A role that is not
+    /// `conscious`, `channel`, `agent`, `connector` or `capability`, a person without a role and any
+    /// other role without a person answer `INVALID_REQUEST`. It checks everything before it changes
+    /// anything. Answers `{ilk_id, works_for, work_role}`, and whether the record changed: the same
+    /// relation again changes nothing.
     fn set_ilk_works_for(&mut self, req: &IlkSetWorksForRequest) -> Result<(Value, bool), String> {
         let ilk_id = req.ilk_id.as_str();
         let _ = parse_prefixed_uuid(ilk_id, "ilk")?;
@@ -2099,7 +2106,7 @@ impl IdentityStore {
         if work_role.is_some_and(|role| ilk_work_role_code(role).is_none()) {
             return Err(lifecycle_error(
                 "INVALID_REQUEST",
-                "work_role must be conscious, channel, agent or null",
+                "work_role must be conscious, channel, agent, connector, capability or null",
             ));
         }
         match (works_for, work_role) {
@@ -2109,10 +2116,11 @@ impl IdentityStore {
                     "works_for names a person, so work_role must name the ILK's role to it",
                 ))
             }
-            (None, Some(_)) => {
+            (None, Some(role)) if role != WORK_ROLE_CAPABILITY => {
                 return Err(lifecycle_error(
                     "INVALID_REQUEST",
-                    "work_role needs works_for, the person it is a role to",
+                    "work_role needs works_for, the person it is a role to; only a capability \
+                     may work for nobody, for every ED of its tenant",
                 ))
             }
             _ => {}
@@ -4988,7 +4996,7 @@ impl IdentityRuntime {
                     // A fixed text: the request's values are not repeated (FINDINGS A-232).
                     Err(_) => error_payload(
                         "INVALID_REQUEST",
-                        "ILK_SET_WORKS_FOR takes {ilk_id, works_for, work_role, change_reason?}, works_for and work_role both ilk:<uuid> and a role, or both null, and nothing else",
+                        "ILK_SET_WORKS_FOR takes {ilk_id, works_for, work_role, change_reason?}, works_for and work_role both ilk:<uuid> and a role, null and capability, or both null, and nothing else",
                     ),
                 }
             }
@@ -6568,17 +6576,19 @@ fn ilk_entry_flags(ilk: &IlkRecord) -> u16 {
 
 /// Whom an ILK works for, in its SHM entry: the person's ILK as its 16 bytes and the role's byte
 /// (docs/digital-executive-v1-stage-2.md §1.1). The two go in together or not at all, so a reader
-/// never sees a person without a role or a role without a person: an ILK that works for nobody, or
-/// whose record holds no canonical `ilk:<uuid>` and a known role, is written as zeros
-/// (`ILK_WORK_ROLE_NONE`).
+/// never sees a person without a role or a role without a person, but for a capability of every ED
+/// of its tenant: the role `capability` and nobody, its person all zeros
+/// (docs/digital-executive-v1-stage-3.md §2). An ILK that works for nobody, or whose record holds
+/// no canonical `ilk:<uuid>` and a known role, is written as zeros (`ILK_WORK_ROLE_NONE`).
 fn apply_work_relation_to_ilk_entry(entry: &mut IlkEntry, ilk: &IlkRecord) {
     let person = ilk
         .works_for
         .as_deref()
         .and_then(|works_for| parse_prefixed_uuid(works_for, "ilk").ok());
     let role = ilk.work_role.as_deref().and_then(ilk_work_role_code);
-    let (works_for, work_role) = match (person, role) {
-        (Some(person), Some(role)) => (*person.as_bytes(), role),
+    let (works_for, work_role) = match (ilk.works_for.as_deref(), person, role) {
+        (_, Some(person), Some(role)) => (*person.as_bytes(), role),
+        (None, None, Some(ILK_WORK_ROLE_CAPABILITY)) => ([0u8; 16], ILK_WORK_ROLE_CAPABILITY),
         _ => ([0u8; 16], ILK_WORK_ROLE_NONE),
     };
     entry.works_for = works_for;
@@ -17715,7 +17725,8 @@ mod tests {
     #[test]
     fn the_shm_entry_names_whom_an_ilk_works_for_and_its_role() {
         use json_router::shm::{
-            ILK_WORK_ROLE_AGENT, ILK_WORK_ROLE_CHANNEL, ILK_WORK_ROLE_CONSCIOUS,
+            ILK_WORK_ROLE_AGENT, ILK_WORK_ROLE_CHANNEL, ILK_WORK_ROLE_CONNECTOR,
+            ILK_WORK_ROLE_CONSCIOUS,
         };
         let laura = "ilk:5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a";
         let laura_bytes = *Uuid::parse_str(&laura[4..]).unwrap().as_bytes();
@@ -17728,12 +17739,23 @@ mod tests {
             ("conscious", ILK_WORK_ROLE_CONSCIOUS),
             ("channel", ILK_WORK_ROLE_CHANNEL),
             ("agent", ILK_WORK_ROLE_AGENT),
+            ("connector", ILK_WORK_ROLE_CONNECTOR),
+            ("capability", ILK_WORK_ROLE_CAPABILITY),
         ] {
             let mut part = channel.clone();
             part.work_role = Some(role.to_string());
             let entry = ilk_entry_from_record(&part).expect("the part's entry");
             assert_eq!((entry.works_for, entry.work_role), (laura_bytes, code));
         }
+        // A capability of every ED of its tenant: its role, and nobody.
+        let mut for_every_ed = channel.clone();
+        for_every_ed.works_for = None;
+        for_every_ed.work_role = Some("capability".to_string());
+        let entry = ilk_entry_from_record(&for_every_ed).expect("the capability's entry");
+        assert_eq!(
+            (entry.works_for, entry.work_role),
+            ([0u8; 16], ILK_WORK_ROLE_CAPABILITY)
+        );
 
         // Nobody, and a pair that is not whole or not valid, is written as zeros.
         let alone = ilk_for(
@@ -17750,6 +17772,8 @@ mod tests {
         not_an_ilk.works_for = Some(laura.replace("ilk:", "tnt:"));
         let mut other_spelling = channel.clone();
         other_spelling.works_for = Some(laura.to_ascii_uppercase().replace("ILK:", "ilk:"));
+        let mut capability_of_no_ilk = not_an_ilk.clone();
+        capability_of_no_ilk.work_role = Some("capability".to_string());
         for record in [
             &alone,
             &no_role,
@@ -17757,6 +17781,7 @@ mod tests {
             &unknown_role,
             &not_an_ilk,
             &other_spelling,
+            &capability_of_no_ilk,
         ] {
             let entry = ilk_entry_from_record(record).expect("an entry");
             assert_eq!(entry.works_for, [0u8; 16], "{record:?}");
@@ -17818,7 +17843,12 @@ mod tests {
             "IO.slack@worker1",
             "ilk:cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
         );
-        for record in [&channel, &alone] {
+        let mut for_every_ed = ilk_for(
+            "WF.billing.acme@worker1",
+            "ilk:efefefef-efef-4fef-8fef-efefefefefef",
+        );
+        for_every_ed.work_role = Some("capability".to_string());
+        for record in [&channel, &alone, &for_every_ed] {
             writer
                 .upsert_ilk_entry(ilk_entry_from_record(record).expect("an entry"))
                 .expect("upsert");
@@ -17835,6 +17865,9 @@ mod tests {
         let option = read(&alone.ilk_id);
         assert_eq!(option.works_for, None);
         assert_eq!(option.work_role, None);
+        let option = read(&for_every_ed.ilk_id);
+        assert_eq!(option.works_for, None);
+        assert_eq!(option.work_role.as_deref(), Some("capability"));
 
         drop(writer);
         if let Ok(cstr) = std::ffi::CString::new(name) {
@@ -18239,6 +18272,19 @@ mod tests {
                 Some("conscious"),
                 "INVALID_REQUEST",
             ),
+            // Only a capability works for nobody.
+            (
+                conscious.as_str(),
+                None,
+                Some("connector"),
+                "INVALID_REQUEST",
+            ),
+            (
+                conscious.as_str(),
+                None,
+                Some("Capability"),
+                "INVALID_REQUEST",
+            ),
             // Ids in their canonical spelling only.
             (
                 conscious.as_str(),
@@ -18322,6 +18368,48 @@ mod tests {
         );
         let (_, changed) = ed2_works_for(&mut store, &conscious, None, None).expect("clear again");
         assert!(!changed);
+
+        // The stage 3 roles (docs/digital-executive-v1-stage-3.md §2): a connector and a capability
+        // work for a person as the others do, and a capability alone may work for nobody, a
+        // capability of every ED of its tenant.
+        let (_, changed) = ed2_works_for(&mut store, &other_node, Some(&laura), Some("connector"))
+            .expect("a connector");
+        assert!(changed);
+        let (_, changed) = ed2_works_for(&mut store, &other_node, Some(&laura), Some("capability"))
+            .expect("a capability of Laura");
+        assert!(changed);
+        let entry = ilk_entry_from_record(&store.ilks[&other_node]).expect("its entry");
+        assert_eq!(
+            (entry.works_for, entry.work_role),
+            (laura_bytes, ILK_WORK_ROLE_CAPABILITY)
+        );
+        let (for_every_ed, changed) =
+            ed2_works_for(&mut store, &other_node, None, Some("capability"))
+                .expect("a capability of every ED");
+        assert!(changed);
+        assert_eq!(
+            for_every_ed,
+            json!({"status": "ok", "ilk_id": other_node, "works_for": null,
+                   "work_role": "capability"})
+        );
+        assert_eq!(
+            (
+                store.ilks[&other_node].works_for.as_deref(),
+                store.ilks[&other_node].work_role.as_deref()
+            ),
+            (None, Some("capability"))
+        );
+        let entry = ilk_entry_from_record(&store.ilks[&other_node]).expect("its entry");
+        assert_eq!(
+            (entry.works_for, entry.work_role),
+            ([0u8; 16], ILK_WORK_ROLE_CAPABILITY)
+        );
+        let (_, changed) = ed2_works_for(&mut store, &other_node, None, Some("capability"))
+            .expect("the same again");
+        assert!(!changed);
+        let (_, changed) =
+            ed2_works_for(&mut store, &other_node, None, None).expect("cleared again");
+        assert!(changed);
     }
 
     /// ILK_SET_WORKS_FOR's request names `works_for` and `work_role` always, null to clear: a

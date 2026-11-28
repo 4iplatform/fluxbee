@@ -629,9 +629,10 @@ the release that maps them lists them in `is_mutating_admin_action` too.
   the same names answers ok with it, `{status, ilk_id, tenant_id, virtual}` as a creation does;
   any other holder of the id answers `409 ILK_ID_TAKEN`.
 - **`set_ilk_works_for`** (`PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for`, body
-  `{"works_for": "ilk:<uuid>" | null, "work_role": "conscious" | "channel" | "agent" | null}`, both
-  named, and an optional `change_reason`) sends `ILK_SET_WORKS_FOR` (§1.1), always with both keys.
-  Null and null clear the relation; a body that leaves either out is refused with `400
+  `{"works_for": "ilk:<uuid>" | null, "work_role": "conscious" | "channel" | "agent" | "connector" |
+  "capability" | null}`, both named, and an optional `change_reason`) sends `ILK_SET_WORKS_FOR`
+  (§1.1), always with both keys. Null and null clear the relation; null and `capability` make the
+  ILK a capability of every ED of its tenant (docs/digital-executive-v1-stage-3.md §2); a body that leaves either out is refused with `400
   INVALID_REQUEST`, as SY.identity refuses it, so that no request clears a relation by omission. The ILK must be an agent's (`400 INVALID_ILK_TYPE`), the person an active person
   (`404 PERSON_NOT_FOUND`) of the ILK's own tenant (`409 TENANT_MISMATCH`); an ILK SY.identity does
   not hold is `404 ILK_NOT_FOUND`. The answer is `{status, ilk_id, works_for, work_role}`, and the
@@ -2434,7 +2435,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `set_ilk_tenant` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant` | Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope. |
 | `purge_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise); a system ILK only once it is retired (SYSTEM_ILK_PROTECTED otherwise). |
 | `create_virtual_person` | `POST /hives/{hive}/identity/virtual-people` | Create a virtual person: a human ILK marked virtual (a Digital Executive), created only this way, with no channels; an optional ilk_id makes it idempotent (ILK_ID_TAKEN for another holder). The operator and Archi, never Fluxbee Cloud. |
-| `set_ilk_works_for` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for` | Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel or agent). The operator and Archi, never Fluxbee Cloud. |
+| `set_ilk_works_for` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for` | Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel, agent, connector or capability; a capability may work for nobody, for every ED of its tenant). The operator and Archi, never Fluxbee Cloud. |
 | `set_person_document` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/document` | Write a new version of a person's document, kept by SY.identity and written as blob/people/person-<uuid>_<hash16>.json on the motherbee. The operator and Archi, never Fluxbee Cloud. |
 | `delete_tenant` | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable. |
 | `restore_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | Undo the deleted mark of one tenant: it comes back as it was. |

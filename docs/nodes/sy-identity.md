@@ -325,11 +325,13 @@ sends no delta.
   ILK, or an id an alias of a merge still names) answers `ILK_ID_TAKEN`.
 - **`ILK_SET_WORKS_FOR {ilk_id, works_for, work_role, change_reason?}`** (`set_ilk_works_for`):
   whom a node's ILK works for. `works_for` and `work_role` are always named: an `ilk:<uuid>` and
-  `conscious`, `channel` or `agent` set the relation, two nulls clear it, and a request that
-  leaves either out is refused, so nothing clears a relation by omission. The ILK is an active
-  `agent` (a node's; `ILK_NOT_FOUND`, `INVALID_ILK_TYPE`); the person an active `human`, real or
-  virtual, of the ILK's own tenant (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`); a
-  person without a role, a role without a person or an unknown role is `INVALID_REQUEST`.
+  `conscious`, `channel`, `agent`, `connector` or `capability` set the relation, two nulls clear
+  it, `null` and `capability` make the ILK a capability of every ED of its tenant
+  (docs/digital-executive-v1-stage-3.md §2), and a request that leaves either out is refused, so
+  nothing clears a relation by omission. The ILK is an active `agent` (a node's; `ILK_NOT_FOUND`,
+  `INVALID_ILK_TYPE`); the person an active `human`, real or virtual, of the ILK's own tenant
+  (`PERSON_NOT_FOUND`, `INVALID_ILK_TYPE`, `TENANT_MISMATCH`); a person without a role, any other
+  role without a person or an unknown role is `INVALID_REQUEST`.
   `change_reason` goes to the log (`identity set whom an ILK works for`). Answers `{ilk_id,
   works_for, work_role}`. A replica's push never changes the relation: the primary's stands
   (`with_primary_work_relation`).

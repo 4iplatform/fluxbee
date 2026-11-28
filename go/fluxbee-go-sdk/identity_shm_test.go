@@ -34,6 +34,7 @@ func TestIlkEntryLayoutMatchesTheFixtureSharedWithRust(t *testing.T) {
 		"ilk_id":        ilkOffIlkID,
 		"ilk_type":      ilkOffType,
 		"flags":         ilkOffFlags,
+		"tenant_id":     ilkOffTenantID,
 		"display_name":  ilkOffDisplayName,
 		"handler_node":  ilkOffHandlerNode,
 		"works_for":     ilkOffWorksFor,
@@ -45,7 +46,7 @@ func TestIlkEntryLayoutMatchesTheFixtureSharedWithRust(t *testing.T) {
 			t.Fatalf("%s: fixture %d (%v), Go %d", field, got, ok, offset)
 		}
 	}
-	if len(fixture.WorkRoles) != 4 || fixture.WorkRoles["none"] != 0 {
+	if len(fixture.WorkRoles) != 6 || fixture.WorkRoles["none"] != 0 {
 		t.Fatalf("work roles: %v", fixture.WorkRoles)
 	}
 	for name, code := range fixture.WorkRoles {

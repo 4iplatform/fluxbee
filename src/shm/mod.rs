@@ -93,13 +93,18 @@ pub const HIVE_FLAG_SELF: u16 = 0x0010;
 /// and `go/fluxbee-go-sdk/identity_shm.go`.
 pub const ILK_FLAG_VIRTUAL: u16 = 0x0100;
 /// An identity ILK entry's `work_role`, what the ILK is to the person its `works_for` names
-/// (docs/digital-executive-v1-stage-2.md §1.1): none (the ILK works for nobody), the person's
-/// conscious, one of its channels, or one of its agents. Its copies:
-/// `crates/fluxbee_sdk/src/identity.rs` and `go/fluxbee-go-sdk/identity_shm.go`.
+/// (docs/digital-executive-v1-stage-2.md §1.1, docs/digital-executive-v1-stage-3.md §2): none (the
+/// ILK works for nobody), the person's conscious, one of its channels, one of its agents, one of
+/// its connectors (an IO to an external system), or the entry WF of one of its capabilities. A
+/// `capability` alone may work for nobody: its `works_for` all zeros, it is a capability of every
+/// ED of its tenant. Its copies: `crates/fluxbee_sdk/src/identity.rs` and
+/// `go/fluxbee-go-sdk/identity_shm.go`.
 pub const ILK_WORK_ROLE_NONE: u8 = 0;
 pub const ILK_WORK_ROLE_CONSCIOUS: u8 = 1;
 pub const ILK_WORK_ROLE_CHANNEL: u8 = 2;
 pub const ILK_WORK_ROLE_AGENT: u8 = 3;
+pub const ILK_WORK_ROLE_CONNECTOR: u8 = 4;
+pub const ILK_WORK_ROLE_CAPABILITY: u8 = 5;
 pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 
@@ -444,7 +449,9 @@ pub struct IlkEntry {
     pub personality_hash: [u8; 32],
     /// The person this ILK works for: its ILK's 16 bytes, all zeros for nobody.
     pub works_for: [u8; 16],
-    /// What this ILK is to that person (`ILK_WORK_ROLE_*`), `ILK_WORK_ROLE_NONE` for nobody.
+    /// What this ILK is to that person (`ILK_WORK_ROLE_*`), `ILK_WORK_ROLE_NONE` for nobody; or
+    /// `ILK_WORK_ROLE_CAPABILITY` with `works_for` all zeros, a capability of every ED of its
+    /// tenant.
     pub work_role: u8,
     pub _pad1: [u8; 7],
     /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): the first 8 bytes of its
@@ -514,14 +521,17 @@ const _: () = {
     assert!(std::mem::size_of::<IchMappingEntry>() == 384);
 };
 
-/// The `work_role` byte of a role's name (`conscious`, `channel`, `agent`), as an ILK record holds
-/// it; `None` for any other name. An ILK that works for nobody has no role and is written
+/// The `work_role` byte of a role's name (`conscious`, `channel`, `agent`, `connector`,
+/// `capability`), as an ILK record holds it; `None` for any other name. An ILK that works for
+/// nobody, but a capability of every ED of its tenant, has no role and is written
 /// `ILK_WORK_ROLE_NONE`.
 pub fn ilk_work_role_code(role: &str) -> Option<u8> {
     match role {
         "conscious" => Some(ILK_WORK_ROLE_CONSCIOUS),
         "channel" => Some(ILK_WORK_ROLE_CHANNEL),
         "agent" => Some(ILK_WORK_ROLE_AGENT),
+        "connector" => Some(ILK_WORK_ROLE_CONNECTOR),
+        "capability" => Some(ILK_WORK_ROLE_CAPABILITY),
         _ => None,
     }
 }
@@ -532,6 +542,8 @@ pub fn ilk_work_role_name(code: u8) -> Option<&'static str> {
         ILK_WORK_ROLE_CONSCIOUS => Some("conscious"),
         ILK_WORK_ROLE_CHANNEL => Some("channel"),
         ILK_WORK_ROLE_AGENT => Some("agent"),
+        ILK_WORK_ROLE_CONNECTOR => Some("connector"),
+        ILK_WORK_ROLE_CAPABILITY => Some("capability"),
         _ => None,
     }
 }
@@ -4654,6 +4666,7 @@ mod tests {
             ("ilk_id", std::mem::offset_of!(IlkEntry, ilk_id)),
             ("ilk_type", std::mem::offset_of!(IlkEntry, ilk_type)),
             ("flags", std::mem::offset_of!(IlkEntry, flags)),
+            ("tenant_id", std::mem::offset_of!(IlkEntry, tenant_id)),
             ("display_name", std::mem::offset_of!(IlkEntry, display_name)),
             ("handler_node", std::mem::offset_of!(IlkEntry, handler_node)),
             (
@@ -4679,7 +4692,7 @@ mod tests {
             );
         }
         let roles = fixture["work_roles"].as_object().expect("work_roles");
-        assert_eq!(roles.len(), 4);
+        assert_eq!(roles.len(), 6);
         assert_eq!(roles["none"], serde_json::json!(ILK_WORK_ROLE_NONE));
         for (name, code) in roles.iter().filter(|(name, _)| *name != "none") {
             let code = code.as_u64().expect("a code") as u8;
@@ -4696,13 +4709,32 @@ mod tests {
         );
         assert_eq!(ilk_work_role_code("channel"), Some(ILK_WORK_ROLE_CHANNEL));
         assert_eq!(ilk_work_role_code("agent"), Some(ILK_WORK_ROLE_AGENT));
+        assert_eq!(
+            ilk_work_role_code("connector"),
+            Some(ILK_WORK_ROLE_CONNECTOR)
+        );
+        assert_eq!(
+            ilk_work_role_code("capability"),
+            Some(ILK_WORK_ROLE_CAPABILITY)
+        );
+        for code in [
+            ILK_WORK_ROLE_CONSCIOUS,
+            ILK_WORK_ROLE_CHANNEL,
+            ILK_WORK_ROLE_AGENT,
+            ILK_WORK_ROLE_CONNECTOR,
+            ILK_WORK_ROLE_CAPABILITY,
+        ] {
+            let name = ilk_work_role_name(code).expect("a role's name");
+            assert_eq!(ilk_work_role_code(name), Some(code), "{name}");
+        }
         // No other name has a code, not even a spelling of one.
         assert_eq!(ilk_work_role_code(""), None);
         assert_eq!(ilk_work_role_code("Conscious"), None);
+        assert_eq!(ilk_work_role_code("Capability"), None);
         assert_eq!(ilk_work_role_code("none"), None);
         // No role, and a byte no writer of this version writes, read as none.
         assert_eq!(ilk_work_role_name(ILK_WORK_ROLE_NONE), None);
-        assert_eq!(ilk_work_role_name(4), None);
+        assert_eq!(ilk_work_role_name(6), None);
         assert_eq!(ilk_work_role_name(u8::MAX), None);
     }
 
@@ -4731,8 +4763,16 @@ mod tests {
         let mut alone = empty_ilk_entry();
         alone.ilk_id = [0x33u8; 16];
         alone.flags = FLAG_ACTIVE;
+        // A capability of every ED of its tenant: a role and nobody.
+        let mut for_every_ed = empty_ilk_entry();
+        for_every_ed.ilk_id = [0x44u8; 16];
+        for_every_ed.flags = FLAG_ACTIVE;
+        for_every_ed.work_role = ILK_WORK_ROLE_CAPABILITY;
         writer.upsert_ilk_entry(channel).expect("channel upsert");
         writer.upsert_ilk_entry(alone).expect("alone upsert");
+        writer
+            .upsert_ilk_entry(for_every_ed)
+            .expect("capability upsert");
 
         let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open reader");
         let snap = reader.try_read_snapshot().expect("snapshot");
@@ -4753,6 +4793,9 @@ mod tests {
         assert_eq!(read.works_for, [0u8; 16]);
         assert_eq!(read.work_role, ILK_WORK_ROLE_NONE);
         assert_eq!(ilk_work_role_name(read.work_role), None);
+        let read = entry_of([0x44u8; 16]);
+        assert_eq!(read.works_for, [0u8; 16]);
+        assert_eq!(ilk_work_role_name(read.work_role), Some("capability"));
 
         cleanup_shm(&name);
     }

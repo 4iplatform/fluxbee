@@ -45,6 +45,7 @@ const (
 	ilkOffIlkID       = 0
 	ilkOffType        = 16   // u8: 0 human, 1 agent, 2 system
 	ilkOffFlags       = 18   // u16
+	ilkOffTenantID    = 20   // [u8; 16]: the tenant the ILK is charged to
 	ilkOffDisplayName = 36   // [u8; 128]
 	ilkOffHandlerNode = 164  // [u8; 128]
 	ilkOffWorksFor    = 1152 // [u8; 16]: the person's ILK, zeros for nobody (version 7)
@@ -59,10 +60,13 @@ const (
 	ilkFlagVirtual uint16 = 0x0100
 
 	// IlkEntry work_role bytes, what the ILK is to the person it works for (src/shm/mod.rs
-	// ILK_WORK_ROLE_*); 0 is none.
-	ilkWorkRoleConscious byte = 1
-	ilkWorkRoleChannel   byte = 2
-	ilkWorkRoleAgent     byte = 3
+	// ILK_WORK_ROLE_*); 0 is none. A capability may work for nobody: a capability of every ED of its
+	// tenant (docs/digital-executive-v1-stage-3.md §2).
+	ilkWorkRoleConscious  byte = 1
+	ilkWorkRoleChannel    byte = 2
+	ilkWorkRoleAgent      byte = 3
+	ilkWorkRoleConnector  byte = 4
+	ilkWorkRoleCapability byte = 5
 
 	// Field offsets within IdentityHeader.
 	hdrOffMagic          = 0
@@ -466,6 +470,10 @@ func ilkWorkRoleName(value byte) string {
 		return "channel"
 	case ilkWorkRoleAgent:
 		return "agent"
+	case ilkWorkRoleConnector:
+		return "connector"
+	case ilkWorkRoleCapability:
+		return "capability"
 	default:
 		return ""
 	}

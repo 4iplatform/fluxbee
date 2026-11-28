@@ -47,6 +47,8 @@ const ILK_FLAG_VIRTUAL: u16 = 0x0100;
 const SHM_WORK_ROLE_CONSCIOUS: u8 = 1;
 const SHM_WORK_ROLE_CHANNEL: u8 = 2;
 const SHM_WORK_ROLE_AGENT: u8 = 3;
+const SHM_WORK_ROLE_CONNECTOR: u8 = 4;
+const SHM_WORK_ROLE_CAPABILITY: u8 = 5;
 const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 const SHM_ILK_TYPE_HUMAN: u8 = 0;
 const SHM_ILK_TYPE_AGENT: u8 = 1;
@@ -141,8 +143,10 @@ pub struct IdentityIlkOption {
     /// (docs/digital-executive-v1-stage-2.md §1.1). Absent on the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub works_for: Option<String>,
-    /// What this ILK is to that person: `conscious`, `channel` or `agent`; `None` for nobody.
-    /// Absent on the wire when `None`.
+    /// What this ILK is to that person: `conscious`, `channel`, `agent`, `connector` (an IO to an
+    /// external system) or `capability` (a capability's entry WF); `None` for nobody. A
+    /// `capability` with no `works_for` is a capability of every ED of its tenant
+    /// (docs/digital-executive-v1-stage-3.md §2). Absent on the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_role: Option<String>,
     /// A person's document (docs/digital-executive-v1-stage-2.md §1.2): the 16 lowercase hex of
@@ -1543,6 +1547,8 @@ fn work_role_from_shm(value: u8) -> Option<&'static str> {
         SHM_WORK_ROLE_CONSCIOUS => Some("conscious"),
         SHM_WORK_ROLE_CHANNEL => Some("channel"),
         SHM_WORK_ROLE_AGENT => Some("agent"),
+        SHM_WORK_ROLE_CONNECTOR => Some("connector"),
+        SHM_WORK_ROLE_CAPABILITY => Some("capability"),
         _ => None,
     }
 }
@@ -1842,6 +1848,7 @@ mod tests {
             ("ilk_id", std::mem::offset_of!(IlkEntry, ilk_id)),
             ("ilk_type", std::mem::offset_of!(IlkEntry, ilk_type)),
             ("flags", std::mem::offset_of!(IlkEntry, flags)),
+            ("tenant_id", std::mem::offset_of!(IlkEntry, tenant_id)),
             ("display_name", std::mem::offset_of!(IlkEntry, display_name)),
             ("handler_node", std::mem::offset_of!(IlkEntry, handler_node)),
             (
@@ -1867,13 +1874,13 @@ mod tests {
             );
         }
         let roles = fixture["work_roles"].as_object().expect("work_roles");
-        assert_eq!(roles.len(), 4);
+        assert_eq!(roles.len(), 6);
         for (name, code) in roles {
             let code = code.as_u64().expect("a code") as u8;
             let expected = (name != "none").then_some(name.as_str());
             assert_eq!(work_role_from_shm(code), expected, "{name}");
         }
-        assert_eq!(work_role_from_shm(4), None);
+        assert_eq!(work_role_from_shm(6), None);
     }
 
     #[test]
@@ -1909,6 +1916,8 @@ mod tests {
             (SHM_WORK_ROLE_CONSCIOUS, "conscious"),
             (SHM_WORK_ROLE_CHANNEL, "channel"),
             (SHM_WORK_ROLE_AGENT, "agent"),
+            (SHM_WORK_ROLE_CONNECTOR, "connector"),
+            (SHM_WORK_ROLE_CAPABILITY, "capability"),
         ] {
             let part = identity_ilk_option_from_entry(&entry(laura.into_bytes(), code));
             assert_eq!(
@@ -1932,6 +1941,14 @@ mod tests {
         assert!(json.get("work_role").is_none());
         let back: IdentityIlkOption = serde_json::from_value(json).unwrap();
         assert_eq!(back, alone);
+        // A capability of every ED of its tenant: a role, and nobody.
+        let for_every_ed =
+            identity_ilk_option_from_entry(&entry([0; 16], SHM_WORK_ROLE_CAPABILITY));
+        assert_eq!(for_every_ed.works_for, None);
+        assert_eq!(for_every_ed.work_role.as_deref(), Some("capability"));
+        let json = serde_json::to_value(&for_every_ed).unwrap();
+        assert!(json.get("works_for").is_none());
+        assert_eq!(json["work_role"], serde_json::json!("capability"));
         // A byte no writer of this version writes reads as no role.
         let unknown = identity_ilk_option_from_entry(&entry(laura.into_bytes(), 9));
         assert_eq!(unknown.work_role, None);

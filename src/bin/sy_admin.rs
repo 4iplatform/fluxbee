@@ -17855,7 +17855,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Create a virtual person: a human ILK marked virtual (a Digital Executive), created only this way, with no channels. In this stage for the operator's tests: the operator and Archi, never Fluxbee Cloud."
         }
         "set_ilk_works_for" => {
-            "Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel or agent). Null and null clear it. The identity SHM carries it."
+            "Set or clear whom one agent ILK, a node's, works for: a person of its own tenant, with its role (conscious, channel, agent, connector or capability); a capability may work for nobody, for every ED of its tenant. Null and null clear it. The identity SHM carries it."
         }
         "set_person_document" => {
             "Write a new version of a person's document: SY.identity keeps it on the person, writes it once as blob/people/person-<uuid>_<hash16>.json on the motherbee, and the identity SHM names its hash."
@@ -18919,12 +18919,12 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "works_for",
                 "string|null",
-                "The person the ILK works for, ilk:<uuid>: a person (human, real or virtual), active, in the ILK's own tenant. null, with a null work_role, clears the relation.",
+                "The person the ILK works for, ilk:<uuid>: a person (human, real or virtual), active, in the ILK's own tenant. null, with a null work_role, clears the relation; null with work_role capability makes the ILK a capability of every ED of its tenant.",
             ),
             admin_action_body_field(
                 "work_role",
                 "string|null",
-                "The ILK's role for that person: conscious, channel or agent. null, with a null works_for, clears the relation.",
+                "The ILK's role for that person: conscious, channel, agent, connector (an IO to an external system) or capability (a capability's entry WF, the only role that may name no person). null, with a null works_for, clears the relation.",
             ),
         ],
         "set_person_document" => vec![admin_action_body_field(
@@ -20784,7 +20784,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "set_ilk_works_for" => vec![
             "Whom an ILK works for (docs/digital-executive-v1-stage-2.md §1.1): sent to the primary's SY.identity as ILK_SET_WORKS_FOR, which takes it from SY.admin@motherbee alone.",
-            "Body: {\"works_for\": \"ilk:<uuid>\" | null, \"work_role\": \"conscious\" | \"channel\" | \"agent\" | null}, both named: null and null clear the relation. An optional change_reason goes to the ILK's history. A field beyond these is refused with INVALID_REQUEST.",
+            "Body: {\"works_for\": \"ilk:<uuid>\" | null, \"work_role\": \"conscious\" | \"channel\" | \"agent\" | \"connector\" | \"capability\" | null}, both named: null and null clear the relation, and null with capability makes the ILK a capability of every ED of its tenant (docs/digital-executive-v1-stage-3.md §2). An optional change_reason goes to the ILK's history. A field beyond these is refused with INVALID_REQUEST.",
             "The ILK must be an agent's, a node's (INVALID_ILK_TYPE, 400, otherwise), and SY.identity must hold it (ILK_NOT_FOUND, 404). The person must be a person, real or virtual, active (PERSON_NOT_FOUND, 404), and of the ILK's own tenant (TENANT_MISMATCH, 409). A request SY.identity cannot take answers INVALID_REQUEST (400).",
             "503 DB_NOT_READY changed nothing and carries payload.retryable true: ask again.",
             "The answer is {status, ilk_id, works_for, work_role}. The identity SHM carries the relation: the conscious (speaks_as) and the IO (io.person_ilk) read it there to confirm what their config says, and a person's parts are the ILKs whose works_for names it.",
@@ -25443,7 +25443,8 @@ fn identity_request_ilk_id<'a>(
 /// §1.1): the ILK, the person it works for and its role, both named and both null to clear them,
 /// and an optional reason for its history. A field beyond these is refused, never dropped.
 /// SY.identity decides the rest: the ILK is a node's, the person an active person of the ILK's
-/// tenant, the role one of `conscious`, `channel` and `agent`, and a relation set or cleared whole.
+/// tenant, the role one of `conscious`, `channel`, `agent`, `connector` and `capability` (the one
+/// that may name no person), and a relation set or cleared whole.
 fn works_for_request(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
     const FIELDS: [&str; 4] = ["ilk_id", "works_for", "work_role", "change_reason"];
     let Some(object) = payload.as_object() else {

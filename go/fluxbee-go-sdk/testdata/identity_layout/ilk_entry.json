@@ -1,11 +1,12 @@
 {
-  "_doc": "The identity SHM's IlkEntry (src/shm/mod.rs, #[repr(C)]) as its three copies read it: src/shm's tests, the Rust SDK's (crates/fluxbee_sdk/src/identity.rs) and the Go SDK's (identity_shm_test.go). Version 7 added works_for (the 16 bytes of the person's ILK, zeros for nobody) and work_role (one byte) (docs/digital-executive-v1-stage-2.md §1.1), and named its last 8 bytes document_hash: the first 8 bytes of the SHA-256 of a person's document, zeros for none, written from release 2C (§1.2). Change the layout here and in the three copies together.",
+  "_doc": "The identity SHM's IlkEntry (src/shm/mod.rs, #[repr(C)]) as its three copies read it: src/shm's tests, the Rust SDK's (crates/fluxbee_sdk/src/identity.rs) and the Go SDK's (identity_shm_test.go). Version 7 added works_for (the 16 bytes of the person's ILK, zeros for nobody) and work_role (one byte) (docs/digital-executive-v1-stage-2.md §1.1), and named its last 8 bytes document_hash: the first 8 bytes of the SHA-256 of a person's document, zeros for none, written from release 2C (§1.2). The Digital Executive's stage 3 added two roles, connector and capability, in the same byte (docs/digital-executive-v1-stage-3.md §2): a capability may work for nobody, a capability of every ED of its tenant_id. Change the layout here and in the three copies together.",
   "version": 7,
   "ilk_entry_size": 1184,
   "offsets": {
     "ilk_id": 0,
     "ilk_type": 16,
     "flags": 18,
+    "tenant_id": 20,
     "display_name": 36,
     "handler_node": 164,
     "personality_hash": 1120,
@@ -17,6 +18,8 @@
     "none": 0,
     "conscious": 1,
     "channel": 2,
-    "agent": 3
+    "agent": 3,
+    "connector": 4,
+    "capability": 5
   }
 }
