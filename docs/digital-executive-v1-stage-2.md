@@ -1,8 +1,9 @@
 # The Digital Executive v1, stage 2: the ED's identity, SY.deploy and a plain ED's birth
 
-**Status:** the build design. Drafted on 2026-11-26, and rewritten on 2026-11-27 on the new path:
-after the cleanup of stage 1's security path (0.1.155, 0.1.156) and the operator's calls (§13).
-Every call is made. Nothing is built.
+**Status:** the build design, drafted on 2026-11-26 and rewritten on 2026-11-27 on the new path after
+the cleanup of stage 1's security path (0.1.155, 0.1.156) and the operator's calls (§13). **Built and
+live:** 2A in 0.1.157, 2B in 0.1.158, 2C in 0.1.159, 2D in 0.1.160, and A-372 in 0.1.161; each
+release's gate passed (lab/DEPLOYMENTS.md). Stage 2 is complete.
 
 **What it builds:** stage 2 of [digital-executive-v1-design](digital-executive-v1-design.md) §15,
 with the ED's identity where the operator put it (design §3.0, notes §32):
