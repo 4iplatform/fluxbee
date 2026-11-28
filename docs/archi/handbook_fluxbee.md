@@ -1188,7 +1188,8 @@ never talks with people.
   `{"type": "notify", "status": "done", "result": {...}}`. It goes to the conscious that asked, on
   the person's conversation; the conscious tells the person.
 - **Never send the conscious a message:** only `reply` and `notify` reach it. A send or a forward
-  to it is a `COMPILE_ERROR`, since it would start a turn whose answer comes back (a loop).
+  to it is a `COMPILE_ERROR`, since it would start a turn whose answer comes back (a loop). Nor
+  wait for one from it: the WF drops every message of a conscious but its request.
 - **The help is the interface.** The conscious reads `WF_HELP`: the `description`, the
   `input_schema` and the `request_actions`, each `{"name": "invoice_state", "description": "..."}`
   as `input.action` names it. Write them for the conscious's model.

@@ -87,9 +87,11 @@ func (r *InstanceRegistry) All() []*WFInstance {
 //
 //  1. TIMER_FIRED, from SY.timer of the WF's own hive, for a timer this node scheduled → the instance
 //     its client_ref names, when the instance has that timer, at that time (takeTimerFired)
-//  2. from a sender the definition does not involve (no node of its start_from, of an
-//     event_match.src or a target of its sends: FINDINGS A-123) → dropped, never answered; on the
-//     thread of a running instance, that instance's definition decides, otherwise the current one
+//  2. from a conscious a capability's door takes requests from (fromAConscious), whose only way in is
+//     a CAPABILITY_REQUEST, or from a sender the definition does not involve (no node of its
+//     start_from, of an event_match.src or a target of its sends: FINDINGS A-123) → dropped, never
+//     answered; on the thread of a running instance, that instance's definition decides, otherwise
+//     the current one
 //  3. meta.thread_id is the thread of a running instance → that instance; when neither its state
 //     nor the catch takes it, NOT_TAKEN not_expected (RunTransition)
 //  4. no thread → NOT_TAKEN no_thread: a WF never makes up a thread (FINDINGS A-135)
@@ -132,6 +134,13 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 	def := rt.Def
 	if onThread {
 		def = inst.def
+	}
+	// A conscious a capability's door takes requests from starts and drives an instance only with a
+	// CAPABILITY_REQUEST (taken before, in Dispatch): its other messages are dropped, never answered.
+	if rt.fromAConscious(def, sender) {
+		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): a conscious this door takes requests from starts and drives an instance only with a %s",
+			msgName(msg), sender, threadID, msg.Routing.TraceID, MsgCapabilityRequest)
+		return nil
 	}
 	if !def.Involves(sender) {
 		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): the definition does not involve its sender",

@@ -16,20 +16,25 @@ import (
 )
 
 // identityView is what a capability's door reads of its hive's identity memory
-// (docs/digital-executive-v1-stage-3.md §5): the ILK a node handles, and what identity says of an
-// ILK. The engine reads the identity SHM (shmIdentity); a test gives its own. Shared state stays in
-// shared memory: the door never asks SY.identity.
+// (docs/digital-executive-v1-stage-3.md §5): the ILK a node handles, with what identity says of it,
+// and what identity says of an ILK. The engine reads the identity SHM (shmIdentity); a test gives
+// its own. Shared state stays in shared memory: the door never asks SY.identity.
+//
+// Its two reads have the signatures of the Go SDK's of stage 3's release 3A, sdk.LookupIlkByNode
+// and sdk.LookupIlk with IlkFacts.TenantID, which replace shmIdentity's body at the integration
+// (ilkFacts becoming sdk.IlkFacts, whose fields it names alike).
 type identityView interface {
-	// nodeILK is the active ILK whose handler_node is nodeName ("ilk:<uuid>"), false when none is.
-	nodeILK(nodeName string) (string, bool, error)
+	// ilkByNode is the active ILK whose handler_node is nodeName ("ilk:<uuid>") and its facts, false
+	// when none is.
+	ilkByNode(nodeName string) (string, ilkFacts, bool, error)
 	// ilk is what identity says of the active ILK ilk, false when it has no such ILK.
 	ilk(ilk string) (ilkFacts, bool, error)
 }
 
-// ilkFacts is what the door reads of an ILK: its type (human, agent or system), its tenant
-// ("tnt:<uuid>"), and the person it works for ("ilk:<uuid>", "" for nobody) in what role
-// (conscious, channel, agent; "" for none, and, until the Go SDK reads them, for connector and
-// capability).
+// ilkFacts is what the door reads of an ILK, as sdk.IlkFacts names it: its type (human, agent or
+// system), its tenant ("tnt:<uuid>"), and the person it works for ("ilk:<uuid>", "" for nobody) in
+// what role (conscious, channel, agent; "" for none, and, until the Go SDK reads them, for connector
+// and capability).
 type ilkFacts struct {
 	Type     string
 	TenantID string
@@ -38,15 +43,23 @@ type ilkFacts struct {
 }
 
 // shmIdentity reads the identity SHM of hive. Whom an ILK works for, and in what role, come from the
-// Go SDK (sdk.LookupIlk, since 0.1.157); its tenant from ilkTenantAt, which the SDK does not read
-// yet: it stands in for the SDK's helper of stage 3's release 3A, and goes once that helper gives the
-// tenant.
+// Go SDK (sdk.LookupIlkByHandlerNode and sdk.LookupIlk, since 0.1.157); its tenant from ilkTenantAt,
+// which this SDK does not read yet. It stands in for the SDK's helpers of release 3A until the
+// integration, which drops ilkTenantAt.
 type shmIdentity struct {
 	hive string
 }
 
-func (s shmIdentity) nodeILK(nodeName string) (string, bool, error) {
-	return sdk.LookupIlkByHandlerNode(s.hive, nodeName)
+func (s shmIdentity) ilkByNode(nodeName string) (string, ilkFacts, bool, error) {
+	ilk, found, err := sdk.LookupIlkByHandlerNode(s.hive, nodeName)
+	if err != nil || !found {
+		return "", ilkFacts{}, false, err
+	}
+	facts, found, err := s.ilk(ilk)
+	if err != nil || !found {
+		return "", ilkFacts{}, false, err
+	}
+	return ilk, facts, true, nil
 }
 
 func (s shmIdentity) ilk(ilk string) (ilkFacts, bool, error) {

@@ -215,7 +215,7 @@ func (rt *NodeRuntime) refuseWhileStoreDown(msg sdk.Message) error {
 			sender, msg.Routing.TraceID)
 		return nil
 	}
-	if !rt.storeDown.def.Involves(sender) {
+	if rt.fromAConscious(rt.storeDown.def, sender) || !rt.storeDown.def.Involves(sender) {
 		log.Printf("wf: ignoring %s from %q (trace_id=%s): the definition does not involve its sender", msgName(msg), sender, msg.Routing.TraceID)
 		return nil
 	}

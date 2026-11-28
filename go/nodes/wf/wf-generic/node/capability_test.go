@@ -86,9 +86,13 @@ type fakeIdentity struct {
 	ilks  map[string]ilkFacts
 }
 
-func (f fakeIdentity) nodeILK(node string) (string, bool, error) {
+func (f fakeIdentity) ilkByNode(node string) (string, ilkFacts, bool, error) {
 	ilk, ok := f.nodes[node]
-	return ilk, ok, nil
+	if !ok {
+		return "", ilkFacts{}, false, nil
+	}
+	facts, ok := f.ilks[ilk]
+	return ilk, facts, ok, nil
 }
 
 func (f fakeIdentity) ilk(ilk string) (ilkFacts, bool, error) {
@@ -301,6 +305,56 @@ func TestADoorRefusesWhatIsNoRequestOfItsConscious(t *testing.T) {
 	}
 	if rt.Registry.Count() != 1 || len(disp.sent) != sent || mustGetInstance(t, rt, instanceID).CurrentState != "reading" {
 		t.Fatalf("the conscious's message is dropped: %d instances, sent %d", rt.Registry.Count(), len(disp.sent)-sent)
+	}
+}
+
+// From a conscious a door takes requests from, only a CAPABILITY_REQUEST starts or drives an
+// instance: any other message of it (its answer to a notify its SDK did not take as a result, sent
+// back to the door) is dropped, never answered, whatever thread it comes on, even when the
+// definition names the conscious elsewhere, as an event_match.src. Under the consciouses marker a
+// conscious is who identity says is one; the capability's own agents go on as any agent.
+func TestAConsciousDrivesNothingButWithARequest(t *testing.T) {
+	answerOn := func(thread, sender string) sdk.Message {
+		return onThread(thread, from(sender, sdk.Message{
+			Routing: sdk.Routing{Src: "conscious-uuid", TraceID: "trace-answer"},
+			Meta:    sdk.Meta{MsgType: "user"},
+			Payload: json.RawMessage(`{"type":"text","content":"Thanks, I will tell the person."}`),
+		}))
+	}
+	invoice := `{"action":"invoice_state","number":"A-1"}`
+
+	// A door of one ED whose reading state also matches its conscious by src.
+	named := strings.Replace(doorWorkflowJSON, `{"event_match": {"src": "AI.billing.ed1@motherbee"}, "guard": "event.payload.content == 'missing'"`,
+		`{"event_match": {"src": "AI.ed1@motherbee"}, "guard": "true", "target_state": "answered", "actions": []},
+        {"event_match": {"src": "AI.billing.ed1@motherbee"}, "guard": "event.payload.content == 'missing'"`, 1)
+	if named == doorWorkflowJSON {
+		t.Fatal("the fixture did not change")
+	}
+	for name, c := range map[string]struct {
+		definition, doorFor, conscious, ed string
+	}{
+		"a door of one ED":            {named, "ilk:ed1", "AI.ed1@motherbee", "ilk:ed1"},
+		"a door for the tenant's EDs": {doorForTheTenant(), "", "AI.ed2@motherbee", "ilk:ed2"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt, disp := newDoorRuntime(t, "", c.definition, c.doorFor, nil)
+			instanceID := startInstance(t, rt, capabilityRequestFrom(c.conscious, "r-1", c.ed, invoice))
+			sent := len(disp.sent)
+			for _, thread := range []string{instanceID, "conv-person-1", "conv-other"} {
+				dispatchOK(t, rt, answerOn(thread, c.conscious))
+			}
+			// Another tenant's conscious, under the marker, is dropped as well.
+			dispatchOK(t, rt, answerOn(instanceID, "AI.ed3@motherbee"))
+			if rt.Registry.Count() != 1 || len(disp.sent) != sent || mustGetInstance(t, rt, instanceID).CurrentState != "reading" {
+				t.Fatalf("the conscious's messages start nothing, drive nothing and get no answer: %d instances, sent %d, %+v",
+					rt.Registry.Count(), len(disp.sent)-sent, mustGetInstance(t, rt, instanceID))
+			}
+			// The capability's own agent drives the instance as before.
+			dispatchOK(t, rt, agentAnswer(t, "AI.billing.ed1@motherbee", sentTo(t, disp, "AI.billing.ed1@motherbee"), `{"type":"text","content":"paid"}`, nil))
+			if reply := requestAnswer(t, disp.sent[len(disp.sent)-1], "r-1"); reply["status"] != "done" {
+				t.Fatalf("the agent's answer is replied: %v", reply)
+			}
+		})
 	}
 }
 

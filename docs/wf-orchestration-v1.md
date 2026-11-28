@@ -2175,7 +2175,14 @@ go/nodes/wf/wf-generic; the language's reference is docs/spec-systemnode-wf-v1_1
     `request_id` or `ed_ilk`) or `INVALID_INPUT` (the `input_schema` refuses the input).
   - **Each request is an instance of its own.** Its input is the request's `input`, its thread its
     own id (the conversation with the capability's agents, which the WF opens), and it keeps the
-    request (schema v8). The conscious's user message starts nothing and drives nothing.
+    request (schema v8).
+  - **From a conscious, only a request.** Any other message of a conscious the door takes requests
+    from (one `start_from` names, or, under the marker, one identity names a conscious) starts
+    nothing and drives nothing, on whatever thread, even when the definition names it elsewhere: it
+    is dropped, logged, never answered. The AI SDK answers a `capability_result` it does not take
+    (its ED not confirmed then, or the door not one of its ED's capabilities) as an ordinary message
+    back to its sender, the door, so A-118's loop cannot start from that side either. A
+    capability's own agents are no consciouses, and drive its instances as any agent.
 - **`reply`, a new action,** answers the request that started the instance: a
   `CAPABILITY_REQUEST_RESPONSE`, on the request's trace, `{request_id, status, result?,
   error_code?, message?}`. Its status is `done`, `pending` (the result comes later) or `error`.
@@ -2196,8 +2203,10 @@ go/nodes/wf/wf-generic; the language's reference is docs/spec-systemnode-wf-v1_1
   `request_actions`, each a name and an optional description (`{"name": "invoice_state",
   "description": "The state of an invoice, by its number."}`).
 - **Open, for the integration with release 3A:**
-  - the Go SDK reads no ILK's tenant yet: the door reads it from the SHM itself
-    (go/nodes/wf/wf-generic/node/identity.go), until the SDK's helper gives it;
+  - the Go SDK of 0.1.161 reads no ILK's tenant: the door reads it from the SHM itself
+    (go/nodes/wf/wf-generic/node/identity.go), its reads shaped as release 3A's
+    `sdk.LookupIlkByNode` and `sdk.LookupIlk` with `IlkFacts.TenantID`, which replace them at the
+    integration;
   - `CAPABILITY_REQUEST` and its response are no protected system action
     (src/router/system_policy.rs), so the router's system gate leaves them alone; stage 3's gate
     checks the path live.

@@ -168,34 +168,25 @@ func (rt *NodeRuntime) admitRequest(def *WorkflowDefinition, msg sdk.Message) (*
 //     tenant.
 func (rt *NodeRuntime) checkConscious(sender, edILK string) (string, error) {
 	id := rt.identity()
-	senderILK, found, err := id.nodeILK(sender)
+	_, facts, found, err := id.ilkByNode(sender)
 	switch {
 	case err != nil:
 		return "", fmt.Errorf("identity could not be read: %v", err)
 	case !found:
 		return "", fmt.Errorf("%s has no ILK in identity", sender)
-	}
-	facts, found, err := id.ilk(senderILK)
-	switch {
-	case err != nil:
-		return "", fmt.Errorf("identity could not be read: %v", err)
-	case !found:
-		return "", fmt.Errorf("%s's ILK %s is not active in identity", sender, senderILK)
 	case facts.WorkRole != "conscious" || facts.WorksFor == "":
 		return "", fmt.Errorf("%s is no ED's conscious in identity", sender)
 	case edILK != "" && !strings.EqualFold(facts.WorksFor, edILK):
 		return "", fmt.Errorf("%s is the conscious of %s, not of %s", sender, facts.WorksFor, edILK)
 	}
 	ed := facts.WorksFor
-	selfILK := strings.TrimSpace(rt.ActCtx.SelfILK)
-	if selfILK == "" {
-		if selfILK, found, err = id.nodeILK(rt.NodeName); err != nil || !found {
-			return "", fmt.Errorf("this capability's own ILK (%s) is not in identity (%v)", rt.NodeName, err)
+	var door ilkFacts
+	if selfILK := strings.TrimSpace(rt.ActCtx.SelfILK); selfILK != "" {
+		if door, found, err = id.ilk(selfILK); err != nil || !found {
+			return "", fmt.Errorf("this capability's own ILK %s is not active in identity (%v)", selfILK, err)
 		}
-	}
-	door, found, err := id.ilk(selfILK)
-	if err != nil || !found {
-		return "", fmt.Errorf("this capability's own ILK %s is not active in identity (%v)", selfILK, err)
+	} else if _, door, found, err = id.ilkByNode(rt.NodeName); err != nil || !found {
+		return "", fmt.Errorf("this capability's own ILK (%s) is not in identity (%v)", rt.NodeName, err)
 	}
 	if door.WorksFor != "" {
 		if !strings.EqualFold(door.WorksFor, ed) {
@@ -213,6 +204,31 @@ func (rt *NodeRuntime) checkConscious(sender, edILK string) (string, error) {
 		return "", fmt.Errorf("%s is not of this capability's tenant (%s)", ed, door.TenantID)
 	}
 	return ed, nil
+}
+
+// fromAConscious reports whether sender, the router-stamped name of a message's sender, is a conscious
+// def takes requests from (docs/digital-executive-v1-stage-3.md §5): an agent its start_from names,
+// or, under the consciouses marker, an agent whose ILK identity names a conscious. Such a sender
+// starts and drives an instance only with a CAPABILITY_REQUEST: any other message of it, the answer
+// of a conscious whose SDK took no capability_result (its ED not confirmed then, or the door not
+// one of its ED's capabilities in identity, which it then answers as an ordinary message back to its
+// sender), is dropped and never answered (dispatchWorkflowEvent), so A-118's loop cannot start from
+// the conscious's side either. Under the marker a capability's own agents are no consciouses: their
+// answers go on as any agent's.
+func (rt *NodeRuntime) fromAConscious(def *WorkflowDefinition, sender string) bool {
+	if !def.TakesRequestsFrom(sender) {
+		return false
+	}
+	for _, starter := range def.StartFrom {
+		if starter.Consciouses == "" && starter.Node == sender {
+			return true
+		}
+	}
+	_, facts, found, err := rt.identity().ilkByNode(sender)
+	if err != nil {
+		log.Printf("wf: identity could not be read for %q: %v", sender, err)
+	}
+	return found && facts.WorkRole == "conscious"
 }
 
 // identity is what the door reads identity through: the runtime's, or the identity SHM of the node's
