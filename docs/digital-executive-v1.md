@@ -823,3 +823,25 @@ Options (b), a label over several agents, and (c), one node that does everything
   - each works for the ED it is deployed into (`works_for`), never speaks as it (no `speaks_as`);
   - offered to: the tenant (custom) or every tenant (catalog), with an optional flag in the CI that
     narrows it to all EDs or to named EDs.
+
+## 36. Notes, 2026-11-28 (later): how the conscious uses a capability
+
+- **Agreed (the operator, "me cierra, es coherente… 1 a 1"):** one entry agent per capability; the
+  conscious learns its capabilities from identity (the ILKs working for its ED as `agent`, marked as
+  the entry, with their definitions' descriptions); a role `connector` for a capability's IO to an
+  external system, next to `conscious`, `channel` and `agent`.
+- **Found against an earlier decision, to talk before the build** (docs/wf-orchestration-v1.md §2,
+  the operator, 2026-10-27): *AI agents are pure responders*; an agent answers a message, its timers
+  live in a WF; no `send_message` in the AI node (removed in 0.1.89); whenever several agents take
+  part, a WF sits at the IO node's exit and routes by node names written in its definition. The
+  proposed tool "ask capability X" has the conscious send a request to another agent.
+- **The two ways, for the operator's call:**
+  - **a request inside the turn:** the tool is a request and its answer, within the conscious's
+    turn, bounded in time, only to the entries of its own ED's capabilities. The conversation's
+    destination does not change: the person talks to the conscious, which answers; the capability's
+    answer comes back as the tool's result. Nothing starts an exchange outside a turn, and no timer
+    lives in the agent;
+  - **a WF in the ED's path:** the conscious answers with a structured intent, and a WF at the IO's
+    exit sends it to the capability's entry and brings its answer back to the conscious (Case 3's
+    consultation). SY.deploy would write and rewrite each ED's WF as capabilities come and go, and the
+    conscious could not use a capability in the middle of a turn.
