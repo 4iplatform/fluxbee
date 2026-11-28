@@ -920,3 +920,22 @@ Options (b), a label over several agents, and (c), one node that does everything
   wakes on its own timers; io.wapp sends any message that carries `meta.context.io.reply_target`
   (kind `wapp_post`), not only a reply to a message it just took; WhatsApp lets a business answer
   freely within 24 hours of the person's last message.
+
+## 41. Notes, 2026-11-28 (later): identity, what it has and what may be missing
+
+- **The operator:** talk about identity, what it has and what could be missing. Of the candidates
+  (the profile; the ED's capabilities as capabilities; its addresses as real channels; its email;
+  layer 1; the small pending ones), start with the addresses and the email; the operator's doubts
+  are more with the capabilities (how to build it complete), left for the end.
+- **Facts read for it (2026-11-28):**
+  - An ILK record holds its type, registration, tenant, `identification` (free JSON), definition,
+    channels, its mark and reason, the virtual flag, `works_for`/`work_role`, and the document with
+    its hash (`IlkRecord`, `src/bin/sy_identity.rs`).
+  - A channel's key is its type, address and scope; the scope is the ILK's tenant, and only Fluxbee
+    Cloud's relay may name the installation-wide scope, for a `cloud` account (`resolve_channel_scope`).
+    So a channel is unique within a tenant.
+  - `ILK_ADD_CHANNEL` is taken from `IO.*` and the frontdesk only; SY.admin sends none.
+  - An ED holds no channel today: its WhatsApp number lives in its document, and SY.deploy keeps two
+    EDs off one number by its own records (stage 2's call of 2026-11-26).
+  - The design of 2026-11-25 (§3) had decided otherwise: an ED's channels are its ILK's, like a
+    person's, and no two EDs hold the same address.
