@@ -561,7 +561,7 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', 1, 2, 'hash-asking', 'conv
 		t.Fatalf("the migrated store keeps an instance's person's IO node: %+v %v", again, err)
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != 7 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if err := ensureWFSchema(db); err != nil {
@@ -608,7 +608,59 @@ func TestEnsureWFSchemaMigratesV6ToTimerRefusals(t *testing.T) {
 		t.Fatalf("the migrated index keeps a refusal: %+v %v", due, err)
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 7 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
+}
+
+// A capability's door (schema v8, wf-orchestration-v1 §5.6): each instance of a v7 store keeps the
+// request that started it, none for an instance of before, and what the v7 store held stays as it
+// was.
+func TestEnsureWFSchemaMigratesV7ToRequests(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v7.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE wf_instances (
+    instance_id TEXT PRIMARY KEY, workflow_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','cancelled','failed')),
+    current_state TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+    current_trace_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    terminated_at_ms INTEGER, definition_hash TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '',
+    person_ilk TEXT NOT NULL DEFAULT '', person_ich TEXT NOT NULL DEFAULT '', person_io TEXT NOT NULL DEFAULT '');`,
+		`INSERT INTO wf_instances (instance_id, workflow_type, status, current_state, created_at_ms, updated_at_ms, definition_hash, thread_id, person_io)
+VALUES ('wfi:running', 'asking', 'running', 'asking', 1, 2, 'hash-asking', 'conv-1', 'IO.api.sales@motherbee');`,
+		`PRAGMA user_version=7;`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v7 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	row, err := store.GetInstance(ctx, "wfi:running")
+	if err != nil || row.Status != "running" || row.ThreadID != "conv-1" || row.PersonIO != "IO.api.sales@motherbee" || row.RequestJSON != "" {
+		t.Fatalf("a v7 instance stays as it was, with no request: %+v %v", row, err)
+	}
+	row.RequestJSON = `{"request_id":"r-1","replied":"pending"}`
+	if err := store.CommitInstanceMutation(ctx, row, InstanceCommitMutation{}); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := store.GetInstance(ctx, "wfi:running"); err != nil || again.RequestJSON != row.RequestJSON {
+		t.Fatalf("the migrated store keeps an instance's request: %+v %v", again, err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 8 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if err := ensureWFSchema(db); err != nil {
@@ -692,7 +744,7 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', '', 1, 2, NULL,
 		t.Fatal("the store refuses a cancelling instance")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 7 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 

@@ -209,6 +209,24 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 			} else if !errors.Is(err, errInstanceNotFound) {
 				return fmt.Errorf("recover: read instance %s: %w", row.InstanceID, err)
 			}
+			// A capability request starts an instance of its own, on the instance's id as its thread,
+			// once the current definition admits it again (wf-orchestration-v1 §5.6); otherwise it is
+			// answered, status error, once the drop went.
+			if isCapabilityRequest(msg) {
+				req, input, refusal := rt.admitRequest(rt.Def, msg)
+				if refusal != nil {
+					if drop(fmt.Sprintf("the current definition does not take it: %s: %s", refusal.code, refusal.message)) {
+						if err := rt.refuseRequest(msg, *refusal); err != nil {
+							log.Printf("recover: inbound event %d: %v", row.EventID, err)
+						}
+					}
+					continue
+				}
+				if err := rt.runCreation(ctx, msg, row.InstanceID, input, row.EventID, req); err != nil {
+					log.Printf("recover: create %s again: %v", row.InstanceID, err)
+				}
+				continue
+			}
 			// A creation journaled by an engine of before FINDINGS A-135 may have no thread: a WF
 			// never makes one up, so it starts nothing.
 			threadID := derefStringPtr(msg.Meta.ThreadID)
@@ -243,7 +261,7 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 				refuse(notTakenInvalidInput, fmt.Sprintf("the current definition takes no such input: %v", err), err.Error())
 				continue
 			}
-			if err := rt.runCreation(ctx, msg, row.InstanceID, input, row.EventID); err != nil {
+			if err := rt.runCreation(ctx, msg, row.InstanceID, input, row.EventID, nil); err != nil {
 				log.Printf("recover: create %s again: %v", row.InstanceID, err)
 			}
 		default:

@@ -110,7 +110,7 @@ func pendingTimers(t *testing.T, rt *NodeRuntime, instances, keys int, firstMS i
 		row := WFInstanceRow{InstanceID: id, ThreadID: id, WorkflowType: rt.Def.WorkflowType, DefinitionHash: rt.DefHash,
 			Status: "running", CurrentState: "collecting_data", InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
 			CreatedAtMS: 1000, UpdatedAtMS: 1000}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO wf_instances (`+instanceColumns+`) VALUES (?`+strings.Repeat(", ?", 14)+`);`,
+		if _, err := tx.ExecContext(ctx, `INSERT INTO wf_instances (`+instanceColumns+`) VALUES (?`+strings.Repeat(", ?", len(instanceValues(WFInstanceRow{}))-1)+`);`,
 			instanceValues(row)...); err != nil {
 			t.Fatal(err)
 		}

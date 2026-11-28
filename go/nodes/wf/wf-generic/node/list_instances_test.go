@@ -52,7 +52,7 @@ func insertInstances(t *testing.T, store *Store, n int, status string, createdAt
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	insert, err := tx.PrepareContext(ctx, `INSERT INTO wf_instances (`+instanceColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`)
+	insert, err := tx.PrepareContext(ctx, `INSERT INTO wf_instances (`+instanceColumns+`) VALUES (?`+strings.Repeat(", ?", len(instanceValues(WFInstanceRow{}))-1)+`);`)
 	if err != nil {
 		t.Fatal(err)
 	}

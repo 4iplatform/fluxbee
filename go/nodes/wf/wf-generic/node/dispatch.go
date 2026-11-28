@@ -61,6 +61,9 @@ type NodeRuntime struct {
 	Plane    *ControlPlane
 	// Engine is the wf.engine the node runs, which its status reports (FINDINGS A-302).
 	Engine Engine
+	// Identity is what a capability's door reads identity through (checkConscious): nil reads the
+	// identity SHM of the node's hive.
+	Identity identityView
 	// timersPending is why the timer index is not reconciled with SY.timer yet (it did not answer,
 	// or the index could not be read): the node runs DEGRADED, and the receive loop tries again until
 	// it is.
@@ -126,11 +129,17 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	// The engine's control verbs answer only the nodes that use them (the router does not protect
 	// them, FINDINGS A-119): SY.admin@motherbee, through which every user action goes, and SY.wf-rules
 	// of the WF's own hive, which counts a workflow's running instances.
+	// A capability's door answers WF_HELP to the consciouses its start_from takes too: its help is the
+	// capability's interface (wf-orchestration-v1 §5.6).
 	if responseMsg, ok := wfControlRequests[msgName]; ok {
-		if !controlCallerAuthorized(rt.NodeName, msg.SourceL2Name()) {
+		if !controlCallerAuthorized(rt.NodeName, msg.SourceL2Name()) && (msgName != MsgWFHelp || !rt.helpAskedByConscious(msg.SourceL2Name())) {
 			log.Printf("wf: %s from %q refused (trace_id=%s): unauthorized", msgName, msg.SourceL2Name(), msg.Routing.TraceID)
+			callers := fmt.Sprintf("%s and %s", sdk.PrimaryAdminNode, wfRulesNode(rt.NodeName))
+			if msgName == MsgWFHelp {
+				callers = fmt.Sprintf("%s, %s and the consciouses a capability's start_from takes", sdk.PrimaryAdminNode, wfRulesNode(rt.NodeName))
+			}
 			return sendErrorReply(ctx, msg, responseMsg, errCodeUnauthorized,
-				fmt.Sprintf("%s is answered only to %s and %s, not %q", msgName, sdk.PrimaryAdminNode, wfRulesNode(rt.NodeName), msg.SourceL2Name()), rt)
+				fmt.Sprintf("%s is answered only to %s, not %q", msgName, callers, msg.SourceL2Name()), rt)
 		}
 		// The engine runs (Def is set) only with a config in use and its store open: with the config
 		// in use the store says why it does not.
@@ -166,6 +175,12 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	if notice, ok := sdk.ParseNotTaken(msg); ok {
 		rt.takeNotTaken(ctx, msg, notice)
 		return nil
+	}
+
+	// A CAPABILITY_REQUEST, from a conscious to a capability's door, starts an instance once the door
+	// admits it, and is answered otherwise (wf-orchestration-v1 §5.6).
+	if isCapabilityRequest(msg) {
+		return rt.takeCapabilityRequest(ctx, msg)
 	}
 
 	// A system message is control, never a workflow event, but a TIMER_FIRED: since 0.1.90 a WF sends
@@ -376,8 +391,24 @@ func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 		"terminal_states": rt.Def.TerminalStates,
 		"input_schema":    rt.Def.InputSchema,
 		"idle_timeout":    idleTimeout,
+		"actions":         requestActions(rt.Def),
 	}
 	return sendReply(ctx, msg, MsgWFHelpResponse, payload, rt)
+}
+
+// requestActions are a capability's door's request actions as WF_HELP lists them (the stage's wire
+// contract §3): each one's name, and its description when the definition gives one; none for a WF
+// that declares none.
+func requestActions(def *WorkflowDefinition) []map[string]any {
+	actions := make([]map[string]any, 0, len(def.RequestActions))
+	for _, action := range def.RequestActions {
+		entry := map[string]any{"name": action.Name}
+		if action.Description != "" {
+			entry["description"] = action.Description
+		}
+		actions = append(actions, entry)
+	}
+	return actions
 }
 
 func handleWFGetCode(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
@@ -507,6 +538,10 @@ func instanceDetail(row WFInstanceRow, logs []WFLogEntry) map[string]any {
 	detail := instanceSummary(row)
 	detail["input"] = storedObject(row.InputJSON)
 	detail["state_variables"] = storedObject(row.StateJSON)
+	if row.RequestJSON != "" {
+		// A capability's door's instance: the request that started it (wf-orchestration-v1 §5.6).
+		detail["request"] = storedObject(row.RequestJSON)
+	}
 	recent := make([]map[string]any, 0, len(logs))
 	for _, entry := range logs {
 		recent = append(recent, map[string]any{

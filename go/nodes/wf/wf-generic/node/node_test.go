@@ -969,7 +969,7 @@ func TestTheWFAnswersUseTheKeysTheSpecShows(t *testing.T) {
 	}
 
 	help := ask(MsgWFHelp, `{}`)
-	if keys(help) != "description,idle_timeout,initial_state,input_schema,ok,states,terminal_states,workflow_type" || help["workflow_type"] != "asking" || help["idle_timeout"] != "4d" {
+	if keys(help) != "actions,description,idle_timeout,initial_state,input_schema,ok,states,terminal_states,workflow_type" || help["workflow_type"] != "asking" || help["idle_timeout"] != "4d" {
 		t.Fatalf("WF_HELP = %v", help)
 	}
 	if states, _ := help["states"].([]any); len(states) != 4 || states[0] != "asking" {

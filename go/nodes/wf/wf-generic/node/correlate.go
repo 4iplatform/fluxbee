@@ -300,7 +300,7 @@ func (rt *NodeRuntime) create(ctx context.Context, msg sdk.Message) error {
 	if err != nil {
 		return err
 	}
-	return rt.runCreation(ctx, msg, instanceID, input, inboundID)
+	return rt.runCreation(ctx, msg, instanceID, input, inboundID, nil)
 }
 
 // creationInput is the input msg starts an instance of def with: its payload, a JSON object (or
@@ -326,12 +326,24 @@ func creationInput(def *WorkflowDefinition, msg sdk.Message) (map[string]any, er
 // the same instance_id (and the same trace_id), so no instance is ever half-started. The instance's
 // thread is msg's, which its callers checked it has, its person msg's src_ilk and ich, and its
 // person's IO node msg's sender.
-func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanceID string, input map[string]any, inboundID int64) error {
+//
+// A capability request (req, admitted by admitRequest) is no conversation's message: the instance
+// keeps the request, and its thread is its own id, the one its exchanges with the capability's agents
+// go on, one instance per request (wf-orchestration-v1 §5.6). The person's conversation is the
+// request's, which a notify goes back on. It has no person: what it sends names none.
+func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanceID string, input map[string]any, inboundID int64, req *capabilityRequest) error {
 	def := rt.Def
-	inst := NewInstance(def, instanceID, derefStringPtr(msg.Meta.ThreadID), def.WorkflowType, input, rt.ActCtx.Clock)
-	inst.PersonILK = derefStringPtr(msg.Meta.SrcIlk)
-	inst.PersonICH = derefStringPtr(msg.Meta.Ich)
-	inst.PersonIO = msg.SourceL2Name()
+	threadID := derefStringPtr(msg.Meta.ThreadID)
+	if req != nil {
+		threadID = instanceID
+	}
+	inst := NewInstance(def, instanceID, threadID, def.WorkflowType, input, rt.ActCtx.Clock)
+	if req == nil {
+		inst.PersonILK = derefStringPtr(msg.Meta.SrcIlk)
+		inst.PersonICH = derefStringPtr(msg.Meta.Ich)
+		inst.PersonIO = msg.SourceL2Name()
+	}
+	inst.request = req
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
 	inst.takeCycleTrace(msg)

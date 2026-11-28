@@ -103,6 +103,10 @@ type WFInstance struct {
 	// calls counts the messages sent to agents since the instance's last trigger. It lives in memory:
 	// a restart starts the count again.
 	calls agentCalls
+	// request is the capability request that started the instance, a capability's door's
+	// (wf-orchestration-v1 §5.6), nil for any other: what reply answers and notify names. Its commit
+	// writes it (request_json), with whether it was answered.
+	request *capabilityRequest
 }
 
 // agentCalls is an instance's count of the messages it sent to agents (AI.*) since its last trigger
@@ -183,6 +187,12 @@ func FromRow(row WFInstanceRow, def *WorkflowDefinition, kept []KeptMessageRow) 
 		v := row.TerminatedAtMS.Int64
 		inst.TerminatedAtMS = &v
 	}
+	if row.RequestJSON != "" {
+		inst.request = &capabilityRequest{}
+		if err := json.Unmarshal([]byte(row.RequestJSON), inst.request); err != nil {
+			return nil, fmt.Errorf("instance %s: bad request_json: %w", row.InstanceID, err)
+		}
+	}
 	for _, keptRow := range kept {
 		var msg sdk.Message
 		if err := json.Unmarshal([]byte(keptRow.MessageJSON), &msg); err != nil {
@@ -225,6 +235,13 @@ func (inst *WFInstance) ToRow(clock ClockFunc) (WFInstanceRow, error) {
 	}
 	if inst.TerminatedAtMS != nil {
 		row.TerminatedAtMS = newNullInt64(*inst.TerminatedAtMS)
+	}
+	if inst.request != nil {
+		request, err := json.Marshal(inst.request)
+		if err != nil {
+			return WFInstanceRow{}, err
+		}
+		row.RequestJSON = string(request)
 	}
 	return row, nil
 }
@@ -525,11 +542,12 @@ func (inst *WFInstance) runActions(ctx context.Context, actions []ActionDefiniti
 		detail := ""
 		fatal := false
 		var capped agentCallCapError
+		var replied alreadyRepliedError
 		switch {
 		case err == nil:
-		case errors.As(err, &capped):
-			// Past the cap on agent calls the send is not made, whatever its on_error, and the
-			// transition's other actions run.
+		case errors.As(err, &capped), errors.As(err, &replied):
+			// Past the cap on agent calls the send is not made, and neither is a second reply to a
+			// request, whatever its on_error: the transition's other actions run.
 			detail = err.Error()
 			log.Printf("instance %s: %s (%s) not sent: %v", inst.InstanceID, path, action.Type, err)
 		default:
@@ -926,6 +944,10 @@ func actionSummary(action ActionDefinition) string {
 	case "set_variable":
 		if action.Name != "" {
 			return fmt.Sprintf("set_variable %s", action.Name)
+		}
+	case "reply", "notify":
+		if action.Status != "" {
+			return fmt.Sprintf("%s %s", action.Type, action.Status)
 		}
 	}
 	return action.Type

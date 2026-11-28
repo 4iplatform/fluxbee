@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	// wfSchemaVersion 7 (FINDINGS A-254): a timer of the index keeps why SY.timer did not take the
+	// wfSchemaVersion 8 (wf-orchestration-v1 §5.6): an instance of a capability's door keeps the
+	// request that started it, and whether it was answered. Version 7 (FINDINGS A-254): a timer of the index keeps why SY.timer did not take the
 	// last request about it, how many times it was sent again since, and when it goes again. Version
 	// 6 (Case 5, wf-orchestration-v1 §5.5.1): an instance keeps its person's IO node,
 	// the node whose message started it (FINDINGS A-139). Version 5 (Case 4, §5.4.10): an instance
@@ -26,7 +27,7 @@ const (
 	// the conversation's (indexed), and the messages keep_message kept (§5.2.1). Version 3 (0.1.90): a
 	// definition is kept by its hash for as long as a running instance uses it, each instance records
 	// the hash it was born with, and an inbound event is journaled until its transition commits (§5.1).
-	wfSchemaVersion = 7
+	wfSchemaVersion = 8
 	maxLogEntries   = 100
 )
 
@@ -58,6 +59,10 @@ type WFInstanceRow struct {
 	PersonILK string
 	PersonICH string
 	PersonIO  string
+	// RequestJSON is the capability request that started an instance of a capability's door
+	// (capabilityRequest, wf-orchestration-v1 §5.6), with whether it was answered; empty for any other
+	// instance, and for one of before v8.
+	RequestJSON string
 }
 
 // WFLogEntry is a single entry in the per-instance audit log.
@@ -270,7 +275,8 @@ var wfSchemaStatements = []string{
     thread_id         TEXT NOT NULL DEFAULT '',
     person_ilk        TEXT NOT NULL DEFAULT '',
     person_ich        TEXT NOT NULL DEFAULT '',
-    person_io         TEXT NOT NULL DEFAULT ''
+    person_io         TEXT NOT NULL DEFAULT '',
+    request_json      TEXT NOT NULL DEFAULT ''
 );`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
@@ -361,6 +367,11 @@ func ensureWFSchema(db *sql.DB) error {
 	if userVersion >= 1 && userVersion < 7 {
 		if err := migrateToTimerRefusals(tx); err != nil {
 			return fmt.Errorf("migrate wf schema to v7: %w", err)
+		}
+	}
+	if userVersion >= 1 && userVersion < 8 {
+		if err := migrateToRequests(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v8: %w", err)
 		}
 	}
 	for _, stmt := range wfSchemaStatements {
@@ -459,6 +470,21 @@ func migrateToTimerRefusals(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateToRequests takes a v7 store (or an older one, once at v7) to v8 (wf-orchestration-v1 §5.6):
+// an instance of a capability's door keeps the request that started it, none for an instance of
+// before. A store without the instances' table has it created at its v8 shape.
+func migrateToRequests(tx *sql.Tx) error {
+	var tables int
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'wf_instances';`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE wf_instances ADD COLUMN request_json TEXT NOT NULL DEFAULT '';`)
+	return err
 }
 
 // migrateToPersons takes a v4 store (or an older one, once at v4) to v5. Each instance keeps its
@@ -563,13 +589,14 @@ WHERE hash != ? AND hash NOT IN (
 var errInstanceNotFound = errors.New("not found")
 
 const instanceColumns = `instance_id, thread_id, workflow_type, definition_hash, status, current_state, input_json,
-       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, person_ilk, person_ich, person_io`
+       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, person_ilk, person_ich, person_io,
+       request_json`
 
 // CreateInstance inserts a new workflow instance row.
 func (s *Store) CreateInstance(ctx context.Context, inst WFInstanceRow) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
 	return err
 }
 
@@ -578,6 +605,7 @@ func instanceValues(inst WFInstanceRow) []any {
 		inst.InstanceID, inst.ThreadID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
 		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
 		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS, inst.PersonILK, inst.PersonICH, inst.PersonIO,
+		inst.RequestJSON,
 	}
 }
 
@@ -615,7 +643,7 @@ func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, 
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(instance_id) DO UPDATE SET
     status           = excluded.status,
     current_state    = excluded.current_state,
@@ -625,7 +653,8 @@ ON CONFLICT(instance_id) DO UPDATE SET
     terminated_at_ms = excluded.terminated_at_ms,
     person_ilk       = excluded.person_ilk,
     person_ich       = excluded.person_ich,
-    person_io        = excluded.person_io;`, instanceValues(inst)...); err != nil {
+    person_io        = excluded.person_io,
+    request_json     = excluded.request_json;`, instanceValues(inst)...); err != nil {
 		return err
 	}
 
@@ -798,6 +827,7 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 			&r.InstanceID, &r.ThreadID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
 			&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
 			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS, &r.PersonILK, &r.PersonICH, &r.PersonIO,
+			&r.RequestJSON,
 		); err != nil {
 			return nil, err
 		}

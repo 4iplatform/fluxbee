@@ -71,17 +71,28 @@ type ActionContext struct {
 func executeAction(ctx context.Context, path string, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
 	switch action.Type {
 	case "send_message":
-		// A send to an agent counts against the cap of the instance's trigger, past which it is not
-		// made (maxAgentCallsPerTrigger).
+		// Only reply and notify reach the conscious whose request started the instance; a send to an
+		// agent counts against the cap of the instance's trigger, past which it is not made
+		// (maxAgentCallsPerTrigger).
+		if err := inst.requestersSend(action.Type, action.Target); err != nil {
+			return err
+		}
 		if err := inst.callAgent(action.Target); err != nil {
 			return err
 		}
 		return execSendMessage(ctx, action, inst, event, actx)
 	case "forward":
+		if err := inst.requestersSend(action.Type, action.Target); err != nil {
+			return err
+		}
 		if err := inst.callAgent(action.Target); err != nil {
 			return err
 		}
 		return execForward(ctx, action, inst, event, actx)
+	case "reply":
+		return execReply(ctx, action, inst, event, actx)
+	case "notify":
+		return execNotify(ctx, action, inst, event, actx)
 	case "keep_message":
 		return execKeepMessage(action, inst, event, actx)
 	case "emit_internal_event":
