@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.159** | 2026-11-27 | `91587ba0` | motherbee + spokes (core), three binaries, one branch each: the Digital Executive's stage 2, release 2C ([stage 2](../docs/digital-executive-v1-stage-2.md) §1, §9, §10). SY.identity: `ILK_CREATE_VIRTUAL` born with its id (idempotent, `ILK_ID_TAKEN`), `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` (migration v8, the file in `blob/people/`, its hash in the SHM), `ILK_DELETE`'s `node_retired` reason; the orchestrator: `kill_node`'s `retire_instance`, the people folder; SY.admin: `create_virtual_person`'s `ilk_id`, `set_ilk_works_for`, `set_person_document`, `kill_node`'s retire | ✅ live, gate0259 28 PASS (two tool FAILs re-run PASS) | snapshot `pre-ed2c-0-1-159` · `apt install fluxbee=0.1.158` (migration v8 only adds two columns) |
+| **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ live, gate0260 50 PASS; A-372 (a worker's io.wapp provisions at its identity replica) fixed in 0.1.161; two tool FAILs re-run PASS | snapshot `pre-ed2d-0-1-160` · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
+| **0.1.159** | 2026-11-27 | `91587ba0` | motherbee + spokes (core), three binaries, one branch each: the Digital Executive's stage 2, release 2C ([stage 2](../docs/digital-executive-v1-stage-2.md) §1, §9, §10). SY.identity: `ILK_CREATE_VIRTUAL` born with its id (idempotent, `ILK_ID_TAKEN`), `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` (migration v8, the file in `blob/people/`, its hash in the SHM), `ILK_DELETE`'s `node_retired` reason; the orchestrator: `kill_node`'s `retire_instance`, the people folder; SY.admin: `create_virtual_person`'s `ilk_id`, `set_ilk_works_for`, `set_person_document`, `kill_node`'s retire | ✅ replaced by 0.1.160 | snapshot `pre-ed2c-0-1-159` (deleted 2026-11-27) · `apt install fluxbee=0.1.158` (migration v8 only adds two columns) |
 | **0.1.158** | 2026-11-27 | `c285c567` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2B ([stage 2](../docs/digital-executive-v1-stage-2.md) §6.1, §7, §10): the AI SDK's `speaks_as` (an agent speaks as the person its config names while identity confirms it, its own ILK otherwise) and the IO family's `io.person_ilk` (an inbound message names the IO's person as `dst_ilk` while identity confirms it), unset everywhere; the identity SHM's last 8 bytes named `document_hash` | ✅ replaced by 0.1.159 | snapshot `pre-sdk-ed2-0-1-158` (deleted 2026-11-27) · `apt install fluxbee=0.1.157` (nothing one-way) |
 | **0.1.157** | 2026-11-27 | `105ee2f0` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2A ([stage 2](../docs/digital-executive-v1-stage-2.md) §1.1, §10): the identity SHM's version 7, every `IlkEntry` naming whom its ILK works for (`works_for`) and its role (`work_role`), 1184 bytes, in its three copies with one shared layout fixture; SY.identity's migration v7, record, replication and projection, the primary's relation standing on every replica push; nothing sets it yet. With A-367 (a Go SDK test's race) | ✅ replaced by 0.1.158 | snapshot `pre-shm7-0-1-157` (deleted 2026-11-27) · `apt install fluxbee=0.1.156` (migration v7 only adds two columns; SY.identity recreates its region at the version it runs) |
 | **0.1.156** | 2026-11-26 | `0a5be3fb` | motherbee + spokes (core), the router alone: the Digital Executive's stage 1 cleanup, release two. The router's binding of a person's `src_ilk` comes out whole (its rule, its watcher, its report lines, and the identity reader's ILK kinds it read): the router and `src/shm` are 0.1.153's again | ✅ replaced by 0.1.157 | snapshot `pre-edclean2-0-1-156` (deleted 2026-11-27) · `apt install fluxbee=0.1.155` (nothing one-way) |
@@ -168,6 +169,84 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.160 — SY.deploy and a plain ED's birth (the Digital Executive's stage 2, release 2D)
+
+- **Date:** 2026-11-27 (ART) · **Previous version:** 0.1.159 · **Commit:** `ee04ca05`.
+- **Scope:** motherbee and the three spokes, through the installation's update. Five branches on
+  different binaries, against one file of wire contracts: SY.deploy (new), SY.admin with the Rust
+  SDK's Cloud table and IO.cloud, ai.generic, io.wapp, Archi. The Cloud table is shared code in a
+  release with others: its six rows are read only by IO.cloud and SY.admin, both in it.
+- **Why:** stage 2's last release: an ED born from Fluxbee Cloud's door by SY.deploy, which runs
+  every step through SY.admin and keeps only its deployments; its conscious and its IO confirmed by
+  identity.
+- **What changed:**
+  - **SY.deploy (`coa/ed2-deploy`):** a Rust system node on the motherbee, its state in files under
+    `state/sy-deploy/` (deployments, journals, the sources' copies); general: a source reader, a
+    desired state, one step builder, one runner (one deployment at a time, a lock per grouping,
+    every step journaled, a retry or a restart converging on what runs); the six orders; the source
+    `plain-ed` 1 built in, with the native texts the operator approved; Archi's agent-asset code
+    moved to the core library and shared; three versions of a source kept, never one in use; the
+    packaging and every registration point (role lists, unit and role gate, postinst, prerm, the
+    factory reset, `BOX_INSTALL_UNITS`, the stop script, `ops.py`'s timeline).
+  - **SY.admin (`coa/ed2-admin-cd`):** the six `cd_*` orders, forwarded to SY.deploy with
+    `_caller`, 202 on an accepted write; SY.deploy's row, exactly its sixteen actions (never a
+    purge); the six as Cloud ops (`CLOUD_OP_ACTIONS`, IO.cloud's translation, `docs/io-cloud-api.md`
+    §5.9); registry version 30.
+  - **ai.generic (`coa/ed2-ai`):** reads `speaks_as` into the AI SDK and shows it in its status.
+  - **io.wapp (`coa/ed2-wapp`):** reads `io.person_ilk`, re-checks every 10 s, shows it in its
+    status.
+  - **Archi (`coa/ed2-archi`):** SCMD routes for the six orders and for 0.1.159's two identity
+    writes, the mutating list, the handbook's deployments section; its saved manifests kept to the
+    last three and the newest executed one.
+- **Review:** mine of the builders' reports; two contract gaps settled before the build (SY.admin's
+  command log keeps `cd_deploy`/`cd_remove`, so Archi reads them back; Cloud's `tenant_id` and the
+  executor's nulls accepted by SY.deploy).
+- **Build:** CI green on each branch and on the head `ee04ca05`. Build on fb-build
+  23:28:03–23:55:58Z (27.9 min).
+- **The deploy:** the mark at 23:56:55Z; `ops deploy 0.1.160 --snapshot pre-ed2d-0-1-160 --drop
+  pre-ed2c-0-1-159` in 269 s:
+  - **Phases:** snapshots 32.2 s, the motherbee's apt 112.5 s, its admin on the version 54.7 s, the
+    spokes answering 8.2 s, the update's call 25.8 s, the hives on the target 19.0 s, health 7.4 s.
+  - **On the target after the update's call:** the motherbee 4.2 s, egress1 29.5 s, ingress1 34.0 s,
+    worker1 42.9 s.
+  - **Health:** clean; SY.deploy running on the motherbee, its state directories made.
+- **Checked on 8.x (the gate, gate0260, 00:00–00:12Z on 2026-11-28; `scratchpad/gate-tools/
+  r160_gate.py` and `r160_probe.py`, git-ignored; 50 PASS, one real FAIL, two of the tool's, one
+  model call):**
+  - **The smoke:** a new node RUNNING in 4.3 s on 0.1.160; a stopped one reads STOPPED.
+  - **Through Cloud's door:** a test credential put (`whatsapp`); `cd_catalog` lists `plain-ed`;
+    `cd_deploy` accepted in 1.18 s; the deployment `active` 4.7 s after the order. The ten steps
+    took 82 ms to 437 ms each (`run_node`s the longest).
+  - **Read back:** the ED virtual in `pruebas` with its document (short id, WhatsApp number); the
+    conscious and the IO working for it in worker1's SHM (roles conscious and channel), both
+    RUNNING, both confirmed by identity, both launched by `SY.deploy@motherbee`; the conscious's
+    definition (role, handbook, personality); `cd_tree` with the ED, its parts and its deployment,
+    no secret.
+  - **A message:** a signed webhook into the IO (as the edge's fan-out hands it) went to the
+    conscious; one model call; SY.storage holds the inbound turn with `to_ilk` the ED and the reply
+    with `from_ilk` the ED and the conscious as its writer ("¡Hola! Soy Laura, ejecutiva
+    digital…"); io.wapp took the reply with its target and tried Graph, 401 on the fake token.
+    The conscious's assets reached worker1 about 20 s after the birth, before the message (A-338's
+    lag).
+  - **FAIL, A-372:** the writer got no temporary ILK. io.wapp on worker1 provisions at
+    `SY.identity@worker1`, a replica, which answers `NOT_PRIMARY`; the inbound turn's `from_ilk` is
+    empty. Fixed in 0.1.161.
+  - **The confirmation:** a live `CONFIG_SET` of another person into the IO: not confirmed, with the
+    reason; back to the ED: confirmed. The conscious's relation cleared: not confirmed; set again:
+    confirmed. (The tool's first try wrote the config file with `PUT …/config`, which a running
+    node does not read: re-run with `node_control_config_set`.)
+  - **The edges:** the same key gives the same deployment; another key with the same number
+    `NUMBER_TAKEN`; another tenant reads `NOT_FOUND`; Cloud's `delete_ilk` on the ED `ILK_VIRTUAL`.
+  - **A restart of SY.deploy 0.4 s after an order's acceptance:** the run left under way resumed and
+    the ED was active 2 s later, one ILK per node. (A first try restarted it after the birth had
+    ended; re-run.)
+  - **The end:** `cd_remove` of each ED's grouping, removed in 3 to 4 s; the nodes gone; the nodes'
+    ILKs marked `node_retired`, the ED's marked; its document and the credential kept.
+  - **Cleaned:** the gate's ILKs, its credential, the document files, the smoke node.
+- **Next:** 0.1.161, A-372.
+- **Rollback:** snapshot `pre-ed2d-0-1-160`, or `apt install fluxbee=0.1.159` and 0.1.159's
+  `update_installation`: SY.deploy stops being installed; its state stays on disk.
 
 ## 0.1.159 — the ED's identity verbs, the retire mode and the people folder (the Digital Executive's stage 2, release 2C)
 
