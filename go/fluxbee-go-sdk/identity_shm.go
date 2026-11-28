@@ -319,9 +319,62 @@ func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error
 	return "ilk:" + uuid.UUID(ilkBytes).String(), true, nil
 }
 
+// LookupIlkByNode is the active ILK whose handler_node is nodeName (a node's L2 name, as the router
+// stamps a sender: "AI.ed4qm7k2xa@worker1"), "ilk:<uuid>", and what the identity memory of hiveID
+// says of it, as LookupIlk does. ("", _, false, nil) on a miss, and when the region is absent.
+func LookupIlkByNode(hiveID, nodeName string) (string, IlkFacts, bool, error) {
+	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
+	return lookupIlkByNodeAt(shmFilePath(name), nodeName)
+}
+
+func lookupIlkByNodeAt(path, nodeName string) (string, IlkFacts, bool, error) {
+	handler := strings.TrimSpace(nodeName)
+	if handler == "" {
+		return "", IlkFacts{}, false, nil
+	}
+	var ilkBytes [16]byte
+	var facts IlkFacts
+	var found bool
+	read, err := readIlkEntries(path, func(entries []byte, count int) {
+		ilkBytes, found = scanIlkEntriesByHandler(entries, count, handler)
+		if found {
+			facts, found = scanIlkEntriesByID(entries, count, ilkBytes)
+		}
+	})
+	if err != nil || !read || !found {
+		return "", IlkFacts{}, false, err
+	}
+	ilk := "ilk:" + uuid.UUID(ilkBytes).String()
+	if strings.EqualFold(facts.Name, ilk) {
+		facts.Name = ""
+	}
+	return ilk, facts, true, nil
+}
+
+// IsConsciousOf reports whether the node nodeName works for person ("ilk:<uuid>") as its conscious,
+// in the identity memory of hiveID: its ILK's works_for is that person and its work_role is
+// "conscious" (docs/digital-executive-v1-stage-3.md §4: a capability's door takes a request only
+// from the conscious of the ED it names). False on a miss, and when the region is absent.
+func IsConsciousOf(hiveID, nodeName, person string) (bool, error) {
+	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
+	return isConsciousOfAt(shmFilePath(name), nodeName, person)
+}
+
+func isConsciousOfAt(path, nodeName, person string) (bool, error) {
+	person = strings.TrimSpace(person)
+	if person == "" {
+		return false, nil
+	}
+	_, facts, found, err := lookupIlkByNodeAt(path, nodeName)
+	if err != nil || !found {
+		return false, err
+	}
+	return facts.WorkRole == "conscious" && strings.EqualFold(facts.WorksFor, person), nil
+}
+
 // LookupIlk is what the identity memory of hiveID says of the active ILK ilkID ("ilk:<uuid>"): its
-// type (human, agent or system), its display name, and whom it works for and in what role.
-// (_, false, nil) on a miss, and when the region is absent.
+// type (human, agent or system), its display name, its tenant, and whom it works for and in what
+// role. (_, false, nil) on a miss, and when the region is absent.
 func LookupIlk(hiveID, ilkID string) (IlkFacts, bool, error) {
 	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
 	return lookupIlkAt(shmFilePath(name), ilkID)
@@ -424,8 +477,8 @@ func readIlkEntries(path string, scan func(entries []byte, count int)) (bool, er
 	}
 }
 
-// scanIlkEntriesByID finds the active entry of id: its type, its display name, its virtual flag, and
-// whom it works for and in what role.
+// scanIlkEntriesByID finds the active entry of id: its type, its display name, its virtual flag, its
+// tenant, and whom it works for and in what role.
 func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
 	for i := 0; i < count; i++ {
 		off := i * ilkEntrySize
@@ -445,6 +498,7 @@ func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
 			Virtual:  binary.LittleEndian.Uint16(entry[ilkOffFlags:])&ilkFlagVirtual != 0,
 			WorksFor: ilkWorksFor(entry[ilkOffWorksFor : ilkOffWorksFor+16]),
 			WorkRole: ilkWorkRoleName(entry[ilkOffWorkRole]),
+			TenantID: ilkTenantID(entry[ilkOffTenantID : ilkOffTenantID+16]),
 		}, true
 	}
 	return IlkFacts{}, false
@@ -458,6 +512,16 @@ func ilkWorksFor(raw []byte) string {
 		return ""
 	}
 	return "ilk:" + id.String()
+}
+
+// ilkTenantID is the tenant an entry's tenant_id names, "tnt:<uuid>"; "" for zeros.
+func ilkTenantID(raw []byte) string {
+	var id uuid.UUID
+	copy(id[:], raw)
+	if id == (uuid.UUID{}) {
+		return ""
+	}
+	return "tnt:" + id.String()
 }
 
 // ilkWorkRoleName is an entry's work_role as the identity names it (fluxbee_sdk work_role_from_shm):

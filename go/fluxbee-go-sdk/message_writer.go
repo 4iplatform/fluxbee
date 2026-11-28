@@ -88,10 +88,13 @@ type IlkFacts struct {
 	// Virtual is a virtual person, a Digital Executive: a human ILK with the virtual flag.
 	Virtual bool
 	// WorksFor is the person this ILK works for, "ilk:<uuid>", and WorkRole its role to that person:
-	// "conscious", "channel" or "agent" (docs/digital-executive-v1-stage-2.md §1.1). Both "" for an
-	// ILK that works for nobody.
+	// "conscious", "channel", "agent", "connector" or "capability"
+	// (docs/digital-executive-v1-stage-2.md §1.1, stage-3 §2). Both "" for an ILK that works for
+	// nobody, but a capability of every ED of its tenant: WorkRole "capability" and WorksFor "".
 	WorksFor string
 	WorkRole string
+	// TenantID is the tenant the ILK is charged to, "tnt:<uuid>"; "" when its entry holds none.
+	TenantID string
 }
 
 // fillWriterName fills the name of msg's writer, when it names an ILK and no name, with what facts

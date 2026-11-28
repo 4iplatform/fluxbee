@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -157,6 +158,74 @@ func TestLookupIlkReadsWhomAnIlkWorksFor(t *testing.T) {
 	}
 }
 
+// A node's ILK is found by the node's name (its handler_node), with its facts: its tenant, whom it
+// works for and in what role; the stage 3 roles read by name, and a capability of every ED of its
+// tenant works for nobody. Only a node that works for a person as its conscious is that person's
+// conscious (docs/digital-executive-v1-stage-3.md §4).
+func TestLookupIlkByNodeAndTheConsciousOfAPerson(t *testing.T) {
+	laura := uuid.MustParse("5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a")
+	ana := uuid.MustParse("6b6b6b6b-6b6b-46b6-86b6-6b6b6b6b6b6b")
+	acme := uuid.MustParse("7c7c7c7c-7c7c-47c7-87c7-7c7c7c7c7c7c")
+	conscious, channel, connector, door, doorForAll, gone := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	path := writeIdentityRegion(t, []testIlk{
+		{id: laura, kind: 0, name: "Laura", active: true, virtual: true, tenant: acme},
+		{id: conscious, kind: 1, name: "AI.ed4qm7k2xa@worker1", node: "AI.ed4qm7k2xa@worker1", active: true, tenant: acme, worksFor: laura, workRole: ilkWorkRoleConscious},
+		{id: channel, kind: 1, name: "IO.wapp.ed4qm7k2xa@worker1", node: "IO.wapp.ed4qm7k2xa@worker1", active: true, tenant: acme, worksFor: laura, workRole: ilkWorkRoleChannel},
+		{id: connector, kind: 1, name: "IO.crm.ed4qm7k2xa@worker1", node: "IO.crm.ed4qm7k2xa@worker1", active: true, tenant: acme, worksFor: laura, workRole: ilkWorkRoleConnector},
+		{id: door, kind: 1, name: "WF.billing.ed4qm7k2xa@worker1", node: "WF.billing.ed4qm7k2xa@worker1", active: true, tenant: acme, worksFor: laura, workRole: ilkWorkRoleCapability},
+		{id: doorForAll, kind: 1, node: "WF.billing.acme@worker1", active: true, tenant: acme, workRole: ilkWorkRoleCapability},
+		{id: gone, kind: 1, node: "AI.gone@worker1", active: false, tenant: acme, worksFor: laura, workRole: ilkWorkRoleConscious},
+	})
+	ilk, facts, ok, err := lookupIlkByNodeAt(path, " AI.ed4qm7k2xa@worker1 ")
+	want := IlkFacts{Type: "agent", Name: "AI.ed4qm7k2xa@worker1", WorksFor: "ilk:" + laura.String(), WorkRole: "conscious", TenantID: "tnt:" + acme.String()}
+	if err != nil || !ok || ilk != "ilk:"+conscious.String() || facts != want {
+		t.Fatalf("conscious: %q %+v %v %v", ilk, facts, ok, err)
+	}
+	for node, role := range map[string]string{
+		"IO.crm.ed4qm7k2xa@worker1":     "connector",
+		"WF.billing.ed4qm7k2xa@worker1": "capability",
+	} {
+		if _, facts, ok, err := lookupIlkByNodeAt(path, node); err != nil || !ok || facts.WorkRole != role || facts.WorksFor != "ilk:"+laura.String() {
+			t.Fatalf("%s: %+v %v %v", node, facts, ok, err)
+		}
+	}
+	ilk, facts, ok, err = lookupIlkByNodeAt(path, "WF.billing.acme@worker1")
+	if err != nil || !ok || ilk != "ilk:"+doorForAll.String() || facts != (IlkFacts{Type: "agent", WorkRole: "capability", TenantID: "tnt:" + acme.String()}) {
+		t.Fatalf("a door for every ED: %q %+v %v %v", ilk, facts, ok, err)
+	}
+	// A person's tenant, which a door of every ED checks against its own.
+	if facts, ok, err := lookupIlkAt(path, "ilk:"+laura.String()); err != nil || !ok || facts.TenantID != "tnt:"+acme.String() || !facts.Virtual {
+		t.Fatalf("laura: %+v %v %v", facts, ok, err)
+	}
+	for _, node := range []string{"AI.gone@worker1", "AI.nobody@worker1", "", "ai.ed4qm7k2xa@worker1"} {
+		if _, _, ok, err := lookupIlkByNodeAt(path, node); err != nil || ok {
+			t.Fatalf("%q: found %v %v", node, ok, err)
+		}
+	}
+
+	for _, check := range []struct {
+		node, person string
+		want         bool
+	}{
+		{"AI.ed4qm7k2xa@worker1", "ilk:" + laura.String(), true},
+		{"AI.ed4qm7k2xa@worker1", "ILK:" + strings.ToUpper(laura.String()), true},
+		{"AI.ed4qm7k2xa@worker1", "ilk:" + ana.String(), false},
+		{"AI.ed4qm7k2xa@worker1", "", false},
+		{"IO.wapp.ed4qm7k2xa@worker1", "ilk:" + laura.String(), false},
+		{"WF.billing.ed4qm7k2xa@worker1", "ilk:" + laura.String(), false},
+		{"AI.gone@worker1", "ilk:" + laura.String(), false},
+		{"AI.nobody@worker1", "ilk:" + laura.String(), false},
+	} {
+		if got, err := isConsciousOfAt(path, check.node, check.person); err != nil || got != check.want {
+			t.Fatalf("%s of %s: %v %v, want %v", check.node, check.person, got, err, check.want)
+		}
+	}
+	// No region: nobody is anybody's conscious, and nothing fails.
+	if got, err := isConsciousOfAt(filepath.Join(t.TempDir(), "absent"), "AI.ed4qm7k2xa@worker1", "ilk:"+laura.String()); err != nil || got {
+		t.Fatalf("absent region: %v %v", got, err)
+	}
+}
+
 func TestReadSelfIlkFromEnv(t *testing.T) {
 	t.Setenv(envSelfIlkID, " ilk:wf ")
 	if got := ReadSelfIlkFromEnv(); got != "ilk:wf" {
@@ -179,6 +248,9 @@ type testIlk struct {
 	virtual  bool
 	worksFor uuid.UUID
 	workRole byte
+	// node is the entry's handler_node, a node's L2 name; tenant its tenant_id.
+	node   string
+	tenant uuid.UUID
 }
 
 // writeIdentityRegion writes an identity region of this SDK's version with one tenant slot and
@@ -205,6 +277,8 @@ func writeIdentityRegion(t *testing.T, ilks []testIlk) string {
 			binary.LittleEndian.PutUint16(entry[ilkOffFlags:], flags)
 		}
 		copy(entry[ilkOffDisplayName:ilkOffDisplayName+128], ilk.name)
+		copy(entry[ilkOffHandlerNode:ilkOffHandlerNode+128], ilk.node)
+		copy(entry[ilkOffTenantID:ilkOffTenantID+16], ilk.tenant[:])
 		copy(entry[ilkOffWorksFor:ilkOffWorksFor+16], ilk.worksFor[:])
 		entry[ilkOffWorkRole] = ilk.workRole
 	}
