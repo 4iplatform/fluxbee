@@ -788,3 +788,24 @@ Options (b), a label over several agents, and (c), one node that does everything
     source deployed into the ED's grouping, each with its record.
   - Archi's saved manifest (`SolutionManifestV2`) has no blanks, no person it founds, no node roles,
     no released versions; `plain-ed`'s format has all of them.
+
+## 34. Notes, 2026-11-28 (later): Cloud's screen, the kinds of solution, a deploy in pieces
+
+- **The operator, Cloud's screen:** the user builds an ED from the solutions available, released in
+  Archi's CI. The screen lists the EDs; a button starts "create an ED", where the user loads all its
+  data; while it deploys, a timer waits for the confirmation. Afterwards the user can add to that ED
+  other listed solutions.
+- **Kinds of solution** (the operator, three for now, names left to me):
+  - **`executive`:** the base of an ED; it founds the ED (the plain ED is the system one);
+  - **`capability`:** an extension of an ED's capabilities, deployed into one ED;
+  - **`infrastructure`:** general for all of a tenant's EDs, deployed into the tenant's infra
+    grouping.
+- **The deploy goes in pieces** (the operator: the most controlled, opinions accepted): the
+  executive first, each capability after, each its own deployment with its own state and timer.
+- **The points of §33 are right** (the operator): a deployable package format in Archi's CI, system
+  solutions that ship with the software and Archi cannot edit, Archi's publish, an ED composed of
+  parts.
+- **Proposed in the talk:** two attributes besides the kind, so that the kinds stay three:
+  - **origin:** `system` (ships with Fluxbee, locked), `catalog` (Archi's standard), `custom` (made
+    by Archi for one tenant or one ED);
+  - **offered to:** every tenant, one tenant, or one ED (a custom one).
