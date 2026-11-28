@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.161** | 2026-11-27 | `aec9d4b6` | motherbee + spokes (core), io.wapp alone: FINDINGS A-372, a writer is provisioned at the primary's SY.identity by default, as io.api does (a worker's io.wapp asked its own hive's replica, `NOT_PRIMARY`) | ✅ live, gate0261 29 PASS, no FAIL | snapshot `pre-a372-0-1-161` · `apt install fluxbee=0.1.160` (nothing one-way) |
+| **0.1.162** | 2026-11-27 | `7da4782b` | motherbee + spokes (core), shared code: the Digital Executive's stage 3, release 3A ([stage 3](../docs/digital-executive-v1-stage-3.md) §2, §6, §6.1): identity's roles `connector` (4) and `capability` (5, which may work for nobody: a capability for all of a tenant's EDs) in the SHM's three copies and SY.identity; the AI SDK's `ask_capability` (an ED's capabilities from identity, their doors' help, a `CAPABILITY_REQUEST` with the turn's conversation, 60 s) and the turn on a later result answered to the person's IO; ai.generic registers it for a conscious; the Go SDK's `LookupIlkByNode`, `IsConsciousOf`, the ILK's tenant | ✅ live, gate0262 35 PASS (one tool FAIL re-read PASS) | snapshot `pre-ed3a-0-1-162` · `apt install fluxbee=0.1.161` (nothing one-way) |
+| **0.1.161** | 2026-11-27 | `aec9d4b6` | motherbee + spokes (core), io.wapp alone: FINDINGS A-372, a writer is provisioned at the primary's SY.identity by default, as io.api does (a worker's io.wapp asked its own hive's replica, `NOT_PRIMARY`) | ✅ replaced by 0.1.162 | snapshot `pre-a372-0-1-161` (deleted 2026-11-28) · `apt install fluxbee=0.1.160` (nothing one-way) |
 | **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ replaced by 0.1.161 (gate0260 50 PASS; A-372 fixed there) | snapshot `pre-ed2d-0-1-160` (deleted 2026-11-28) · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
 | **0.1.159** | 2026-11-27 | `91587ba0` | motherbee + spokes (core), three binaries, one branch each: the Digital Executive's stage 2, release 2C ([stage 2](../docs/digital-executive-v1-stage-2.md) §1, §9, §10). SY.identity: `ILK_CREATE_VIRTUAL` born with its id (idempotent, `ILK_ID_TAKEN`), `ILK_SET_WORKS_FOR`, `ILK_SET_DOCUMENT` (migration v8, the file in `blob/people/`, its hash in the SHM), `ILK_DELETE`'s `node_retired` reason; the orchestrator: `kill_node`'s `retire_instance`, the people folder; SY.admin: `create_virtual_person`'s `ilk_id`, `set_ilk_works_for`, `set_person_document`, `kill_node`'s retire | ✅ replaced by 0.1.160 | snapshot `pre-ed2c-0-1-159` (deleted 2026-11-27) · `apt install fluxbee=0.1.158` (migration v8 only adds two columns) |
 | **0.1.158** | 2026-11-27 | `c285c567` | motherbee + spokes (core), shared code alone: the Digital Executive's stage 2, release 2B ([stage 2](../docs/digital-executive-v1-stage-2.md) §6.1, §7, §10): the AI SDK's `speaks_as` (an agent speaks as the person its config names while identity confirms it, its own ILK otherwise) and the IO family's `io.person_ilk` (an inbound message names the IO's person as `dst_ilk` while identity confirms it), unset everywhere; the identity SHM's last 8 bytes named `document_hash` | ✅ replaced by 0.1.159 | snapshot `pre-sdk-ed2-0-1-158` (deleted 2026-11-27) · `apt install fluxbee=0.1.157` (nothing one-way) |
@@ -170,6 +171,41 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.162 — capabilities, the shared code: two roles and the conscious's tool (the Digital Executive's stage 3, release 3A)
+
+- **Date:** 2026-11-27 (ART) · **Previous version:** 0.1.161 · **Commit:** `7da4782b`.
+- **Scope:** motherbee and the three spokes. Shared code (the SHM's copies, the Rust, AI and Go SDKs),
+  with SY.identity's role check and ai.generic's registration of the tool that the SDK holds.
+- **Why:** stage 3 (the operator, 2026-11-28): a capability works behind the ED, its door a WF; the
+  conscious finds its capabilities in identity and asks them within its turn, and a result that
+  comes later reaches the person.
+- **What changed (`coa/ed3-sdk3`, one builder's four commits):** the roles `connector` and
+  `capability` (a `capability` may work for nobody); `ask_capability` (listing without a
+  capability: each door's `WF_HELP`, cached until the SHM moves; asking: `CAPABILITY_REQUEST`,
+  `request_id`, `ed_ilk`, the conversation from the turn, 60 s); the turn on a
+  `meta.context.capability_result` from one of the ED's doors, answered to the conversation's IO
+  with the person as `dst_ilk`, never back to the door; the Go SDK's helpers for 3B.
+- **Build:** CI green on the branch and on the head `7da4782b`. Build on fb-build
+  02:14:37–02:43:47Z (29.2 min).
+- **The deploy:** `ops deploy 0.1.162 --snapshot pre-ed3a-0-1-162 --drop pre-a372-0-1-161` in 283 s;
+  health clean.
+- **Checked on 8.x (the gate, gate0262, 02:50–03:00Z; `scratchpad/gate-tools/r162_gate.py`,
+  git-ignored; 35 PASS; one tool FAIL re-read PASS; one model call):**
+  - the smoke;
+  - **the roles:** a throwaway node set to work for a person as its `connector` (role 4 in worker1's
+    SHM), then as a `capability` for nobody (role 5); `agent` for nobody refused; cleared;
+  - **an ED born through Cloud's door** (active 5.0 s after the order), read back confirmed;
+  - **the tool:** the ED's conscious lists `ask_capability`. (The tool first checked that another
+    agent's help did not list it; every agent's help lists every base tool's card with its
+    `present_when`, as the thread-state tools, and this one says it is present only with
+    `speaks_as`: re-read.)
+  - **a message to the ED, as in 0.1.161:** the writer's temporary ILK to the ED, the ED's answer to
+    the writer;
+  - the ED removed in 3.4 s; cleaned.
+- **Next:** 0.1.163, 3B, the WF's door.
+- **Rollback:** snapshot `pre-ed3a-0-1-162`, or `apt install fluxbee=0.1.161` and 0.1.161's
+  `update_installation`: nothing one-way.
 
 ## 0.1.161 — A-372: an ED's IO on a worker provisions its writer at the primary
 
