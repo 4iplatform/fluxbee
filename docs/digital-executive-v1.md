@@ -872,3 +872,20 @@ Options (b), a label over several agents, and (c), one node that does everything
     agents behind it are `agent`, its IOs to external systems `connector`. The capability's name,
     description and the requests it takes go in the ED's document, written by SY.deploy at each
     deployment, which the conscious reads.
+
+## 38. Notes, 2026-11-28 (later): the WF door agreed
+
+- **The operator:**
+  1. yes: the WF answers only the ED; that a WF receives messages is fine, it acts on events, a
+     timer or a message;
+  2. yes: the `reply` action is part of extending the WF as its uses need;
+  3. yes: the ED must have the functions to know how to talk to a capability, read from the WF's
+     help, so that changing the WF's program needs nothing but that, and the rest adapts.
+- **Facts read for it (2026-11-28):** a WF node already answers `HELP` with its definition's
+  `description`, its states and its `input_schema` (`handleWFHelp`, `go/nodes/wf/wf-generic/node/
+  dispatch.go`). A WF's name is `[a-z][a-z0-9]*(\.[a-z0-9]+)*` (`go/sy-wf-rules/node/types.go`), so
+  `collections.ed4qm7k2xa` is one.
+- **So:** the capability's interface is its entry WF's definition, its `description` and
+  `input_schema` (with each action's own description), read by the conscious through the WF's help.
+  The ED's document need not list the requests.
+- **Next:** stage 3's build design, consolidated: [digital-executive-v1-stage-3](digital-executive-v1-stage-3.md).
