@@ -4,11 +4,11 @@ SY.architect ("Archi") is the operator's agent. It serves a chat UI and API on t
 loopback. The operator asks in plain language; Archi reads the system through SY.admin, and turns
 requested changes into executor plans that SY.admin runs after the operator confirms. It also
 runs a design pipeline for larger work, publishes runtime packages, keeps the agent assets
-(roles, skills, handbooks, personalities) that AI nodes use, and shows the stored conversation
-turns.
+(roles, skills, handbooks, personalities) that AI nodes use, keeps its CI of deployable packages
+and publishes it to SY.deploy, and shows the stored conversation turns.
 
 Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types.rs`,
-`reconciler.rs`, `artifact_loop.rs`, `failure_classifier.rs`, `messages_db.rs`).
+`reconciler.rs`, `artifact_loop.rs`, `failure_classifier.rs`, `messages_db.rs`, `package_ci.rs`).
 
 | | |
 | --- | --- |
@@ -17,7 +17,7 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
 | Role | motherbee (by configuration) |
 | systemd unit | `sy-architect.service`: `Restart=always`, `RestartSec=5`, `TimeoutStopSec=15`; no role gate (`gen_unit`) |
 | Listens on | HTTP `127.0.0.1:3000` by default; reaches the mesh through the local router socket |
-| State | `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/architect.lance`, `/var/lib/fluxbee/state/{pipeline,manifests,cookbook}/`, blob `agent-assets/` |
+| State | `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/architect.lance`, `/var/lib/fluxbee/state/{pipeline,manifests,cookbook,packages}/`, blob `agent-assets/`; reads `/usr/share/fluxbee/solutions/` |
 
 ## Where it runs
 
@@ -49,9 +49,11 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
      as they are. The file is rewritten atomically, and the journal gets one INFO line
      (`cookbook seeds upgraded`) naming the entries replaced and both versions.
    - A seed edit raises that seed's `seed_version` (`a_changed_seed_raises_its_seed_version`).
-6. Starts the system and incoming workers and a status refresh every 60 s
-   (`STATUS_REFRESH_INTERVAL_SECS`), then binds HTTP: `JSR_ARCHITECT_LISTEN`, else
-   `architect.listen`, else `127.0.0.1:3000` (`DEFAULT_ARCHITECT_LISTEN`).
+6. Starts the system and incoming workers, a status refresh every 60 s
+   (`STATUS_REFRESH_INTERVAL_SECS`) and the publish of its CI to SY.deploy
+   (`package_publish_loop`, [Deployable packages](#deployable-packages-archis-ci)), then binds
+   HTTP: `JSR_ARCHITECT_LISTEN`, else `architect.listen`, else `127.0.0.1:3000`
+   (`DEFAULT_ARCHITECT_LISTEN`).
 
 ## HTTP API
 
@@ -83,9 +85,10 @@ Each chat turn first takes a new version of the installation file, when there is
 (`architect_takes_new_installation_ai`, [LLM, key and usage records](#llm-key-and-usage-records)).
 Then `handle_chat_message` looks at each message in this order:
 
-1. `CONFIRM`: runs what is waiting for confirmation (a pipeline checkpoint, or a plan the plan
-   compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`); once such a plan
-   ran, the chat says what each step did ([What the chat says after a confirmed
+1. `CONFIRM`: runs what is waiting for confirmation (a pipeline checkpoint, a package release
+   `release_package` staged, or a plan the plan compiler prepared, sent with labels
+   `{"origin": "plan_compiler_confirmed"}`); once such a plan ran, the chat says what each step
+   did ([What the chat says after a confirmed
    plan](#what-the-chat-says-after-a-confirmed-plan)). `CANCEL` or `ABORT` drops it; a dropped
    plan answers "Plan discarded." in mode `chat` (since 0.1.137; before, "Programmer plan
    discarded." in mode `executor`, which the UI drew as a run marked "done"). An SCMD never waits
@@ -102,7 +105,7 @@ Then `handle_chat_message` looks at each message in this order:
 The LLM's tools (`ArchitectAdminReadToolsProvider`): `fluxbee_system_get`, `list_agent_assets`,
 `get_agent_asset`, `delete_agent_asset`, `create_agent_role_asset`, `create_agent_skill_asset`,
 `create_agent_handbook_asset`, `create_agent_personality_asset`, `fluxbee_start_pipeline`,
-`fluxbee_pipeline_action`, `fluxbee_plan_compiler`.
+`fluxbee_pipeline_action`, `list_packages`, `release_package`, `fluxbee_plan_compiler`.
 
 Sessions, messages, operations, pipeline runs and manifest references live in LanceDB at
 `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/architect.lance` (`architect_db_path_for_hive`;
@@ -147,7 +150,8 @@ delete, and the user policy's clear (`opa_clear`). Before 0.1.152 the change was
 operator's `update_tenant`, `set_tenant_sponsor`, `add_tap`, `delete_tap` and `opa_clear` ran
 unrecorded, as reads. Since the Digital Executive's release 2D (its stage 2) the list adds
 whom an ILK works for (`set_ilk_works_for`), a person's document (`set_person_document`), and a
-deployment and its removal (`cd_deploy`, `cd_remove`).
+deployment and its removal (`cd_deploy`, `cd_remove`), and since release 3C (its stage 3) a
+package's publish and its withdrawal (`cd_publish`, `cd_unpublish`).
 
 **The Digital Executive's actions** (docs/digital-executive-v1-stage-2.md §1, §2):
 `PUT /hives/{hive}/identity/ilks/{ilk_id}/works-for` (`set_ilk_works_for`, the body
@@ -159,7 +163,11 @@ hive: `POST /cd/deployments` (`cd_deploy`, the body as it came), `GET /cd/deploy
 keys alone), `POST /cd/deployments/{id}/remove` and `POST /cd/groupings/{id}/remove` (`cd_remove`,
 the path's id, refused when the body names the other), `GET /cd/catalog` (`cd_catalog`) and
 `GET /cd/tree?tenant_id=` (`cd_tree`). The two writes are the operator's SCMD only, never the AI's
-(`admin_action_allows_ai_write` leaves them out); the four reads are reads.
+(`admin_action_allows_ai_write` leaves them out); the four reads are reads. Since release 3C,
+`POST /cd/packages` (`cd_publish`, the body `{"package": {...}}` as it came) and
+`POST /cd/packages/{id}/{version}/unpublish` (`cd_unpublish`, `{id, version}` from the path,
+refused when the body names either) are recorded changes too, never the AI's: its release goes
+through `release_package` and the operator's CONFIRM.
 
 **An identity's lifecycle** (since 0.1.152, the operator's ask) has SY.admin's own routes, each
 translated as SY.admin's route sends it ([SY.identity](sy-identity.md)):
@@ -222,10 +230,11 @@ recorded mutation SY.admin runs as a command (`action_in_command_log`): a hive's
 node's run, start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN
 rule, a tap, an ILK's or a tenant's change (a purge included, since 0.1.152), a node's config, a
 message to a node, the storage, a WF instance's cancel, a deployment and its removal (`cd_deploy`,
-`cd_remove`, which SY.admin runs as commands before it forwards them to SY.deploy). `update`,
-`sync_hint` and the OPA and wf-rules writes (`opa_clear` among them) go another way in SY.admin
-and are not in it, so a timed-out one stays open in that chat, as before: Archi waits for each as
-long as SY.admin does, or longer. An identical request there is refused with a text that says so
+`cd_remove`), a package's publish and withdrawal (`cd_publish`, `cd_unpublish`), which SY.admin
+runs as commands before it forwards them to SY.deploy. `update`, `sync_hint` and the OPA and
+wf-rules writes (`opa_clear` among them) go another way in SY.admin and are not in it, so a
+timed-out one stays open in that chat, as before: Archi waits for each as long as SY.admin does,
+or longer. An identical request there is refused with a text that says so
 (`operation_error_message`, `open_operation_is_read`): the record cannot be settled in that chat;
 read the state, and repeat it in a new chat. Before 0.1.139 only an `add_hive` was read, and a
 `remove_hive` that outlasted Archi's 30 s, or a node's purge SY.admin waits 180 s for, stayed open
@@ -620,6 +629,60 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
 Runs are stored in the `pipeline_runs` table; a restart marks unfinished ones `interrupted`, and
 the session's recovery route resumes or discards them.
 
+## Deployable packages (Archi's CI)
+
+Archi keeps the packages SY.deploy deploys (docs/digital-executive-v1-stage-3.md §2, §3, §11),
+in SY.deploy's format, each an `executive`, a `capability` or an `infrastructure`
+(`src/bin/sy_architect/package_ci.rs`).
+
+- **Two stores.** The packages Fluxbee ships, installed read-only by the .deb at
+  `/usr/share/fluxbee/solutions/<id>/<version>.json` (store `system`): Archi reads them and
+  never writes, edits or removes one. Archi's own, at
+  `/var/lib/fluxbee/state/packages/<id>/<version>.json` (store `own`), each written once.
+- **The listing** (`list_packages`, `SCMD: curl -X GET /architect/packages`, Archi's own path):
+  each package's id, version, kind, origin, title, `offered_to`, store, path and its publish this
+  run; with an id and a version (`GET /architect/packages/{id}/{version}`), that package whole.
+  A file Archi cannot publish as it is is listed with its `error`: its `id` and `version` not its
+  place's, not JSON, an origin that is not its store's (`system` for the shipped ones, `custom`
+  or `catalog` for Archi's own), or larger than a publish carries (`PACKAGE_MAX_BYTES`, the
+  128 KiB frame less 8 KiB for the command's envelope). Hidden files and files other than `.json`
+  are not packages.
+- **The publish** (`package_publish_loop`, started with Archi): every package of both stores, one
+  by one, the shipped ones first, with `cd_publish` (`{"package": ...}`) to the motherbee's
+  SY.admin, which forwards it to SY.deploy.
+  - SY.deploy's `kept` (`new` or `already`) settles a package; so does a refusal: any error that
+    is not retryable (`PACKAGE_INVALID`, `PACKAGE_CHANGED`, `PACKAGE_TOO_LARGE`, ...), and a
+    package Archi cannot send as it is, refused without a send. A refused package is not sent
+    again until its file changes (its bytes' SHA-256).
+  - No answer, SY.admin's `DEPLOY_UNAVAILABLE` or an answer marked `retryable` is no verdict: the
+    pass stops there, and the next one, 10 s later, goes on (`PACKAGE_PUBLISH_RETRY`). The log
+    says so once.
+  - Once every package has its verdict, a pass runs each minute (`PACKAGE_PUBLISH_RESCAN`) and
+    sends only a package new or changed since; a package whose file is gone is forgotten.
+  - Each pass that changed an outcome logs one line, `published its CI to SY.deploy: <n> new,
+    <n> already, <n> refused [<id> <version> (<store>): <why>; ...]` (a warning when one is
+    refused), and `GET /api/status` keeps it as `packages`: `new`, `already`, `refused` and
+    `pending`, each refused or pending with its reason. What each package's publish did is kept
+    in memory only: the next start publishes the CI again, and SY.deploy answers `already` for
+    what it holds.
+  - A publish is logged by its package's id, version, kind, origin and size, never whole
+    (`admin_params_for_log`).
+- **A release** comes only from the chat, with the operator's CONFIRM (§11):
+  - `release_package` takes the whole package and checks what Archi needs to keep it: an object
+    whose id and version are each 1 to 64 of `[a-z0-9._-]`, its kind one of the three (never the
+    `ed` alias), its origin `custom` or `catalog` (never `system`), a size a publish carries, and
+    a version neither store holds. SY.deploy checks the rest on the publish. A refusal comes back
+    as the tool's error.
+  - A staged release takes the place of a staged plan in that chat, as a new plan takes a staged
+    release's, and the chat holds it as `package_release`: other messages are `blocked`, and the
+    UI offers *Release package* or *Discard*.
+  - `CONFIRM` writes it once (the whole file under a hidden name, then linked in, mode 0644; a
+    version already there is refused) and publishes it at once, one publish at a time with the
+    CI's passes. `CANCEL` drops it: "Package release discarded: nothing was written."
+  - SY.deploy's refusal removes the file, and the chat says why. A publish with no verdict leaves
+    the file: the CI's next pass sends it, and removes it if SY.deploy refuses it then.
+  - An SCMD `cd_publish` sends a package as written and writes nothing to the CI.
+
 ## Messages page
 
 `messages_db.rs` reads the `turns` table of PostgreSQL database `fluxbee_storage`, the one
@@ -771,8 +834,8 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
   `VAULT_SECRET_CHANGED` is not gated.
 - **Incoming channel**: `user`, `chat` and `text` messages, stored to an impersonation session.
 - **Sends**: `ADMIN_COMMAND` to `SY.admin@<hive>` (reads, SCMD, the executor, `inventory` for
-  the status), vault reads, usage records, impersonation messages. Admin timeouts: 120 s for the
-  executor (`JSR_ADMIN_EXECUTOR_TIMEOUT_SECS`), and 35 min more for each `add_hive` step of the
+  the status, `cd_publish` for its CI), vault reads, usage records, impersonation messages.
+  Admin timeouts: 120 s for the executor (`JSR_ADMIN_EXECUTOR_TIMEOUT_SECS`), and 35 min more for each `add_hive` step of the
   plan it runs, since SY.admin's executor follows each join to its end, for up to 30 min, before
   the next step; 90 s more for each workflow deploy or removal; 240 s more for each
   `set_installation_ai` step (`EXECUTOR_INSTALLATION_WAIT_SECS`), past SY.admin's 210 s ceiling for
@@ -793,8 +856,11 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
 - `/var/lib/fluxbee/nodes/SY/SY.architect@<hive>/architect.lance`: sessions and pipeline runs.
 - `/var/lib/fluxbee/state/pipeline/<run_id>/`, `/var/lib/fluxbee/state/manifests/`,
   `/var/lib/fluxbee/state/cookbook/`, `/var/lib/fluxbee/state/software-upload-staging/`.
+- `/var/lib/fluxbee/state/packages/<id>/<version>.json`: Archi's released packages, each written
+  once; it reads the shipped ones at `/usr/share/fluxbee/solutions/<id>/<version>.json`.
 - The blob root: attachments and uploads (`staging/`, then `active/`), and `agent-assets/`.
-- Pending plans and the status cache are kept in memory only.
+- Pending plans, staged releases, the CI's publish outcomes and the status cache are kept in
+  memory only.
 
 ## Failure behavior
 
@@ -808,7 +874,8 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
 ## Health
 
 - `curl -s http://127.0.0.1:3000/healthz` on the motherbee: `status` (`loading`, `ok`,
-  `degraded`), `router_connected`, `admin_available`, and the state of the main components.
+  `degraded`), `router_connected`, `admin_available`, the state of the main components, and
+  `packages`, what the CI's publish to SY.deploy did.
 - `systemctl status sy-architect`; the log line `sy.architect axum listening` marks HTTP up.
 - In the chat: `SCMD: curl -X GET /architect/control/config-get` shows whether the AI key and the
   messages database are configured.

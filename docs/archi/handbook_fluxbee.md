@@ -1850,12 +1850,132 @@ and removes them (docs/digital-executive-v1-stage-2.md §2-§9).
   - `cd_remove` (`POST /cd/deployments/{deployment_id}/remove` or
     `POST /cd/groupings/{grouping_id}/remove`): retires the nodes it made and marks the ED's ILK.
     It answers *accepted*; nothing is purged.
-- **Only as the operator's SCMD:** never a plan step, never `fluxbee_system_get` for the two
+  - `cd_publish` (`POST /cd/packages`, `{"package": {...}}`) and `cd_unpublish`
+    (`POST /cd/packages/{id}/{version}/unpublish`): a package into SY.deploy's catalog, and out of
+    it (below).
+- **Only as the operator's SCMD:** never a plan step, never `fluxbee_system_get` for the
   writes. The four reads you may run yourself. A `cd_deploy` names no secret: a credential is a
   vault key name, which must exist first.
 - **No body carries `_caller`:** SY.admin adds who asks, and refuses a body that names it.
 - **An ED is born by `cd_deploy` and ends by `cd_remove`,** each journaled by SY.deploy: do not
   assemble one step by step with `run_node`, `create_virtual_person` and the relations below.
+
+**Packages: your CI** (docs/digital-executive-v1-stage-3.md §1-§3). What SY.deploy deploys is a
+package, a released version of a solution, in SY.deploy's format; a `cd_deploy` names one as its
+`source` (`{"id": ..., "version": ...}`).
+
+- **Three kinds:**
+  - `executive` founds an ED (its person and document, its conscious, its channels), into a new
+    ED grouping;
+  - `capability` extends an ED: agents behind it, connectors to external systems, and a WF at its
+    door. Into the ED's grouping, or into the tenant's for all of its EDs;
+  - `infrastructure` serves all of a tenant's EDs, into the tenant's grouping.
+- **`origin`:** `system` (ships with Fluxbee), `catalog` (yours, for every tenant) or `custom`
+  (yours, for one tenant).
+- **`offered_to`:** `{"tenants": "all"}` or `{"tenants": ["tnt:..."]}`; a `custom` package names
+  exactly one tenant. A capability may add `"eds": "all"` (the default) or
+  `"eds": ["<short_id>", ...]`.
+- **Two stores,** which `list_packages` lists (and `SCMD: curl -X GET /architect/packages`), each
+  package with its kind, origin, title, place and publish:
+  - the packages Fluxbee ships, at `/usr/share/fluxbee/solutions/<id>/<version>.json`,
+    read-only. Never edit one. To change one, read it whole (`list_packages` with its id and
+    version), derive a `custom` copy under a new id and release that;
+  - the ones you released, at `/var/lib/fluxbee/state/packages/<id>/<version>.json`. Each is
+    written once: a new content takes a new version.
+- **The publish is automatic.** At its start Archi publishes its whole CI to SY.deploy, one
+  package at a time (`cd_publish` through SY.admin), and a release at once. Never stage a publish.
+  - SY.deploy answers each `new` or `already`, or refuses it with why: `PACKAGE_INVALID`,
+    `PACKAGE_CHANGED` (the same id and version with another content) or `PACKAGE_TOO_LARGE` (a
+    message is at most 128 KiB).
+  - A refused package is not sent again until its file changes. Archi's status keeps the
+    outcome (`packages`), and `list_packages` shows each package's.
+- **A release comes only from this chat,** with the operator's CONFIRM. `release_package` with
+  the whole package stages it; CONFIRM writes it and publishes it.
+  - When SY.deploy refuses it, its file is removed and the chat says why: fix the package and
+    release it again.
+  - An SCMD `cd_publish` sends a package as written and keeps no copy in your CI.
+- **A withdrawal** (`cd_unpublish`) is the operator's SCMD. SY.deploy stops offering that
+  version, and the deployments that run it keep it.
+
+**The format,** as SY.deploy reads it (its refusal names what is wrong):
+
+- `schema` 1, `id` and `version` (each 1 to 64 of `[a-z0-9._-]`), `kind`, `origin`,
+  `offered_to`, `title` and `description` (Cloud's catalog shows both), `blanks`, `founds` (an
+  executive only), `nodes`, `vault`.
+- **`blanks`:** what the user fills in Cloud's form, each `{name, type, description}`. The
+  types: `name`, `personality`, `whatsapp_channel`, `vault_key` (with its `resource_type`),
+  `tenant_ilk`, `value`.
+  - A blank's value goes in place as `{"$blank": "<name>"}`, or `"<name>.<field>"` for a field
+    of one. With `"optional": true`, a key with no value is dropped.
+- **What SY.deploy fills** from the grouping: `{"$ref": "grouping.ilk_id"}` (the ED's ILK),
+  `grouping.short_id`, `grouping.tenant_id`, `grouping.hive`, `grouping.conscious` (the ED's
+  conscious's node name), and `nodes.<role>.node_name` (another node of the package).
+- **`nodes`,** each with its `role` (its name in the package), `kind`, `middle` and `work_role`:
+  - an `AI`: `runtime: "ai.generic"`, its `provider`, its `config` and its `definition`'s assets
+    (`role`, `skills`, `handbooks`, `personality`, each written whole);
+  - an `IO`: its runtime and its `config`;
+  - a `WF`: its `definition`, the WF definition, instead of a config.
+  - Its `work_role`: an executive's `conscious` or `channel`; a capability's `agent`,
+    `connector` (an IO to an external system) or `capability` (its door, a WF, exactly one); an
+    infrastructure's `agent` or `connector`.
+- **`vault`:** each `{"key": {"$blank": ...}, "resource_type": ..., "to": "<role>"}`, a key of
+  the tenant given to a node.
+
+**A capability.** Its door is a WF (§4.2.8, docs/wf-orchestration-v1.md §5.6); behind it, its
+agents (`AI`, `work_role: agent`) and its connectors (`IO`, `work_role: connector`). It never
+talks with people.
+
+- **Names:** the door's workflow is `<middle>.<short_id>`, its node
+  `WF.<middle>.<short_id>@<hive>` (`<middle>.<tenant short id>` for every ED of a tenant); an
+  agent is `AI.<middle>.<short_id>@<hive>`. Each node works for the ED with its role; none speaks
+  as it.
+- **The door's `start_from`:** `[{"$ref": "grouping.conscious"}]` for one ED;
+  `[{"consciouses": "tenant"}]`, written as is, for every ED of the tenant.
+- **The door names its agents** by `{"$ref": "nodes.<role>.node_name"}`, in `target` and in
+  `event_match.src`.
+- **Check the door before you release it:** `POST /hives/{hive}/wf-rules/check` with its
+  templates filled with sample values (a conscious `AI.ed4qm7k2xa@worker1`).
+
+The smallest capability: §4.2.8's door before one agent that reads the CRM.
+
+```json
+{
+  "schema": 1, "id": "billing", "version": "1", "kind": "capability", "origin": "custom",
+  "offered_to": {"tenants": ["tnt:550e8400-e29b-41d4-a716-446655440000"]},
+  "title": "Invoices", "description": "The state of an invoice, by its number.",
+  "blanks": [],
+  "nodes": [
+    {"role": "door", "kind": "WF", "middle": "billing", "work_role": "capability",
+     "definition": {
+       "wf_schema_version": "1", "workflow_type": "door",
+       "description": "Invoices: the state of an invoice, by its number.",
+       "start_from": [{"$ref": "grouping.conscious"}],
+       "request_actions": [{"name": "invoice_state", "description": "The state of an invoice, by its number."}],
+       "input_schema": {"type": "object", "required": ["action", "number"], "properties": {"action": {"type": "string", "enum": ["invoice_state"]}, "number": {"type": "string"}}},
+       "initial_state": "reading", "terminal_states": ["answered", "failed"],
+       "states": [
+         {"name": "reading",
+          "entry_actions": [{"type": "send_message", "target": {"$ref": "nodes.clerk.node_name"}, "meta": {"msg": "INVOICE_STATE"},
+                             "payload": {"type": "text", "content": "Read this invoice's state in the CRM."}, "vars": {"number": {"$ref": "input.number"}},
+                             "menu": {"options": [{"name": "found", "description": "The CRM has the invoice.", "params": {"state": {"type": "string", "enum": ["paid", "pending", "overdue"]}}}]}}],
+          "transitions": [
+            {"event_match": {"src": {"$ref": "nodes.clerk.node_name"}}, "guard": "event.context.evaluation.option == 'found'", "target_state": "answered",
+             "actions": [{"type": "reply", "status": "done", "result": {"state": {"$ref": "event.context.evaluation.params.state"}}}]},
+            {"event_match": {"src": {"$ref": "nodes.clerk.node_name"}}, "guard": "true", "target_state": "answered",
+             "actions": [{"type": "reply", "status": "error", "error_code": "INVOICE_NOT_FOUND"}]}]},
+         {"name": "answered"},
+         {"name": "failed", "entry_actions": [{"type": "reply", "status": "error", "error_code": "CAPABILITY_FAILED", "on_error": "continue"}]}]}},
+    {"role": "clerk", "kind": "AI", "middle": "billing", "runtime": "ai.generic", "work_role": "agent",
+     "provider": "anthropic", "config": {"behavior": {"kind": "ai_chat", "model": "claude-sonnet-5-5"}},
+     "definition": {"role": {"asset_type": "role", "name": "Billing clerk",
+                             "description": "You read invoices in the CRM and answer with what it says."}}}
+  ],
+  "vault": []
+}
+```
+
+The door's own `$ref`s (`input.number`, `event.context.evaluation...`) are the WF's, never
+SY.deploy's: SY.deploy fills only `grouping.*` and `nodes.*`.
 
 **A node's person (`works_for`).** Every ILK in identity may name the person it works for, with
 its role: `conscious` (the AI that speaks as the person), `channel` (an IO that carries the person's
