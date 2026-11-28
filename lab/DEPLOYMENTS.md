@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.163** | 2026-11-28 | `27909748` | motherbee + spokes (core), the WF engine and SY.wf-rules: the Digital Executive's stage 3, release 3B ([stage 3](../docs/digital-executive-v1-stage-3.md) §5, §6.1): a capability's door, a WF that `start_from` the ED's conscious (or `{"consciouses": "tenant"}`), checked in identity; `reply` (`CAPABILITY_REQUEST_RESPONSE`, done, pending or error) and `notify` (a later result to the conscious that asked); `request_actions` in its `WF_HELP`; the compiler refusing any other send to a starter conscious; only a request from a conscious gets in | ✅ live, gate0263 30 PASS, no FAIL | snapshot `pre-ed3b-0-1-163` · `apt install fluxbee=0.1.162` (the WF store's schema v8 adds a column) |
+| **0.1.164** | 2026-11-28 | `9fb56246` | motherbee + spokes (core), four branches: the Digital Executive's stage 3, release 3C ([stage 3](../docs/digital-executive-v1-stage-3.md) §1–§4, §7): the solution package in the core library (kinds executive/capability/infrastructure, origin, offered_to, WF nodes with deploy templates); SY.deploy's catalog from what Archi publishes (`cd_publish`/`cd_unpublish`), the tenant grouping, capability deployments with their door, `plain-ed` out of its binary and shipped in `/usr/share/fluxbee/solutions/`; Archi's CI published at its start and `release_package` from its chat; SY.admin's publish actions and SY.deploy's WF row; SY.wf-rules' delete that retires its node | ✅ live, gate0264 41 PASS (one tool FAIL re-read PASS) | snapshot `pre-ed3c-0-1-164` · `apt install fluxbee=0.1.163` (SY.deploy's published/ records stay, unread) |
+| **0.1.163** | 2026-11-28 | `27909748` | motherbee + spokes (core), the WF engine and SY.wf-rules: the Digital Executive's stage 3, release 3B ([stage 3](../docs/digital-executive-v1-stage-3.md) §5, §6.1): a capability's door, a WF that `start_from` the ED's conscious (or `{"consciouses": "tenant"}`), checked in identity; `reply` (`CAPABILITY_REQUEST_RESPONSE`, done, pending or error) and `notify` (a later result to the conscious that asked); `request_actions` in its `WF_HELP`; the compiler refusing any other send to a starter conscious; only a request from a conscious gets in | ✅ replaced by 0.1.164 | snapshot `pre-ed3b-0-1-163` (deleted 2026-11-28) · `apt install fluxbee=0.1.162` (the WF store's schema v8 adds a column) |
 | **0.1.162** | 2026-11-27 | `7da4782b` | motherbee + spokes (core), shared code: the Digital Executive's stage 3, release 3A ([stage 3](../docs/digital-executive-v1-stage-3.md) §2, §6, §6.1): identity's roles `connector` (4) and `capability` (5, which may work for nobody: a capability for all of a tenant's EDs) in the SHM's three copies and SY.identity; the AI SDK's `ask_capability` (an ED's capabilities from identity, their doors' help, a `CAPABILITY_REQUEST` with the turn's conversation, 60 s) and the turn on a later result answered to the person's IO; ai.generic registers it for a conscious; the Go SDK's `LookupIlkByNode`, `IsConsciousOf`, the ILK's tenant | ✅ replaced by 0.1.163 | snapshot `pre-ed3a-0-1-162` (deleted 2026-11-28) · `apt install fluxbee=0.1.161` (nothing one-way) |
 | **0.1.161** | 2026-11-27 | `aec9d4b6` | motherbee + spokes (core), io.wapp alone: FINDINGS A-372, a writer is provisioned at the primary's SY.identity by default, as io.api does (a worker's io.wapp asked its own hive's replica, `NOT_PRIMARY`) | ✅ replaced by 0.1.162 | snapshot `pre-a372-0-1-161` (deleted 2026-11-28) · `apt install fluxbee=0.1.160` (nothing one-way) |
 | **0.1.160** | 2026-11-27 | `ee04ca05` | motherbee + spokes (core), five branches: the Digital Executive's stage 2, release 2D ([stage 2](../docs/digital-executive-v1-stage-2.md) §2–§11): the new node SY.deploy (orders `cd_deploy`/`cd_get`/`cd_list`/`cd_remove`/`cd_catalog`/`cd_tree`, the source `plain-ed` 1 with the operator's native texts, one step builder and runner, journaled, converging on a retry or a restart), SY.admin's six orders and SY.deploy's row, Cloud's six ops (IO.cloud's translation), ai.generic's `speaks_as`, io.wapp's `io.person_ilk`, Archi's routes and its three manifest versions kept, the packaging | ✅ replaced by 0.1.161 (gate0260 50 PASS; A-372 fixed there) | snapshot `pre-ed2d-0-1-160` (deleted 2026-11-28) · `apt install fluxbee=0.1.159` (SY.deploy's state stays on disk, unread) |
@@ -172,6 +173,61 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.164 — packages: Archi's CI, its publish, capabilities added from Cloud (the Digital Executive's stage 3, release 3C)
+
+- **Date:** 2026-11-28 (ART) · **Previous version:** 0.1.163 · **Commit:** `9fb56246`.
+- **Scope:** motherbee and the three spokes. Four branches: SY.deploy with the core library and the
+  packaging, SY.admin with the Rust SDK's Cloud params, SY.wf-rules, Archi.
+- **Why:** stage 3 §3–§4 (the operator, 2026-11-28): SY.deploy only deploys solutions, which Archi
+  publishes from its CI; Cloud composes an ED from the catalog's parts.
+- **What changed:**
+  - **SY.deploy (`coa/ed3c-deploy`):** `src/solution_package.rs` (the format, its validator; in a
+    WF node's definition only `grouping.*`/`nodes.*`/`assets.*` refs are SY.deploy's, the rest the
+    WF's own); its catalog from publishes (`kept: new|already`, `PACKAGE_INVALID`,
+    `PACKAGE_CHANGED`, `PACKAGE_TOO_LARGE`, `CATALOG_NOT_READY`); `cd_catalog` by kind and ED; the
+    tenant grouping; a capability into an ED (its door by `wf_rules_compile_apply`, its ILK learned
+    from the node's status, its relation set); its removal (`wf_rules_delete` with `retire`, the
+    rest retired); `plain-ed` shipped in the .deb at `/usr/share/fluxbee/solutions/`, the copy on
+    8.x adopting the published offer.
+  - **SY.admin (`coa/ed3c-admin`):** `cd_publish`/`cd_unpublish` (Archi, the operator's HTTP, never
+    Cloud); SY.deploy's row with the four WF actions; `cd_catalog`'s `kind` and `grouping_id` for
+    Cloud too; registry version 31.
+  - **SY.wf-rules (`coa/ed3c-wfrules`):** a workflow's delete with `retire: true` retires its WF
+    node instead of purging it (an ILK with history is kept), for a capability's door.
+  - **Archi (`coa/ed3c-archi`):** its CI (the shipped packages read-only, its own written once),
+    published at its start and every 60 s for new files; `release_package` staged for the
+    operator's CONFIRM; SCMD routes; the handbook's packages.
+- **Review:** mine of the builders' reports; three contract gaps settled before the build (a WF's
+  own `$ref`s pass through SY.deploy's templates; a WF node has no `runtime`; a door's removal
+  retires it, which needed SY.wf-rules' change). CI: each branch green; on the head, Go's docs test
+  refused the handbook's package example (its door's templates unfilled): a test-only fix
+  (`61869fc1`, filling the templates as SY.deploy does) went green before the deploy; the binaries
+  are `9fb56246`'s. Recorded: A-373..A-375.
+- **Build:** on fb-build 04:44:57–05:31:30Z (46.6 min).
+- **The deploy:** the mark at 05:33:30Z; `ops deploy 0.1.164 --snapshot pre-ed3c-0-1-164 --drop
+  pre-ed3b-0-1-163` in 299 s; health clean.
+- **Checked on 8.x (the gate, gate0264, 05:36–05:47Z; `scratchpad/gate-tools/r164_gate.py`,
+  git-ignored; 41 PASS; one tool FAIL re-read PASS; Archi's release turn and the conscious's turns):**
+  - **Archi's CI at its start:** `plain-ed` published (`already`: SY.deploy's copy took its offer),
+    nothing refused; SCMD lists it as `system`; Cloud's `cd_catalog` shows it as an executive.
+  - **A release from Archi's chat:** Archi checked the door with `wf_rules_check` on a sample
+    conscious, staged `gate-billing` 1 (a capability, custom for `pruebas`); CONFIRM wrote it once
+    and published it; Cloud's catalog shows it.
+  - **An ED from the published system package** through Cloud's door, active 5.6 s after the order.
+  - **The capability added through Cloud's door,** active in 6.1 s: its door
+    `WF.billing.<short>@worker1` running, working for the ED as its capability; `cd_tree` shows it.
+  - **The ED through it:** an invoice's state answered within the turn ("figura como pagada"); a
+    reconciliation `pending`, then, a minute later, "Quedan 2 facturas sin pagar: A-1040 y A-1051"
+    to the person on the same thread. (The tool's read cut that multi-line answer at its first line:
+    re-read in full.)
+  - **The capability removed** in 4.1 s: its door gone, its ILK `node_retired` and kept, the ED
+    untouched; **the ED removed** in 3.3 s.
+  - **Cleaned:** the gate's ILKs and writer, its credential, the files, the test package
+    (unpublished, Archi's copy removed).
+- **Stage 3 is complete.**
+- **Rollback:** snapshot `pre-ed3c-0-1-164`, or `apt install fluxbee=0.1.163` and 0.1.163's
+  `update_installation`: 0.1.163's SY.deploy has `plain-ed` built in again.
 
 ## 0.1.163 — a capability's door: a WF the ED's conscious asks (the Digital Executive's stage 3, release 3B)
 

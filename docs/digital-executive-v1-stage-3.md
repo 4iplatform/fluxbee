@@ -1,8 +1,9 @@
 # The Digital Executive v1, stage 3: solutions from Archi's CI, and capabilities
 
 **Status:** the build design, 2026-11-28, consolidated from the talk of the same day
-([notes](digital-executive-v1.md) §33–§39). Reviewed by the operator the same day (§11): every point
-decided. Nothing is built.
+([notes](digital-executive-v1.md) §33–§40), reviewed and decided by the operator. **Built and live:**
+3A in 0.1.162, 3B in 0.1.163, 3C in 0.1.164; each release's gate passed (lab/DEPLOYMENTS.md). Stage 3
+is complete.
 
 **What it builds:**
 
