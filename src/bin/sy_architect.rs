@@ -29899,6 +29899,10 @@ mod tests {
         let mut add_hive = 0;
         for raw in &examples {
             let parsed = parse_scmd(raw).unwrap_or_else(|err| panic!("{raw}: {err}"));
+            // Archi answers its own paths itself (its CI's listing): no admin action to translate.
+            if local_architect_scmd(&parsed).is_some() {
+                continue;
+            }
             let translated = translate_scmd(PRIMARY_HIVE_ID, parsed)
                 .unwrap_or_else(|err| panic!("{raw}: {err}"));
             if translated.action == "add_hive" {
