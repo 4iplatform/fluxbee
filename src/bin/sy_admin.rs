@@ -19842,6 +19842,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Delete even when the WF node runs instances, or when they cannot be counted (the node is not RUNNING, or does not answer): they go with the node. Without it such a delete is refused, INSTANCES_ACTIVE or INSTANCES_UNKNOWN.",
             ),
             admin_action_body_field(
+                "retire",
+                "bool",
+                "Remove the WF node with the orchestrator's retire mode instead of a purge: its ILK is marked node_retired and keeps its history. SY.deploy asks for it when it removes a capability's door. The workflow's state and packages go as in any delete.",
+            ),
+            admin_action_body_field(
                 "hive",
                 "string",
                 "Optional explicit hive override for SY.wf-rules target.",

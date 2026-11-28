@@ -730,10 +730,11 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
 - **Its workflows** ([stage 3](../digital-executive-v1-stage-3.md) §4): a capability's door is a
   WF, which SY.deploy deploys with `wf_rules_compile_apply` (`{workflow_name, definition,
   auto_spawn: true, tenant_id}`, on the hive it names), reads with `wf_rules_get_workflow` and
-  `wf_rules_get_status`, and removes with `wf_rules_delete` (`{workflow_name, force: true}`). Each
+  `wf_rules_get_status`, and removes with `wf_rules_delete` (`{workflow_name, force: true, retire:
+  true}`: the node retired, its ILK marked `node_retired`, never purged). Each
   goes to that hive's SY.wf-rules as any caller's does (`handle_wf_rules_http`,
   `handle_wf_rules_query`), with `launched_by: SY.deploy@motherbee` on a deploy; SY.wf-rules then
-  publishes the workflow's package and launches or purges its `WF.*` node under its own rows
+  publishes the workflow's package and launches, retires or purges its `WF.*` node under its own rows
   (`authorize_wf_rules_package`, `authorize_wf_rules_node`), and the run it asks for carries
   SY.deploy as the node's launcher (`launcher_carried_by_wf_rules`), as it carries `operator` and
   `archi`. A compile alone, an apply, a rollback, a check and the list of workflows stay out of the
