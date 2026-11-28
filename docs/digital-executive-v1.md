@@ -845,3 +845,30 @@ Options (b), a label over several agents, and (c), one node that does everything
     exit sends it to the capability's entry and brings its answer back to the conscious (Case 3's
     consultation). SY.deploy would write and rewrite each ED's WF as capabilities come and go, and the
     conscious could not use a capability in the middle of a turn.
+
+## 37. Notes, 2026-11-28 (later): a WF at each capability's door
+
+- **The operator:** every capability's entry is a WF, by convention. Depending on what the
+  capability does, the WF talks to different agents and routes; no AI stands in the middle, and
+  different actions can be programmed.
+- **Facts read for it (2026-11-28):**
+  - A WF's `start_from` is never `SY.*`, `RT.*` or `AI.*` (docs/wf-orchestration-v1.md §5.2, Case 1):
+    an agent only answers, so its message is never a request; an agent the WF also asks would have
+    its late answer start a new instance, the WF↔AI loop of A-118.
+  - A WF always sends `user` messages (Case 0); it has no answer to a request. A message from a WF
+    to an agent starts a new turn of that agent.
+  - The consultation pattern (Case 3) is a WF asking an agent and branching on its structured
+    answer.
+- **What it needs, proposed:**
+  - **the conscious may start its capabilities' entry WFs:** `start_from` takes exactly the ED's
+    conscious, its node name written into the WF by SY.deploy; the WF never sends to the conscious
+    but its answer, so A-118's loop cannot happen;
+  - **a WF answers the request that started it:** a `reply` action that sends the answer to the
+    starter as the response to its request (its trace), never as a new message, so the conscious
+    gets it as its tool's result within its turn;
+  - **the conscious's tool** "ask capability X" sends the request to the entry WF and waits for the
+    answer, bounded in time;
+  - **discovery:** the entry WF's ILK works for the ED with a role of its own, `capability`; the
+    agents behind it are `agent`, its IOs to external systems `connector`. The capability's name,
+    description and the requests it takes go in the ED's document, written by SY.deploy at each
+    deployment, which the conscious reads.
