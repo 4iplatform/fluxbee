@@ -1,8 +1,8 @@
 # The Digital Executive v1, stage 3: solutions from Archi's CI, and capabilities
 
 **Status:** the build design, 2026-11-28, consolidated from the talk of the same day
-([notes](digital-executive-v1.md) §33–§38). It waits for the operator's review (§11). Nothing is
-built.
+([notes](digital-executive-v1.md) §33–§39). Reviewed by the operator the same day (§11): its three
+calls decided, two points open. Nothing is built.
 
 **What it builds:**
 
@@ -90,8 +90,11 @@ external system; `capability` (5), a capability's entry WF.
   SY.deploy checks it (its format, its blanks, sections it can build) and keeps its copy, answering
   accepted or refused with the reason. A withdraw (`cd_unpublish`) stops offering it; running
   deployments keep their version.
-- **System packages reach SY.deploy at Archi's start:** Archi publishes each shipped version
-  SY.deploy has not got, and reports it in its log and its status (proposed, §11).
+- **Archi publishes its whole CI at its start** (decided, §11): every released package it has,
+  shipped or its own, by the normal path; the shipped ones are only read-only for Archi. SY.deploy
+  answers "already kept" for a version it has, and takes deployments once it has a catalog: from its
+  own copies after a restart, or after Archi's first publish on a new installation. Until then an
+  order answers `CATALOG_NOT_READY`, retryable. It is fast: the CI is ready.
 - **Versions kept:** three of each package in SY.deploy, never one a deployment runs (stage 2).
 
 ## 4. SY.deploy
@@ -111,9 +114,11 @@ external system; `capability` (5), a capability's entry WF.
 
 - **By convention, every capability's entry is a WF** (the operator, 2026-11-28). Depending on the
   request, it talks to the capability's agents and connectors and routes; no AI at the door.
-- **Started only by the ED's conscious:** `start_from` takes exactly the conscious's node name,
-  written by SY.deploy. A WF may name an `AI.*` in `start_from` only when it never sends to that
-  node except through `reply`, which the compiler checks (A-118's loop cannot happen).
+- **A normal WF** (the operator): its events are a message or a timer, as any WF's. Its messages
+  come from the ED's conscious, and its own timers wake it, for a request that takes long.
+- **The conscious in `start_from`:** exactly the conscious's node name, written by SY.deploy. A WF
+  may name an `AI.*` in `start_from` only when it never sends to that node except through `reply`,
+  which the compiler checks (A-118's loop cannot happen).
 - **`reply`, a new action:** the instance answers the request that started it, as the response to
   that request (its trace), never as a new message. The conscious gets it as its tool's result.
 - **Its interface is its help:** the definition's `description`, its `input_schema`, and each
@@ -178,12 +183,25 @@ A person asks the ED for an invoice's state. The conscious, in its turn:
 | Upgrades of packages, waves, rollback | With the first new version |
 | An AI check of packages before a publish | Design §5.5 |
 
-## 11. For the operator's review
+## 11. The operator's review (2026-11-28)
 
-1. **System packages reach SY.deploy at Archi's start,** each shipped version SY.deploy lacks,
-   reported in Archi's log and status. The other way: the operator publishes them by hand after an
-   install, and no ED can be created before.
-2. **`ask_capability`'s bound:** 60 s, after which the conscious answers the person with what it
-   has. It cannot come back later on its own: an agent only answers.
-3. **Archi's release step** (a manifest compiled into a package): through Archi's chat, the
-   operator's CONFIRM, like any write of Archi's.
+**Decided:**
+
+1. **Archi publishes its whole CI at its start,** by the normal path; the .deb's solutions are
+   only read-only for Archi (§3).
+2. **`ask_capability`'s bound is 60 s.** Cloud's list never goes through an AI: SY.deploy answers
+   it.
+3. **A release comes only through Archi's chat,** with the operator's CONFIRM, or ready in the .deb.
+
+**Open, to talk:**
+
+4. **One ED or all of them:** a capability is sometimes behind one ED, sometimes behind all of a
+   tenant's EDs. Proposed: a capability deployed for all of them goes into the tenant's grouping;
+   its door's ILK has the role `capability` and works for no one person; a conscious finds it as a
+   capability of its tenant; its WF's `start_from` takes the consciouses of its tenant's EDs, which
+   the WF checks against identity (the sender's ILK works for a person of its tenant, as its
+   `conscious`), so no list of names is rewritten as EDs come and go.
+5. **A request that takes long:** the door's timer wakes it, but the conscious waits 60 s at most.
+   Either the result comes later to the conscious as a new message, and the conscious tells the
+   person through the ED's IO; or the WF keeps it, and the conscious asks for it when the person
+   asks again.

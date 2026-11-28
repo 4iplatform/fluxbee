@@ -889,3 +889,17 @@ Options (b), a label over several agents, and (c), one node that does everything
   `input_schema` (with each action's own description), read by the conscious through the WF's help.
   The ED's document need not list the requests.
 - **Next:** stage 3's build design, consolidated: [digital-executive-v1-stage-3](digital-executive-v1-stage-3.md).
+
+## 39. Notes, 2026-11-28 (later): the operator's review of stage 3
+
+- **Behind the ED:** a capability is sometimes behind one ED and sometimes behind all of them, but
+  always behind the ED type.
+- **The door is a normal WF:** not only the conscious starts it; a timer can too. If an ED asks a
+  capability for something that takes long, a timer wakes it. It is not a special WF: a normal one
+  doing this function with an ED.
+- **Call 1, the system packages:** yes, the system is autonomous. The .deb's solutions are not
+  special, only read-only for Archi; the path is the normal one: Archi has a CI ready and publishes
+  it to SY.deploy. When everything starts, Archi finds what it has and publishes its CI; until that
+  ends nothing does anything, and it is fast, since the CI is ready (released, read-only).
+- **Call 2, the bound:** yes. Cloud's list never goes through an AI: SY.deploy knows it.
+- **Call 3, releasing:** yes, only through Archi's chat, or it comes ready in the .deb.
