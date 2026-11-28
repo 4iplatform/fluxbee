@@ -24,8 +24,16 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   speaks (FINDINGS A-215). A definition names in `start_from` the nodes whose messages
   start an instance, and only the nodes it names (`start_from`, `event_match.src`, the targets of
   its sends) drive one; anyone else is dropped, never answered (FINDINGS A-123).
-  `start_from` names IO nodes and WFs, never an agent or a `SY.*`/`RT.*` node. `thread_id_ref` left
-  the language.
+  `start_from` names IO nodes and WFs, never a `SY.*`/`RT.*` node; an agent's message starts
+  nothing. `thread_id_ref` left the language.
+- **A capability's door** (docs/wf-orchestration-v1.md §5.6). `start_from` names the ED's
+  conscious (`AI.*`) or takes the consciouses of the tenant's EDs (`{"consciouses": "tenant"}`). A
+  conscious's `CAPABILITY_REQUEST` starts an instance of its own (its thread its own id, the request
+  kept, schema v8) once identity's SHM confirms the conscious (`capability.go`, `identity.go`);
+  anything else is answered `status: error`. `reply` answers the request once, on its trace;
+  `notify`, after a reply `pending`, gives the result to the conscious alone, on the person's
+  conversation. A door never sends the conscious a message, and answers `WF_HELP` to its
+  consciouses, with its `request_actions`.
 - **The upgrade to 0.1.91.** A definition written before it has no `start_from` and no longer
   loads: its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with
   `start_from`, and its running instances fail at the next start (`definition_unavailable`).

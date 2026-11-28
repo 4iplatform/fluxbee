@@ -158,7 +158,9 @@ Only a node the definition names in `start_from` starts an instance (§8.1, §14
 
 **From another WF.** A WF, as part of its actions, can send a message to another WF, which takes it as any other trigger when it names the sender in `start_from`. Example: `WF.tenant-onboarding` in its final step sends a message to `WF.invoice` to create the first billing cycle.
 
-**Never from an agent.** An agent only answers (`docs/wf-orchestration-v1.md` §1): it never starts an instance, and `start_from` refuses an `AI.*` node, whose late answer would otherwise start one (a WF↔AI loop). A WF asks agents, and branches on their answers.
+**From the ED's conscious, by a capability request.** A capability's door (`docs/wf-orchestration-v1.md` §5.6) names in `start_from` the conscious of one Digital Executive (an `AI.*` node), or takes the consciouses of its tenant's EDs (`{"consciouses": "tenant"}`). A conscious starts an instance only with a `CAPABILITY_REQUEST`, a system message, once identity confirms it (§14.2). The instance answers it with `reply` and gives a later result with `notify` (§10.11, §10.12); the WF never sends the conscious a message.
+
+**Never from an agent's message.** An agent only answers (`docs/wf-orchestration-v1.md` §1): its message never starts an instance, not even when `start_from` names it, since its late answer would otherwise start one (a WF↔AI loop). A WF asks agents, and branches on their answers.
 
 **Never from a system node.** `SY.cognition`, `SY.admin` or any other `SY.*` or `RT.*` node never starts an instance: `start_from` refuses them.
 
@@ -167,7 +169,7 @@ Only a node the definition names in `start_from` starts an instance (§8.1, §14
 ### 5.2 What cannot trigger a WF
 
 - **The WF itself** cannot spontaneously create new instances. Instances exist only as responses to incoming messages.
-- **A node outside `start_from`**, an agent and a system node included. Its message reaches a running instance on its thread when the definition names it (§14.5), and starts none.
+- **A node outside `start_from`**, a system node included, and **an agent's message**, even when `start_from` names the agent as a conscious. Its message reaches a running instance on its thread when the definition names it elsewhere (§14.5), and starts none.
 - **Archi** does not trigger WFs at runtime. Archi designs WFs and deploys them as code; once deployed, Archi has no privileged trigger path.
 - **External systems directly**. External systems talk to IO nodes, which then emit Fluxbee-native messages that OPA routes.
 
@@ -181,7 +183,7 @@ The key property is that **once triggered, the WF is deterministic regardless of
 
 ## 6. WF as a system toolbox
 
-WF nodes are not private components of specific flows. They are infrastructure: any node its definition names in `start_from`, whose message OPA lets through, can start an instance. Their self-description, `WF_HELP`, is not open to every node: like every `WF_*` control verb, a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (since 0.1.90, §15).
+WF nodes are not private components of specific flows. They are infrastructure: any node its definition names in `start_from`, whose message OPA lets through, can start an instance. Their self-description, `WF_HELP`, is not open to every node: like every `WF_*` control verb, a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (since 0.1.90, §15), and a capability's door to the consciouses its `start_from` takes too.
 
 ### 6.1 The hive-wide live catalog
 
@@ -193,7 +195,7 @@ This is self-description by pull, not registration by push. Each node is the aut
 
 ### 6.2 Authorization via OPA, not via the catalog
 
-Visibility and authorization are different. The catalog shows what exists. Who starts an instance is the definition's `start_from`; OPA decides, besides, which nodes may send the WF anything, with rules that in identity v2 evaluate against `ilk_type`, `registration_status`, and the L2 name of the source node (see section 17). An AI can see in the catalog that `WF.refund` exists, but it never starts it: an agent only answers, and `start_from` names IO nodes and WFs.
+Visibility and authorization are different. The catalog shows what exists. Who starts an instance is the definition's `start_from`; OPA decides, besides, which nodes may send the WF anything, with rules that in identity v2 evaluate against `ilk_type`, `registration_status`, and the L2 name of the source node (see section 17). An AI can see in the catalog that `WF.refund` exists, but it never starts it with a message: an agent only answers. Only a capability's door takes an agent's request, its ED's conscious's, checked in identity (§5.1).
 
 ---
 
@@ -311,7 +313,8 @@ Fields:
 | `wf_schema_version` | Version of the workflow schema format. Current: `"1"`. |
 | `workflow_type` | Unique name for this workflow type. Appears in logs and `WF_HELP`. |
 | `description` | Human-readable description for introspection. |
-| `start_from` | Required. The node names whose messages start an instance, each with its hive (`IO.api.sales@worker1`): IO nodes and WFs, never an `AI.*` node (an agent only answers, §5.1) nor a `SY.*` or `RT.*` node. A message from any other node starts none (§14.5). |
+| `start_from` | Required. Who starts an instance. Each entry is a node name with its hive (`IO.api.sales@worker1`), never a `SY.*` or `RT.*` node, or the consciouses marker `{"consciouses": "tenant"}`, written once. An IO node's or a WF's message starts an instance. An `AI.*` node is the ED's conscious of a capability's door: it starts an instance only with a `CAPABILITY_REQUEST`, never with a message (§5.1). The marker takes the request of any conscious of the EDs of the WF's tenant, each checked in identity. A message from any other node starts none (§14.5). |
+| `request_actions` | Optional, a capability's door's only. The requests its input takes, each `{"name": "invoice_state", "description": "..."}` (the description optional), which `WF_HELP` answers to the conscious as the door's `actions` (§15). |
 | `input_schema` | JSON Schema for the initial event that creates an instance. Compiled to CEL types at load. |
 | `initial_state` | Name of the state where new instances begin. |
 | `terminal_states` | List of state names that end the instance when reached. |
@@ -386,20 +389,22 @@ A built-in function `now()` returns the WF node's clock as Unix milliseconds (UT
 When a WF node loads its workflow definition, it runs these checks:
 
 1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused, and so is a field written with other capitals (`"Name"` for `name`, `"States"` for `states`), by its path: `is written Name: the field is name`. Go's JSON decoder takes a key for the field it equals ignoring case, so a `forward` with a `"Name"` loaded and forwarded the event instead of the kept message. This holds at every level of the language (the definition, a state, a transition, an `event_match`, an action, its `meta`, a menu, an option, a param, a catch transition), never inside user data: a `payload`, `vars`, what `meta.context` holds and the `input_schema` keep their keys as written.
-1a. `start_from` names at least one node, each a node name with its hive, never a `SY.*`, `RT.*` or `AI.*` node: an agent only answers, and one that starts instances and that the WF asks would have its late answer start a new instance, which asks it again (a WF↔AI loop).
+1a. `start_from` has at least one entry, each a node name with its hive, never a `SY.*` or `RT.*` node, or the consciouses marker `{"consciouses": "tenant"}`, with that key only, its value `"tenant"`, written once (`must be "tenant"`, `the consciouses marker is written once`). An `AI.*` node, or the marker, makes the definition a capability's door (§10.11).
 2. `input_schema` is valid JSON Schema.
 3. `initial_state` exists in `states`.
 4. All `terminal_states` exist in `states`; a state named `failed` is one of them.
 5. Every `target_state` in every transition, the catch's included, exists in `states`; a transition without one is internal.
 6. Every transition has a guard, and an `event_match` with a `msg`, a `src` or both, a `src` being a node name with its hive, never a `SY.*` or `RT.*` node; and every guard CEL expression compiles. A catch transition's `event_match` may be empty (it matches every event).
-7. Every action has a known `type` and valid parameters, and only the fields of its type: a field of another type is refused, by its path (a `forward` with a `name` instead of a `message` would forward the event). A catch transition's actions are `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event`: timers belong to states.
+7. Every action has a known `type` and valid parameters, and only the fields of its type: a field of another type is refused, by its path (a `forward` with a `name` instead of a `message` would forward the event). A catch transition's actions are `send_message`, `forward`, `keep_message`, `set_variable`, `emit_internal_event`, `reply` and `notify`: timers belong to states.
 8. For `send_message` and `forward` actions, the `target` is syntactically a valid L2 name, without spaces around it, and not a `SY.*` or `RT.*` node. A `forward` has no `meta.msg` and no `payload` (it keeps the message's own), and the `message` it names is one a `keep_message` of the definition keeps.
 8a. No action has `meta.type`, `target_ref` or `thread_id_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 and 0.1.91 (every message a WF sends is a `user` message, to a node name written in the definition, on the instance's thread; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
 8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), nor `response_envelope` (a WF asks an agent with `menu`), and its `vars` is a JSON object.
 8c. A `menu` is on a `send_message` or a `forward` to an `AI.*` or an `IO.*` node only, and follows the limits the agent checks it with again (§10.10), with each known option (Archi's handbook, §4.2.4) written by its name alone and loaded with the catalog's description and params: `help` up to 600 characters; 1 to 8 options, each with a name of its own that matches `^[a-z][a-z0-9_]{0,31}$` and is never `none`, a description of 1 to 200 characters and up to 8 params; each param with a name of that pattern, a `type` (`string`, `boolean`, `integer` or `number`), a description up to 200 characters and, on a string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode code points. A menu has no field but these, at any level, and no `$ref`.
-8d. Where the event may be no node's message, no `keep_message` and no `forward` without `message`, either of which would fail the instance. On a state's transition that takes a `TIMER_FIRED` (matched on that `msg`) or an internal event, which has no sender (its `event_match` names no `src`, and its `msg` is `AGENT_CALL_CAP`, §9.6, or one an `emit_internal_event` of the definition emits): among its actions and, with a `target_state`, its state's exit actions and its target's entry actions. The error names the event: `the TIMER_FIRED of states[0].transitions[2]`, `the AGENT_CALL_CAP of ...`, `the internal event TO_SALES of ...`. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one. A `forward` of a kept message goes anywhere.
+8d. Where the event may be no node's message, no `keep_message` and no `forward` without `message`, either of which would fail the instance. On a state's transition that takes a `TIMER_FIRED` (matched on that `msg`) or an internal event, which has no sender (its `event_match` names no `src`, and its `msg` is `AGENT_CALL_CAP`, §9.6, or one an `emit_internal_event` of the definition emits): among its actions and, with a `target_state`, its state's exit actions and its target's entry actions. The error names the event: `the TIMER_FIRED of states[0].transitions[2]`, `the AGENT_CALL_CAP of ...`, `the internal event TO_SALES of ...`. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one. The same for a capability's door's initial state's entry actions, which run on the `CAPABILITY_REQUEST` that starts the instance, a system message (`the capability request that starts an instance`). A `forward` of a kept message goes anywhere.
 8e. What reads an agent's evaluation is checked against what it is, a menu's answer `{reply, option, params}` (§10.10), and against the definition's menus, those of its `send_message` and `forward` actions. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.<f>` names `reply`, `option` or `params` (`event.context.evaluation.optoin` and `event.context.evaluation.param.question` are refused). A guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of the menus, or `none`; the empty string names no option, so `event.context.evaluation.option != ''` (any menu's answer) is no typo. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>`, and a guard that looks for a name in them (`'question' in event.context.evaluation.params`), names a param of one of the menus, or `reason`. A name the evaluation or no menu has would be a guard that never matches, or a value that fails the instance.
 8f. A `subject` is on a `send_message` or a `forward` to an `IO.*` node only, and is `new`, `same` or `end`. An `end` takes no `menu`: the IO node closes the subject's menu with it, and io.slack drops a menu that comes with an `end` (`an end closes the subject's menu: a menu goes with new or same`).
+8g. A capability's door (§10.11): `reply` and `notify` are a door's only (`only a capability's door, whose start_from names the ED's conscious (AI.*) or {"consciouses": "tenant"}`), and so is `request_actions`. A `reply`'s `status` is `done`, `pending` or `error`, a `notify`'s `done` or `error`; with `error`, an `error_code` of `^[A-Za-z][A-Za-z0-9_.-]{0,63}$`, and with no other status; a `message` of 1,000 characters at most; a `result` under the `$ref` rules of a payload (item 11, and 8e for what it reads of an evaluation). `request_actions` holds up to 16 actions, each named as a menu option is (`^[a-z][a-z0-9_]{0,31}$`), once, with a description of 200 characters at most when it has one.
+8h. **A door never sends a message to a conscious its `start_from` names** (FINDINGS A-118's loop): a `send_message` or a `forward` whose `target` is one, whatever its capitals, is refused (`is a conscious whose requests start this WF (start_from): only reply and notify reach it`). A message asks an agent for a turn, whose answer comes back to its sender; `reply` and `notify` are answered by no one. With the consciouses marker no conscious is named, and the engine refuses, at run time, a send to the one that asked (§10.11).
 9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is from 60 seconds to 366 days, SY.timer's floor and ceiling (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. SY.timer refuses a timer more than 366 days ahead every time, so before FINDINGS A-254 a `fire_in` of `400d` loaded and its timer never fired (`must be at most 366d`).
 10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
@@ -423,7 +428,7 @@ Entry actions run when the instance enters the state (including from `initial_st
 
 An **internal transition** (one without a `target_state`) runs its own actions only and stays in its state: no exit or entry actions run, so the state's timers keep running. An event that arrives early is noted without leaving the state (a due date that fires while an agent is answering, say), and the next state acts on it. A transition whose `target_state` is its own state leaves the state and enters it again.
 
-If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event` (a lost message, a message not kept or an unset variable leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer. A timer's request to SY.timer is the exception: the router's `UNREACHABLE` of one marks the timer in the WF's index, and the timer goes again until SY.timer takes it (§10.2).
+If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `forward`, `keep_message`, `set_variable`, `emit_internal_event`, `reply` and `notify` (a lost message, a message not kept, an unset variable or an answer that never reached the conscious leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer. A timer's request to SY.timer is the exception: the router's `UNREACHABLE` of one marks the timer in the WF's index, and the timer goes again until SY.timer takes it (§10.2).
 
 ### 9.2 Transition evaluation
 
@@ -473,7 +478,7 @@ A definition may have a `catch` (since Case 3, `docs/wf-orchestration-v1.md` §5
 
 - **Its shape is a state transition's,** but its `event_match` may be empty, which matches every event (a message, a timer's fire, an internal event). Its `guard` is required, and its `target_state` optional: a chosen catch transition runs as a state's, with the current state's exit actions, its own actions and the target's entry actions, or internally, staying where it was, without a `target_state`.
 - **What reaches it:** an agent's `none` (§10.10); an agent's error, which is a payload of type `error` (an answer off its menu, a provider failure); and any event no transition took. Its guards tell them apart: `event.context.evaluation.option == 'none'`, `event.payload.type == 'error'`.
-- **Its actions** are `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event`. Timers belong to states: a catch that needs one goes to a state whose entry actions set it. A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names a `src`, so the event is a node's message and never a timer's (§8.5, 8d).
+- **Its actions** are `send_message`, `forward`, `keep_message`, `set_variable`, `emit_internal_event`, `reply` and `notify`. Timers belong to states: a catch that needs one goes to a state whose entry actions set it. A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names a `src`, so the event is a node's message and never a timer's (§8.5, 8d).
 - **Its actions and targets are the definition's own:** its `event_match.src` and its targets are nodes the definition involves (§14.5), and its `keep_message` keeps a message a `forward` may send.
 - **What it does is the designer's choice:** for example, hand the conversation to a person, ask another agent, or fail the instance, as in §19.2.
 
@@ -492,7 +497,7 @@ An instance sends at most **8 messages to agents** (`AI.*`) between two triggers
 
 ## 10. Actions (the primitive vocabulary)
 
-Actions are the side effects available to a workflow. The set is **fixed and small in v1**: `send_message`, `forward`, `keep_message`, the timer actions, `set_variable` and `emit_internal_event`. A workflow cannot define custom actions. New action types require a runtime release.
+Actions are the side effects available to a workflow. The set is **fixed and small in v1**: `send_message`, `forward`, `keep_message`, the timer actions, `set_variable`, `emit_internal_event`, and a capability's door's `reply` and `notify`. A workflow cannot define custom actions. New action types require a runtime release.
 
 ### 10.1 `send_message`
 
@@ -835,7 +840,48 @@ A `send_message` or a `forward` to an agent (`AI.*`) may offer it a menu (since 
 - **An answer off the menu is an error,** with no retries: an option the menu does not have, a missing or mistyped param, or no JSON at all come back as an error payload (`invalid_structured_output`), which a state's transition or the catch takes (§9.5).
 - **What reads the answer is checked** against the definition's menus at load (§8.5, 8e).
 
-### 10.11 What is NOT in v1
+### 10.11 A capability's door: `reply`
+
+A capability's door (`docs/wf-orchestration-v1.md` §5.6, `docs/digital-executive-v1-stage-3.md` §5) is a WF whose `start_from` names the conscious of one Digital Executive (an `AI.*` node), or has the consciouses marker. The conscious asks it with a `CAPABILITY_REQUEST` (§14.2), a system message whose answer it waits for, by its trace, for 60 s. Each request the door admits starts an instance of its own: its thread is its own `instance_id`, its input is the request's `input`, and it keeps the request (its `request_id`, its ED, its sender, its trace, and the person's conversation it carries; §13.1).
+
+`reply` answers the request that started the instance:
+
+```json
+{ "type": "reply", "status": "done", "result": { "state": { "$ref": "event.context.evaluation.params.state" } } }
+```
+
+| Field | Description |
+|---|---|
+| `status` | Required, literal: `done`, the result is in `result`; `pending`, it comes later by `notify` (§10.12); `error`. |
+| `result` | Optional. Any value, `$ref`-resolved as a payload is. |
+| `error_code` | Required with `error`, and only with it: a literal code (`INVOICE_NOT_FOUND`). |
+| `message` | Optional. A literal text, 1,000 characters at most. |
+
+- **It goes as the response to the request:** a `system` message `CAPABILITY_REQUEST_RESPONSE` to the request's sender, on the request's `trace_id` whatever event the reply runs on, with the payload `{"request_id", "status", "result"?, "error_code"?, "message"?}`. The conscious's tool takes it as its result.
+- **Once per request.** A second `reply` is not sent, whatever its `on_error`: the instance's log and the node's say `reply refused: request <id> was answered already (<status>)`, and the transition goes on. A `failed` state may then hold both a `reply` and a `notify` of the error, and the one that fits goes (the example `wf.capability.billing`).
+- **Within the turn, or pending.** The conscious waits 60 s, and a WF timer fires 60 s ahead at the earliest: a request that may take longer replies `pending` at once, and gives its result with `notify`.
+- In an instance a request did not start, it fails (`reply: the instance was not started by a capability request`), under its `on_error`.
+
+### 10.12 `notify`
+
+`notify` gives the conscious that asked the result of its request, after a `reply` with status `pending`:
+
+```json
+{ "type": "notify", "status": "done", "result": { "open_invoices": { "$ref": "event.context.evaluation.params.open_invoices" } } }
+```
+
+Its fields are `reply`'s; its `status` is `done` or `error`.
+
+- **It is a `user` message to the conscious that asked, and only to it,** by its node name. Its `meta.thread_id` is the thread of the person's conversation the request carried (`conversation.thread_id`), and its `meta.context.capability_result` is `{"request_id", "capability": "<the door's node name>", "status", "result"?, "error_code"?, "message"?, "conversation": <as the request carried it>}`. Its payload is a short text for the model, `The capability <door> completed your request <id>. <message>` and a line `Result: <the result as JSON>`, cut at 8 KiB, or `The capability <door> could not complete your request <id>: error <code>. <message>`. Its writer is the WF.
+- **The conscious answers the person, never the WF:** through the IO node the conversation names (`docs/digital-executive-v1-stage-3.md` §6.1). No answer comes back to the instance.
+- **It runs in any state,** a transition on a timer's fire included: a request that takes long replies `pending`, its timer wakes the instance, and `notify` gives the result.
+- It fails, under its `on_error`, when the request was not answered `pending` (`a notify gives the result after a reply pending`), when the request carried no `conversation.thread_id`, and in an instance a request did not start.
+
+**Only `reply` and `notify` reach the conscious.** A `send_message` or a `forward` to a conscious that `start_from` names is refused at load (§8.5, 8h); under the consciouses marker, one to the conscious that asked fails at run time (`only reply and notify reach it`). Neither `reply` nor `notify` counts against the cap on agent calls (§9.6): the conscious answers neither to the WF.
+
+**What the instance sends its agents** carries the instance's thread, so each request is a conversation of its own with them, and names no person (no `src_ilk`): a request is no person's message. A definition that needs the ED or the person's conversation keeps them from the creation event, `event.payload.ed_ilk` and `event.payload.conversation`, with a `set_variable` of the initial state.
+
+### 10.13 What is NOT in v1
 
 The following action types are intentionally excluded from v1 and reserved for future versions:
 
@@ -1000,12 +1046,13 @@ CREATE TABLE wf_instances (
     thread_id         TEXT NOT NULL DEFAULT '',
     person_ilk        TEXT NOT NULL DEFAULT '',
     person_ich        TEXT NOT NULL DEFAULT '',
-    person_io         TEXT NOT NULL DEFAULT ''
+    person_io         TEXT NOT NULL DEFAULT '',
+    request_json      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 ```
 
-`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance. `person_ilk` and `person_ich` are the instance's person, the `src_ilk` and `ich` of the message that started it, which a `send_message` carries (§10.1); both are emptied when a message from the person's IO node carries another person. `person_io` is the person's IO node, the router-stamped name of the node whose message started the instance (schema v6, 0.1.95), empty for an instance of before, which then names its person to no IO node.
+`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance. `person_ilk` and `person_ich` are the instance's person, the `src_ilk` and `ich` of the message that started it, which a `send_message` carries (§10.1); both are emptied when a message from the person's IO node carries another person. `person_io` is the person's IO node, the router-stamped name of the node whose message started the instance (schema v6, 0.1.95), empty for an instance of before, which then names its person to no IO node. `request_json` (schema v8) is the capability request that started an instance of a capability's door (§10.11): `request_id`, `ed_ilk`, its `sender` and `sender_uuid`, its `trace_id`, the `conversation` it carried, and `replied`, the status of the `reply` that answered it; empty for any other instance. `WF_GET_INSTANCE` shows it as the instance's `request`.
 
 **`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A transition of the catch starts its summary with `catch[<i>]:`, and a send past the cap on agent calls is an action entry that is not ok, its `error_detail` starting with `agent_call_cap` (§9.6). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
 
@@ -1123,11 +1170,12 @@ Handlers:
 - `WF_LIST_INSTANCES` — returns the instances matching a filter, or only how many (`count_only`, §16.1).
 - `WF_GET_CODE` — returns the current workflow definition.
 - `TIMER_FIRED` — from SY.timer of its own hive only, for a timer this node scheduled: routes to the instance its `client_ref` names (§11.2).
+- `CAPABILITY_REQUEST` — from a conscious to a capability's door (§10.11). Admitted only from a sender `start_from` takes (an `AI.*` node it names, or any agent under the consciouses marker) whose node ILK, in the identity SHM (the ILK whose `handler_node` is the sender), works for the request's `ed_ilk` as its `conscious`; the door's own ILK works for that ED, or, for a door of all of its tenant's EDs, for nobody, and the ED is a person of the door's tenant. Its `input` must be a JSON object, or none, that `input_schema` takes. Admitted, it starts an instance (§14.3); otherwise it is answered, as `reply` answers, `status` `error`, `error_code` `UNAUTHORIZED`, `INVALID_REQUEST` (a payload with no `request_id` or `ed_ilk`, or a `conversation` that is no object) or `INVALID_INPUT`, and, while the engine cannot serve, `node_not_configured` or `store_unavailable`. It never enters the correlation order (§14.5). Its payload: `{"request_id", "ed_ilk", "input", "conversation": {"thread_id", "person_ilk", "io_node", "reply_target"}}`, which the AI SDK fills from the conscious's turn.
 - `TIMER_RESPONSE` — from SY.timer of its own hive only, the answer to a timer request the node sent without waiting: it settles the request's timer, which a refusal marks to go again (§10.2); never answered. The SDK hands it to the loop on a channel of its own.
-- Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too), and SY.timer's `TIMER_RESPONSE` settles a timer, no instance's event.
+- Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` and a `CAPABILITY_REQUEST` (since 0.1.90; the AI and IO nodes take the system kind only as control too), and SY.timer's `TIMER_RESPONSE` settles a timer, no instance's event.
 - Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread; a message the WF takes nowhere may get `NOT_TAKEN` (§14.5).
 
-The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, or a system message without a name — SY.timer's rule and the AI nodes', name by name (FINDINGS A-218), but for SY.vault's `VAULT_SECRET_CHANGED`, which SY.timer takes as a notice since 0.1.141 (FINDINGS A-325) and a WF drops unanswered as any other system message (above). The router's `UNREACHABLE` or `TTL_EXCEEDED` of a timer request the node waits on marks the request's timer first, to go again (§10.2, FINDINGS A-254).
+The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). A capability's door answers `WF_HELP` to the consciouses its `start_from` takes too, each checked in identity as a request is, its ED the one it works for (§15). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, or a system message without a name — SY.timer's rule and the AI nodes', name by name (FINDINGS A-218), but for SY.vault's `VAULT_SECRET_CHANGED`, which SY.timer takes as a notice since 0.1.141 (FINDINGS A-325) and a WF drops unanswered as any other system message (above). The router's `UNREACHABLE` or `TTL_EXCEEDED` of a timer request the node waits on marks the request's timer first, to go again (§10.2, FINDINGS A-254).
 
 Internal events emitted by `emit_internal_event` do **not** enter through this inbound loop. They are already bound to a specific instance and are drained from that instance's durable internal queue by the runtime itself.
 
@@ -1137,7 +1185,7 @@ When an incoming event looks like a trigger (it comes from a `start_from` node, 
 
 1. Validate payload against `input_schema`.
 2. If validation fails, respond with `NOT_TAKEN`, reason `invalid_input`, to whoever §14.5 says.
-3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it. The instance's thread is the event's `meta.thread_id`, the conversation's, and every message the instance sends carries it; its person is the event's `src_ilk` and `ich`. A WF never makes up a thread: an event without one starts no instance (FINDINGS A-135).
+3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it. The instance's thread is the event's `meta.thread_id`, the conversation's, and every message the instance sends carries it; its person is the event's `src_ilk` and `ich`. A WF never makes up a thread: an event without one starts no instance (FINDINGS A-135). A capability request (§14.2) is no conversation's message: its instance's thread is its own `instance_id`, the conversation of its exchanges with the capability's agents, which the WF opens; it has no person, and keeps the request (§10.11). A request journaled before a crash is admitted again at the next start, and answered when the current definition no longer admits it.
 4. Acquire the per-instance mutex.
 5. Run entry actions of the initial state.
 6. In one commit: create the instance row (`current_state = initial_state`, or terminal; `input_json = <payload>`; its definition's hash; its thread), enqueue its internal events, write the messages it kept, and delete the journaled event. A crash before this commit leaves no instance at all, and the journaled creation for recovery, which runs it again under the same `instance_id`.
@@ -1170,7 +1218,7 @@ The alternative — guaranteeing exactly-once through write-ahead logging of pen
 
 ### 14.5 Event correlation: which instance does this event belong to?
 
-When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or neither. An instance is a conversation: it lives on the thread of the message that started it (§14.3). Only the nodes written in the definition drive an instance (FINDINGS A-123): those of its `start_from`, of an `event_match.src`, and the targets of its `send_message` and `forward` actions, the catch's included, plus SY.timer for the WF's own timers. The resolution order is strict (since 0.1.91):
+When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or neither. An instance is a conversation: it lives on the thread of the message that started it (§14.3). Only the nodes written in the definition drive an instance (FINDINGS A-123): those of its `start_from` but an agent, of an `event_match.src`, and the targets of its `send_message` and `forward` actions, the catch's included, plus SY.timer for the WF's own timers. A conscious that a capability's door names in `start_from` drives none with a message: it starts an instance only with a `CAPABILITY_REQUEST`, which is taken before this order (§14.2), and its message, an answer above all, is discarded at step 2. The resolution order is strict (since 0.1.91):
 
 1. **If `meta.msg == "TIMER_FIRED"`**: taken only from SY.timer of the WF's own hive, and only for a timer this node scheduled (`owner_l2_name`). The event is for the instance its `client_ref` names. If the instance does not run (terminated, expired, never existed), log "orphaned timer" and discard. If it has no such timer, or has it for a later time, the fire is stale: discarded, logged (§11.2).
 
@@ -1206,7 +1254,7 @@ This contract is implicit in many systems (HTTP correlation IDs, RPC call IDs, e
 
 ## 15. WF_HELP and self-description
 
-Every WF node answers `WF_HELP` with its workflow's contract. Like every `WF_*` control verb, it answers only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (since 0.1.90, FINDINGS A-119).
+Every WF node answers `WF_HELP` with its workflow's contract. Like every `WF_*` control verb, it answers only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (since 0.1.90, FINDINGS A-119). A capability's door answers it to the consciouses its `start_from` takes too, each checked in identity as a request is (§14.2): its help is the capability's interface, which its ED's conscious reads (`docs/digital-executive-v1-stage-3.md` §5).
 
 ```json
 {
@@ -1228,12 +1276,13 @@ Response (for §19.2's workflow):
     "states": ["validating_data", "missing_data_requested", "creating_invoice", "delivering_to_customer", "completed", "failed", "cancelled"],
     "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
     "input_schema": { "type": "object", "required": ["customer_id", "items"], "properties": { "customer_id": { "type": "string" } } },
-    "idle_timeout": "4d"
+    "idle_timeout": "4d",
+    "actions": []
   }
 }
 ```
 
-`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). `idle_timeout` is the one in force: the definition's, or `4d` (§12.5). The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is the definition's `start_from` (§8.1), among the senders OPA lets through (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
+`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). `idle_timeout` is the one in force: the definition's, or `4d` (§12.5). `actions` are a capability's door's `request_actions` (§8.1), each `{"name", "description"?}`, empty for any other WF. The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is the definition's `start_from` (§8.1), among the senders OPA lets through (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
 
 Archi does not read `WF_HELP` today (§19.5).
 
@@ -1433,7 +1482,8 @@ A future iteration of identity may introduce a claims model that allows per-ILK 
 | `INSTANCE_ALREADY_TERMINATED` | Operation on a terminated instance. |
 | `STORAGE_ERROR` | SQLite persistence error. |
 | `INTERNAL_ERROR` | Unclassified runtime error. |
-| `UNAUTHORIZED` | A `WF_*` control verb from a sender other than `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive (since 0.1.90). |
+| `UNAUTHORIZED` | A `WF_*` control verb from a sender other than `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive (since 0.1.90), but a capability's door's `WF_HELP` from a conscious its `start_from` takes; and a `CAPABILITY_REQUEST` from a sender that is no conscious the door serves, as identity says, as the `error_code` of its `CAPABILITY_REQUEST_RESPONSE` (§14.2). |
+| `INVALID_REQUEST`, `INVALID_INPUT` | A `CAPABILITY_REQUEST` whose payload is no request (no `request_id` or `ed_ilk`), or whose `input` the `input_schema` refuses, as the `error_code` of its `CAPABILITY_REQUEST_RESPONSE` (§14.2). `INVALID_REQUEST` also answers a `WF_*` request the engine cannot read. |
 
 What the engine answers today: `NOT_TAKEN` (as a message of its own, `meta.msg`, with `error` `not_taken`), `INVALID_REQUEST`, `INSTANCE_NOT_FOUND`, `INSTANCE_ALREADY_TERMINATED`, `STORE_ERROR` (not `STORAGE_ERROR`), `INTERNAL_ERROR`, `UNAUTHORIZED` and `node_not_configured`. The load-time codes above are not returned as such: a definition that fails validation is `invalid_definition` at the node (`FAILED_CONFIG`) and `COMPILE_ERROR` at SY.wf-rules, with the path; `GUARD_TIMEOUT` is never returned (a guard that times out is false).
 
@@ -1772,7 +1822,7 @@ The first rule lets the billing system ask for an invoice on behalf of a human I
 
 ### 19.5 What Archi sees when designing new workflows
 
-Archi cannot read `WF_HELP` today: a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (§15), and SY.admin has no WF action that asks it and shows the answer (§16). What Archi reads is the definition, through SY.wf-rules (`wf_rules_get_workflow`: the current definition, its version and hash), and the input schema and `start_from` in it. If Archi adds a source of invoice requests (another IO node, or another WF), it names it in the definition's `start_from`, and a redeploy applies it; OPA has to let its messages through too. An agent is never one: it only answers.
+Archi cannot read `WF_HELP` today: a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive, and a capability's door to its consciouses (§15), and SY.admin has no WF action that asks it and shows the answer (§16). What Archi reads is the definition, through SY.wf-rules (`wf_rules_get_workflow`: the current definition, its version and hash), and the input schema and `start_from` in it. If Archi adds a source of invoice requests (another IO node, or another WF), it names it in the definition's `start_from`, and a redeploy applies it; OPA has to let its messages through too. An agent's message is never one: it only answers. Only a capability's door takes an agent's request, its ED's conscious's (§10.11).
 
 This is the Archi-first loop: definitions as data, simple OPA rules using identity primitives, deterministic execution.
 

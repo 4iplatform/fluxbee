@@ -331,14 +331,16 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
 
 - **Its fields:** `wf_schema_version` (`"1"`), `workflow_type`, `description`, `start_from`,
   `input_schema` (the JSON Schema of the first message's payload), `initial_state`,
-  `terminal_states`, `states` and, optionally, `catch` and `idle_timeout`. Any other field is
-  refused. The language no longer has `meta.type`, `target_ref` or `thread_id_ref`.
+  `terminal_states`, `states` and, optionally, `catch`, `idle_timeout` and, for a capability's
+  door, `request_actions` (§4.2.8). Any other field is refused. The language no longer has `meta.type`, `target_ref` or `thread_id_ref`.
 - **`idle_timeout`** closes a conversation that went quiet: no event for that long, and no timer
   pending. A duration from `1h` to `7d`; `4d` when the definition leaves it out. It closes as a
   cancel does: the current state's exit actions, then the `cancelled` state's entry actions, if
   the definition has that state. The next message on the thread starts a new instance.
 - **`start_from`** names the nodes whose messages start an instance: IO nodes or WFs, each with its
-  hive. Never an `AI.*` node, because an agent only answers, and never a `SY.*` or `RT.*` node.
+  hive, never a `SY.*` or `RT.*` node. An agent's message never starts one, because an agent only
+  answers: an `AI.*` node in `start_from` is a capability's door's conscious, which starts an
+  instance only with a request (§4.2.8).
 - **One instance per conversation.** An instance lives on the thread of the message that started
   it.
   - Only the nodes the definition names drive the instance: those of `start_from`, those of an
@@ -414,8 +416,8 @@ Common guards:
   - A missing field fails the action, and a `null` field gives `null`.
   - `{"$ref": "event.context", "default": {}}` gives the literal default for a missing or `null`
     field. A `$ref` holds only `$ref` and `default`.
-- **`on_error`.** `fail` is the default for sends, keeps, sets and emits: the transition halts, and
-  the instance ends in `failed`. `continue` is the default for timer actions.
+- **`on_error`.** `fail` is the default for sends, keeps, sets, emits, `reply` and `notify`: the
+  transition halts, and the instance ends in `failed`. `continue` is the default for timer actions.
 
 **The actions:**
 - **`send_message`** sends a message the WF writes. Its fields are `target`, `meta.msg`,
@@ -489,6 +491,9 @@ Common guards:
     an answer needs one.
   - `missed_policy` is `fire`, `drop` or `fire_if_within` (with `missed_within_ms`). It covers
     only a fire that SY.timer itself delivers late.
+- **`reply` and `notify`** answer the capability request that started the instance, a capability's
+  door's only (§4.2.8). Their fields are `status`, `result` (`$ref`-resolved), `error_code` (with
+  status `error` only, and required with it) and `message` (a literal text).
 - **`subject`,** on a send or a forward to an `IO.*` node only, tells the IO node where the message
   stands. The WF knows the subject; the IO node knows its places and places the message.
   - `new`: the message opens a subject;
@@ -612,8 +617,8 @@ The known options:
     transition with a `target_state` runs as a state's; without one, the instance stays.
   - Its `event_match` may be empty, which matches every event.
   - A state can take `none`, or an error, with its own transitions first.
-  - Its actions are sends, forwards, `keep_message`, `set_variable` and `emit_internal_event`.
-    Timers belong to states.
+  - Its actions are sends, forwards, `keep_message`, `set_variable`, `emit_internal_event`, `reply`
+    and `notify`. Timers belong to states.
   - A `keep_message`, or a forward of the event, needs an `event_match.src`.
 - **What reaches the catch:** an agent's `none`, an agent's error, and any event no transition
   took.
@@ -1156,6 +1161,74 @@ person: when its provider gave no answer, the error carries the operator's text 
   (FINDINGS A-302, since 0.1.139). `version` is null for an engine run by hand; a node on an engine
   before 0.1.139 shows no `engine`. After a release, a WF node moves to the new engine at its
   hive's next reconcile pass (60 s), once the engine has reached that hive.
+
+#### 4.2.8 A capability's door
+
+A capability's entry is a WF, its door (docs/wf-orchestration-v1.md §5.6): the ED's conscious asks
+it within its turn, and the door talks to the capability's agents and connectors. A capability
+never talks with people.
+
+- **`start_from`** names the ED's conscious, `AI.<short_id>@<hive>`, which SY.deploy writes. A
+  capability for all of a tenant's EDs has `[{"consciouses": "tenant"}]` instead.
+  - The WF checks the sender in identity, as the conscious of an ED it serves. Anything else is
+    answered `UNAUTHORIZED`.
+- **Each request starts an instance of its own.** Its input is the request's `input`, which
+  `input_schema` checks (`INVALID_INPUT` otherwise). Its thread is its own, the one its agents
+  answer on.
+  - The initial state's entry actions run on the request, a system message: never a
+    `keep_message`, nor a forward of the event. Branch with an internal event, as atom 1 does.
+  - `event.payload.ed_ilk` and `event.payload.conversation` hold the ED and the person's
+    conversation: keep them with `set_variable` when an agent needs them.
+- **`reply`** answers the request, once: `{"type": "reply", "status": "done", "result": {...}}`.
+  - `status: error` takes an `error_code`, and `status: pending` says the result comes later.
+  - The conscious waits 60 s for it, and a timer fires 60 s ahead at the earliest. A request that
+    may take longer replies `pending` at once.
+  - A second reply is not sent, and the log says so.
+- **`notify`** gives the result after a reply `pending`, from any state, a timer's fire included:
+  `{"type": "notify", "status": "done", "result": {...}}`. It goes to the conscious that asked, on
+  the person's conversation; the conscious tells the person.
+- **Never send the conscious a message:** only `reply` and `notify` reach it. A send or a forward
+  to it is a `COMPILE_ERROR`, since it would start a turn whose answer comes back (a loop).
+- **The help is the interface.** The conscious reads `WF_HELP`: the `description`, the
+  `input_schema` and the `request_actions`, each `{"name": "invoice_state", "description": "..."}`
+  as `input.action` names it. Write them for the conscious's model.
+- **A failed state** may hold both a `reply` and a `notify` of the error, each with `on_error:
+  continue`. The one that fits goes.
+
+The smallest door: an agent reads the CRM, and the door answers within the turn.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "door",
+  "description": "Invoices: the state of an invoice, by its number.",
+  "start_from": ["AI.ed4qm7k2xa@worker1"],
+  "request_actions": [{"name": "invoice_state", "description": "The state of an invoice, by its number."}],
+  "input_schema": {"type": "object", "required": ["action", "number"], "properties": {"action": {"type": "string", "enum": ["invoice_state"]}, "number": {"type": "string"}}},
+  "initial_state": "reading",
+  "terminal_states": ["answered", "failed"],
+  "states": [
+    {
+      "name": "reading",
+      "entry_actions": [
+        {"type": "send_message", "target": "AI.billing.ed4qm7k2xa@worker1", "meta": {"msg": "INVOICE_STATE"},
+         "payload": {"type": "text", "content": "Read this invoice's state in the CRM."}, "vars": {"number": {"$ref": "input.number"}},
+         "menu": {"options": [{"name": "found", "description": "The CRM has the invoice.", "params": {"state": {"type": "string", "enum": ["paid", "pending", "overdue"]}}}]}}
+      ],
+      "transitions": [
+        {"event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"}, "guard": "event.context.evaluation.option == 'found'", "target_state": "answered",
+         "actions": [{"type": "reply", "status": "done", "result": {"state": {"$ref": "event.context.evaluation.params.state"}}}]},
+        {"event_match": {"src": "AI.billing.ed4qm7k2xa@worker1"}, "guard": "true", "target_state": "answered",
+         "actions": [{"type": "reply", "status": "error", "error_code": "INVOICE_NOT_FOUND"}]}
+      ]
+    },
+    {"name": "answered"},
+    {"name": "failed", "entry_actions": [{"type": "reply", "status": "error", "error_code": "CAPABILITY_FAILED", "on_error": "continue"}]}
+  ]
+}
+```
+
+A request that takes long: go/nodes/wf/examples/packages/wf.capability.billing (`reconcile`).
 
 ### 4.3 IO nodes
 

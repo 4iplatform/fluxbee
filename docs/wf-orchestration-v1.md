@@ -29,6 +29,9 @@
   It was validated on 8.x on 2026-11-03, in two runs, the second from zero (§5.5.3; ledger 0.1.95
   to 0.1.98). With it went the ILK fix (A-139) and the bugs of Case 4's test. **The track is
   complete.**
+- **A capability's door (§5.6)**, the Digital Executive's stage 3, release 3B: `start_from` with
+  the ED's consciouses, the `reply` and `notify` actions, the compiler's guard against A-118's loop,
+  and the door's actions in its help. Built and unit-tested; it ships with release 3A.
 - **After the track (the operator, 2026-11-03):** the atoms (handbook §4.2.6) become a document of
   their own, a reservoir Archi reads to develop solutions. They move with the solutions chapter,
   where a solution lives; until then they stay in the handbook.
@@ -2146,6 +2149,58 @@ would know, that the IO nodes are clients with no config.
 
 **Not checked live:** io.slack's fixes (A-130, A-108, A-129), which need a person in Slack or a
 file in the blob store. Its 79 tests cover them; io.slack's revamp will exercise them.
+
+### 5.6 A capability's door
+
+The Digital Executive's stage 3 ([digital-executive-v1-stage-3](digital-executive-v1-stage-3.md)
+§5, §6.1; release 3B) puts a WF at each capability's door: the ED's conscious asks it, within its
+turn, and gets the answer as its tool's result, or later. Built in go/pkg/wfcel and
+go/nodes/wf/wf-generic; the language's reference is docs/spec-systemnode-wf-v1_1.md (§8.1, §8.5,
+§10.11, §10.12, §14.2, §15), and the example go/nodes/wf/examples/packages/wf.capability.billing.
+
+- **`start_from` takes the ED's consciouses,** and it is the one place an agent appears there. It
+  breaks none of §1 and §5.2.1 item 2: the conscious's message still starts nothing.
+  - A door of one ED names its conscious: `"start_from": ["AI.ed4qm7k2xa@worker1"]`, written by
+    SY.deploy.
+  - A door for all of its tenant's EDs has the consciouses marker: `"start_from": [{"consciouses":
+    "tenant"}]`. No list of names is rewritten as EDs come and go.
+  - A conscious starts an instance only with a `CAPABILITY_REQUEST`, a system message it waits on
+    for 60 s by its trace: `{request_id, ed_ilk, input, conversation}`, the conversation from its
+    turn (the person's thread, the person, the IO node and its `reply_target`).
+  - **The door checks the sender in identity's SHM,** never by a message to SY.identity. The node
+    ILK whose `handler_node` is the sender works for `ed_ilk` as its `conscious`. A door of one ED
+    takes its own ED only, the one its own ILK works for. A door for its tenant's EDs, whose ILK
+    works for nobody, takes an ED that is a person of its tenant.
+  - Anything else is answered `status: error`: `UNAUTHORIZED`, `INVALID_REQUEST` (no
+    `request_id` or `ed_ilk`) or `INVALID_INPUT` (the `input_schema` refuses the input).
+  - **Each request is an instance of its own.** Its input is the request's `input`, its thread its
+    own id (the conversation with the capability's agents, which the WF opens), and it keeps the
+    request (schema v8). The conscious's user message starts nothing and drives nothing.
+- **`reply`, a new action,** answers the request that started the instance: a
+  `CAPABILITY_REQUEST_RESPONSE`, on the request's trace, `{request_id, status, result?,
+  error_code?, message?}`. Its status is `done`, `pending` (the result comes later) or `error`.
+  - Once per request: a second reply is not sent, whatever its `on_error`, and the log says so.
+  - The conscious waits 60 s, and a timer fires 60 s ahead at the earliest. A request that may take
+    longer replies `pending` at once.
+- **`notify`, a new action,** gives the result after a reply `pending`, from any state, a timer's
+  fire included. It is a `user` message to the conscious that asked, and to no one else, on the
+  person's thread. Its `meta.context.capability_result` is `{request_id, capability, status,
+  result?, error_code?, message?, conversation}`, and its text renders the result for the model.
+  The conscious answers the person through the conversation's IO node, never the WF.
+- **The guard (A-118's loop):** the compiler refuses a `send_message` or a `forward` to a conscious
+  that `start_from` names. Only `reply` and `notify` reach it, and the conscious answers neither to
+  the WF. Under the marker no conscious is named, and the engine refuses, at run time, a send to the
+  one that asked.
+- **The help is the interface:** a door answers `WF_HELP` to the consciouses its `start_from`
+  takes, checked as a request is. With the help come its `actions`: the definition's
+  `request_actions`, each a name and an optional description (`{"name": "invoice_state",
+  "description": "The state of an invoice, by its number."}`).
+- **Open, for the integration with release 3A:**
+  - the Go SDK reads no ILK's tenant yet: the door reads it from the SHM itself
+    (go/nodes/wf/wf-generic/node/identity.go), until the SDK's helper gives it;
+  - `CAPABILITY_REQUEST` and its response are no protected system action
+    (src/router/system_policy.rs), so the router's system gate leaves them alone; stage 3's gate
+    checks the path live.
 
 ## 6. Docs that drift from the code
 
