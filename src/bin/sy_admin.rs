@@ -5502,7 +5502,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "30";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "31";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -6345,6 +6345,20 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: false,
         allow_legacy_hive_id: false,
     },
+    // The packages SY.deploy deploys (docs/digital-executive-v1-stage-3.md §3): a released one
+    // published to its catalog, and a version withdrawn from it.
+    InternalActionSpec {
+        action: "cd_publish",
+        route: InternalActionRoute::DeployCommand,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "cd_unpublish",
+        route: InternalActionRoute::DeployCommand,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 /// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
@@ -6545,7 +6559,12 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "cd_list"
         | "cd_remove"
         | "cd_catalog"
-        | "cd_tree" => MeshAccess::Archi,
+        | "cd_tree"
+        // The packages of SY.deploy's catalog (docs/digital-executive-v1-stage-3.md §3): Archi
+        // publishes its CI's and withdraws one, never Fluxbee Cloud, which reads the catalog
+        // (neither is in `CLOUD_EXPOSED_ACTIONS`).
+        | "cd_publish"
+        | "cd_unpublish" => MeshAccess::Archi,
         _ => return None,
     };
     Some(access)
@@ -11720,7 +11739,7 @@ async fn dispatch_internal_admin_command(
         // are not (docs/digital-executive-v1-stage-2.md §2).
         InternalActionRoute::DeployCommand => {
             let started = Instant::now();
-            let logged_params = admin_command_log_params(&params);
+            let logged_params = admin_command_log_params(&deploy_order_log_params(action, &params));
             let (status, body) =
                 handle_deploy_order(client, &ctx.hive_id, action, "command", params).await;
             let result = Ok(InternalAdminDispatchResult {
@@ -13847,17 +13866,47 @@ async fn handle_cd_paths(
                 .collect(),
         )
     };
+    // A write's body: none reads as `{}`, which the action refuses for what it lacks.
+    let body_payload = || -> Result<serde_json::Value, serde_json::Error> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            Ok(serde_json::json!({}))
+        } else {
+            serde_json::from_slice(body)
+        }
+    };
     let internal = match (method, segments.as_slice()) {
         ("POST", ["deployments"]) => {
-            let payload = if body.iter().all(u8::is_ascii_whitespace) {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(body)?
-            };
             dispatch_internal_admin_command(
                 ctx,
                 client,
                 "cd_deploy",
+                None,
+                body_payload()?,
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        // The packages of SY.deploy's catalog (docs/digital-executive-v1-stage-3.md §3).
+        ("POST", ["packages"]) => {
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_publish",
+                None,
+                body_payload()?,
+                AdminOrigin::Http,
+            )
+            .await?
+        }
+        ("POST", ["packages", package_id, version, "unpublish"]) => {
+            let payload = serde_json::json!({
+                "id": decode_percent(package_id),
+                "version": decode_percent(version),
+            });
+            dispatch_internal_admin_command(
+                ctx,
+                client,
+                "cd_unpublish",
                 None,
                 payload,
                 AdminOrigin::Http,
@@ -15729,6 +15778,15 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "NUMBER_TAKEN"
         | "DEPLOYMENT_NOT_REMOVABLE" => 409,
         "HIVE_UNAVAILABLE" | "DEPLOY_UNAVAILABLE" => 503,
+        // SY.deploy's catalog (docs/digital-executive-v1-stage-3.md §3): a package its format
+        // refuses (the message says why); the same id and version with another content (a change
+        // is a new version); a package past one mesh message, SY.admin's own refusal before it
+        // sends one too (`package_too_large_response`); and a cd_deploy while SY.deploy holds no
+        // package at all, retryable (`DEPLOY_RETRYABLE_CODES`).
+        "PACKAGE_INVALID" => 400,
+        "PACKAGE_CHANGED" => 409,
+        "PACKAGE_TOO_LARGE" => 413,
+        "CATALOG_NOT_READY" => 503,
         "UNAUTHORIZED"
         | "SYSTEM_ILK_PROTECTED"
         | "TENANT_ROOT_PROTECTED"
@@ -16521,17 +16579,25 @@ fn normalize_wf_rules_target(target: Option<String>, fallback_hive: &str) -> Str
         .unwrap_or_else(|| fallback_hive.to_string())
 }
 
-/// SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2): `cd_deploy` and `cd_remove`
-/// (writes, `InternalActionRoute::DeployCommand`), `cd_get`, `cd_list`, `cd_catalog` and `cd_tree`
-/// (reads, `InternalActionRoute::DeployQuery`).
-const DEPLOY_ORDERS: [&str; 6] = [
+/// SY.deploy's orders (docs/digital-executive-v1-stage-2.md §2), in the registry's order:
+/// `cd_deploy` and `cd_remove` (writes, `InternalActionRoute::DeployCommand`), `cd_get`, `cd_list`,
+/// `cd_catalog` and `cd_tree` (reads, `InternalActionRoute::DeployQuery`), and the writes of its
+/// catalog, `cd_publish` and `cd_unpublish` (docs/digital-executive-v1-stage-3.md §3).
+const DEPLOY_ORDERS: [&str; 8] = [
     "cd_deploy",
     "cd_get",
     "cd_list",
     "cd_remove",
     "cd_catalog",
     "cd_tree",
+    "cd_publish",
+    "cd_unpublish",
 ];
+
+/// What SY.admin answers a `cd_publish` whose message to SY.deploy would not fit one frame
+/// (docs/digital-executive-v1-stage-3.md §3: a message is at most 128 KiB), with nothing sent; and
+/// what SY.deploy answers a package past its own bound.
+const PACKAGE_TOO_LARGE: &str = "PACKAGE_TOO_LARGE";
 
 /// The field of an order SY.admin stamps, `{by, tenant_id}` (`stamp_relay_facts`), and refuses in
 /// a request.
@@ -16541,10 +16607,16 @@ const DEPLOY_CALLER_FIELD: &str = "_caller";
 const DEPLOY_UNAVAILABLE: &str = "DEPLOY_UNAVAILABLE";
 
 /// SY.deploy's answers that changed nothing and may pass when asked again: a hive it cannot reach
-/// now, another deployment of the grouping under way, and no answer at all. Each carries
-/// `payload.retryable: true`; a write asked again with its `request_key` gives back the same
-/// deployment.
-const DEPLOY_RETRYABLE_CODES: [&str; 3] = ["HIVE_UNAVAILABLE", "BUSY", DEPLOY_UNAVAILABLE];
+/// now, another deployment of the grouping under way, a catalog it does not hold yet (no package
+/// published since its start, docs/digital-executive-v1-stage-3.md §3), and no answer at all. Each
+/// carries `payload.retryable: true`; a write asked again with its `request_key` gives back the
+/// same deployment, and a publish asked again answers `kept: already` once its copy is kept.
+const DEPLOY_RETRYABLE_CODES: [&str; 4] = [
+    "HIVE_UNAVAILABLE",
+    "BUSY",
+    "CATALOG_NOT_READY",
+    DEPLOY_UNAVAILABLE,
+];
 
 /// How long SY.admin waits for SY.deploy's answer: 10 s, since SY.deploy answers an order before it
 /// starts any step (docs/digital-executive-v1-stage-2.md §2).
@@ -16552,16 +16624,15 @@ fn deploy_request_timeout() -> Duration {
     Duration::from_secs(env_timeout_secs("JSR_ADMIN_DEPLOY_TIMEOUT_SECS").unwrap_or(10))
 }
 
-/// Why an order cannot go to SY.deploy as it is: it is no JSON object, or a `cd_remove` names
-/// other than exactly one of a deployment and a grouping (docs/digital-executive-v1-stage-2.md
-/// §2). SY.deploy checks the rest: the source, the blanks, the ids and the tenant.
+/// Why an order cannot go to SY.deploy as it is: it is no JSON object, a `cd_remove` names other
+/// than exactly one of a deployment and a grouping (docs/digital-executive-v1-stage-2.md §2), a
+/// `cd_publish` carries no `package` object, or a `cd_unpublish` does not name the package's `id`
+/// and `version` (docs/digital-executive-v1-stage-3.md §3). SY.deploy checks the rest: the source,
+/// the blanks, the ids, the tenant, and a package's whole format.
 fn deploy_order_request_error(action: &str, payload: &serde_json::Value) -> Option<String> {
     let Some(object) = payload.as_object() else {
         return Some(format!("{action} takes a JSON object"));
     };
-    if action != "cd_remove" {
-        return None;
-    }
     let named = |field: &str| {
         object
             .get(field)
@@ -16569,15 +16640,86 @@ fn deploy_order_request_error(action: &str, payload: &serde_json::Value) -> Opti
             .is_some_and(|id| !id.trim().is_empty())
     };
     let given = |field: &str| object.get(field).is_some_and(|value| !value.is_null());
-    match (named("deployment_id"), named("grouping_id")) {
-        (true, false) if !given("grouping_id") => None,
-        (false, true) if !given("deployment_id") => None,
-        _ => Some(
-            "cd_remove names exactly one of deployment_id (one deployment) and grouping_id (a \
-             whole grouping), a non-empty string"
+    match action {
+        "cd_remove" => match (named("deployment_id"), named("grouping_id")) {
+            (true, false) if !given("grouping_id") => None,
+            (false, true) if !given("deployment_id") => None,
+            _ => Some(
+                "cd_remove names exactly one of deployment_id (one deployment) and grouping_id (a \
+                 whole grouping), a non-empty string"
+                    .to_string(),
+            ),
+        },
+        "cd_publish" if !object.get("package").is_some_and(serde_json::Value::is_object) => Some(
+            "cd_publish takes {package}: one released package, a JSON object in SY.deploy's format"
                 .to_string(),
         ),
+        "cd_unpublish" if !(named("id") && named("version")) => Some(
+            "cd_unpublish names the package's id and version, each a non-empty string".to_string(),
+        ),
+        _ => None,
     }
+}
+
+/// What SY.admin's command log keeps of an order's params, before `admin_command_log_params`
+/// redacts and bounds them: a `cd_publish`'s package by what names it, its `id`, `version`, `kind`
+/// and `origin`, and its size in `bytes` (a whole package is up to a message's worth, which the
+/// log's bound would cut to a preview that may not name it); every other field, and every other
+/// order, as it is.
+fn deploy_order_log_params(action: &str, params: &serde_json::Value) -> serde_json::Value {
+    let Some(fields) = params.as_object().filter(|_| action == "cd_publish") else {
+        return params.clone();
+    };
+    let summary = |package: &serde_json::Value| {
+        let mut named: serde_json::Map<String, serde_json::Value> =
+            ["id", "version", "kind", "origin"]
+                .into_iter()
+                .filter_map(|field| {
+                    let value = package.get(field).filter(|value| value.is_string())?;
+                    Some((field.to_string(), value.clone()))
+                })
+                .collect();
+        named.insert(
+            "bytes".to_string(),
+            serde_json::json!(mesh_reply::serialized_len(package)),
+        );
+        serde_json::Value::Object(named)
+    };
+    serde_json::Value::Object(
+        fields
+            .iter()
+            .map(|(name, value)| {
+                let value = if name == "package" {
+                    summary(value)
+                } else {
+                    value.clone()
+                };
+                (name.clone(), value)
+            })
+            .collect(),
+    )
+}
+
+/// SY.admin's refusal of a `cd_publish` whose message would not reach SY.deploy: past one frame
+/// (`mesh_reply::REPLY_MAX_BYTES`, the 128 KiB frame less the router's reserve), which the SDK or
+/// the router would drop with no answer. Nothing is sent; a package is never cut, so asking again
+/// cannot pass: `413 PACKAGE_TOO_LARGE`, never retryable.
+fn package_too_large_response(action: &str, size: usize) -> (u16, String) {
+    (
+        error_code_to_http_status(PACKAGE_TOO_LARGE),
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": PACKAGE_TOO_LARGE,
+            "error_detail": format!(
+                "the package's message to SY.deploy would take {size} bytes, past the {} one mesh \
+                 message carries (docs/digital-executive-v1-stage-3.md §3): nothing was sent",
+                mesh_reply::REPLY_MAX_BYTES
+            ),
+        })
+        .to_string(),
+    )
 }
 
 /// The HTTP status of SY.deploy's refusal: SY.admin's for every code but `BUSY`, which from
@@ -16645,7 +16787,8 @@ fn deploy_order_answer(
 /// `wf_rules_*` reads go to SY.wf-rules: the action's name, its payload (the request with the
 /// `_caller` SY.admin stamped), as a `command` or a `query`, and SY.deploy's answer
 /// (`deploy_order_answer`). A field of the request that is null reads as absent and is not sent:
-/// the executor passes null for an optional field its plan leaves out.
+/// the executor passes null for an optional field its plan leaves out. A `cd_publish` too large
+/// for one message is answered here (`package_too_large_response`), never sent.
 async fn handle_deploy_order(
     client: &RouterDispatcher,
     admin_hive: &str,
@@ -16660,6 +16803,18 @@ async fn handle_deploy_order(
         fields.retain(|_, value| !value.is_null());
     }
     let target = format!("{DEPLOY_NODE_ROLE}@{admin_hive}");
+    if action == "cd_publish" {
+        let size = l2_action_message_len(
+            client.sender_snapshot().uuid(),
+            &target,
+            kind,
+            action,
+            &payload,
+        );
+        if size > mesh_reply::REPLY_MAX_BYTES {
+            return package_too_large_response(action, size);
+        }
+    }
     let answer = send_l2_action_request(
         client,
         &target,
@@ -16672,18 +16827,18 @@ async fn handle_deploy_order(
     deploy_order_answer(action, &target, answer)
 }
 
-async fn send_l2_action_request(
-    client: &RouterDispatcher,
+/// The message `send_l2_action_request` sends: `action` as a `msg_type` (`command` or `query`)
+/// from `src` to `target`, its trace id left for the dispatcher to mint.
+fn l2_action_message(
+    src: &str,
     target: &str,
     msg_type: &str,
     action: &str,
     payload: serde_json::Value,
-    timeout_window: Duration,
-) -> Result<serde_json::Value, AdminError> {
-    let sender = client.sender_snapshot();
-    let msg = Message {
+) -> Message {
+    Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: src.to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
@@ -16697,7 +16852,34 @@ async fn send_l2_action_request(
             ..Meta::default()
         },
         payload,
-    };
+    }
+}
+
+/// The bytes that message takes serialized with `payload`, as it leaves SY.admin: with the trace
+/// id the dispatcher mints, a UUID. Measured without a copy of the payload (a publish's package):
+/// the envelope with a null payload, less the null, plus the payload.
+fn l2_action_message_len(
+    src: &str,
+    target: &str,
+    msg_type: &str,
+    action: &str,
+    payload: &serde_json::Value,
+) -> usize {
+    let mut envelope = l2_action_message(src, target, msg_type, action, serde_json::Value::Null);
+    envelope.routing.trace_id = Uuid::nil().to_string();
+    mesh_reply::serialized_len(&envelope) - "null".len() + mesh_reply::serialized_len(payload)
+}
+
+async fn send_l2_action_request(
+    client: &RouterDispatcher,
+    target: &str,
+    msg_type: &str,
+    action: &str,
+    payload: serde_json::Value,
+    timeout_window: Duration,
+) -> Result<serde_json::Value, AdminError> {
+    let sender = client.sender_snapshot();
+    let msg = l2_action_message(sender.uuid(), target, msg_type, action, payload);
     let success = match msg_type {
         "command" => vec![
             RouteMatch::any_msg_type("command"),
@@ -17716,9 +17898,11 @@ fn admin_action_is_read_only(action: &str) -> bool {
             // It mints a one-time way in to an exposure.
             | "issue_exposure_link"
             // SY.deploy's writes: a deployment made, or ended (docs/digital-executive-v1-stage-2.md
-            // §2).
+            // §2), and a package published to its catalog, or withdrawn (stage 3, §3).
             | "cd_deploy"
             | "cd_remove"
+            | "cd_publish"
+            | "cd_unpublish"
     )
 }
 
@@ -17789,6 +17973,11 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             // A Digital Executive born (a person, its nodes, its keys assigned), or retired.
             | "cd_deploy"
             | "cd_remove"
+            // What Fluxbee Cloud offers its tenants to deploy, a package more or one less, as
+            // publish_runtime_package and unpublish_artifact: Archi's start publishes its CI by
+            // its own path, the operator's chat says so first.
+            | "cd_publish"
+            | "cd_unpublish"
     )
 }
 
@@ -17995,6 +18184,8 @@ fn admin_action_summary(action: &str) -> &'static str {
         "cd_list" => "List SY.deploy's deployments, by tenant, grouping kind or grouping.",
         "cd_remove" => "Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed.",
         "cd_catalog" => "List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks.",
+        "cd_publish" => "Publish one released package to SY.deploy's catalog (Archi's CI): SY.deploy checks its format and keeps a copy, answering kept new or already with its id, version and hash; PACKAGE_INVALID says why, PACKAGE_CHANGED is the same id and version with other content, PACKAGE_TOO_LARGE one past a mesh message (128 KiB).",
+        "cd_unpublish" => "Withdraw one version of a package from SY.deploy's catalog: it is offered no more and no new deployment takes it; the deployments that run it keep it.",
         "cd_tree" => "Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret.",
         _ => "Admin action.",
     }
@@ -18261,6 +18452,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         ],
         "cd_catalog" => vec!["GET /cd/catalog"],
         "cd_tree" => vec!["GET /cd/tree"],
+        "cd_publish" => vec!["POST /cd/packages"],
+        "cd_unpublish" => vec!["POST /cd/packages/{id}/{version}/unpublish"],
         _ => Vec::new(),
     }
 }
@@ -18405,6 +18598,18 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "string",
             "The deployment, as cd_deploy answered it.",
         )],
+        "cd_unpublish" => vec![
+            admin_action_path_param(
+                "id",
+                "string",
+                "The package's id, as cd_publish answered it (cd_catalog lists it).",
+            ),
+            admin_action_path_param(
+                "version",
+                "string",
+                "The version of it to withdraw; the others stay offered.",
+            ),
+        ],
         // The name the route stores and the orchestrator reads (A-172's family).
         "get_hive" | "remove_hive" => vec![admin_action_path_param(
             "hive_id",
@@ -18693,6 +18898,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "unpublish_exposure"
             | "issue_exposure_link"
             | "cd_deploy"
+            | "cd_publish"
     )
 }
 
@@ -18994,6 +19200,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "tenant_id",
             "string",
             "The tenant, tnt:<uuid>; over HTTP ?tenant_id=.",
+        )],
+        "cd_publish" => vec![admin_action_body_field(
+            "package",
+            "object",
+            "One released package, as Archi's CI keeps it, in SY.deploy's format (docs/digital-executive-v1-stage-3.md §2): schema, id, version, kind (executive, capability or infrastructure), origin (system, catalog or custom), offered_to, title, description, blanks, founds (an executive only), nodes (AI, IO or WF, each with its work_role; a WF with its definition) and vault. SY.deploy validates it: PACKAGE_INVALID (400) says why.",
         )],
         _ => Vec::new(),
     }
@@ -20013,6 +20224,39 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "tenant_id": "tnt:11111111-1111-4111-8111-111111111111"
         }),
         "cd_remove" => serde_json::json!({ "deployment_id": "dp7xk3m2qa" }),
+        // The smallest package: infrastructure, one agent for every ED of a tenant. Archi's
+        // release writes a package whole; its text goes between the SCMD's single quotes.
+        "cd_publish" => serde_json::json!({
+            "package": {
+                "schema": 1,
+                "id": "policies",
+                "version": "1",
+                "kind": "infrastructure",
+                "origin": "catalog",
+                "offered_to": { "tenants": "all" },
+                "title": "Company policies",
+                "description": "An agent that knows the company policies, for every ED of the tenant.",
+                "blanks": [],
+                "nodes": [{
+                    "role": "policies",
+                    "kind": "AI",
+                    "middle": "policies",
+                    "runtime": "ai.generic",
+                    "work_role": "agent",
+                    "provider": "anthropic",
+                    "config": { "behavior": { "kind": "ai_chat", "model": "claude-sonnet-5-5" } },
+                    "definition": {
+                        "role": {
+                            "asset_type": "role",
+                            "name": "Policies",
+                            "description": "You answer questions about the company policies, briefly, from what you know."
+                        }
+                    }
+                }],
+                "vault": []
+            }
+        }),
+        "cd_unpublish" => serde_json::json!({ "id": "policies", "version": "1" }),
         _ => serde_json::Value::Null,
     }
 }
@@ -20352,6 +20596,13 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "cd_remove" => "curl -X POST /cd/deployments/dp7xk3m2qa/remove",
         "cd_catalog" => "curl -X GET /cd/catalog",
         "cd_tree" => "curl -X GET /cd/tree?tenant_id=tnt:11111111-1111-4111-8111-111111111111",
+        "cd_publish" => {
+            return Some(format!(
+                "curl -X POST /cd/packages -d '{}'",
+                admin_action_example_payload(action)
+            ));
+        }
+        "cd_unpublish" => "curl -X POST /cd/packages/policies/1/unpublish",
         _ => return None,
     };
     Some(text.to_string())
@@ -20384,7 +20635,11 @@ const VIRTUAL_PERSON_CLOUD_NOTE: &str = "Fluxbee Cloud's call on a virtual perso
 
 /// What every one of SY.deploy's orders says of its path, its callers and its codes
 /// (docs/digital-executive-v1-stage-2.md §2).
-const DEPLOY_ORDER_NOTE: &str = "Forwarded to SY.deploy@motherbee (docs/digital-executive-v1-stage-2.md §2) with _caller {by, tenant_id} stamped by SY.admin: a request that carries _caller is refused (INVALID_REQUEST), and a null field is not sent. Only Fluxbee Cloud's names a tenant, the one it claims: SY.deploy answers NOT_FOUND for another tenant's. Codes: 400 INVALID_REQUEST, BLANK_INVALID; 404 NOT_FOUND, SOURCE_NOT_FOUND; 409 REQUEST_KEY_REUSED, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, DEPLOYMENT_NOT_REMOVABLE; 503 HIVE_UNAVAILABLE, BUSY and, with no answer in 10 s, DEPLOY_UNAVAILABLE, each with payload.retryable true.";
+const DEPLOY_ORDER_NOTE: &str = "Forwarded to SY.deploy@motherbee (docs/digital-executive-v1-stage-2.md §2) with _caller {by, tenant_id} stamped by SY.admin: a request that carries _caller is refused (INVALID_REQUEST), and a null field is not sent. Only Fluxbee Cloud's names a tenant, the one it claims: SY.deploy answers NOT_FOUND for another tenant's. Codes: 400 INVALID_REQUEST, BLANK_INVALID; 404 NOT_FOUND, SOURCE_NOT_FOUND; 409 REQUEST_KEY_REUSED, AI_KEY_MISSING, CREDENTIAL_MISSING, NUMBER_TAKEN, DEPLOYMENT_NOT_REMOVABLE; 503 HIVE_UNAVAILABLE, BUSY, CATALOG_NOT_READY (a cd_deploy while SY.deploy holds no package yet, docs/digital-executive-v1-stage-3.md §3) and, with no answer in 10 s, DEPLOY_UNAVAILABLE, each with payload.retryable true.";
+
+/// What both writes of SY.deploy's catalog say of their path, their callers and their codes
+/// (docs/digital-executive-v1-stage-3.md §3).
+const PACKAGE_ORDER_NOTE: &str = "Forwarded to SY.deploy@motherbee as a command (docs/digital-executive-v1-stage-3.md §3) with _caller {by, tenant_id: null} stamped by SY.admin: a request that carries _caller is refused (INVALID_REQUEST), and a null field is not sent. Archi's over the mesh, and the operator's over HTTP and through the executor; never Fluxbee Cloud's, which reads the catalog (cd_catalog). In the command log, a publish by its package's id, version, kind, origin and size. Codes: 400 INVALID_REQUEST, PACKAGE_INVALID (its message says why); 409 PACKAGE_CHANGED; 413 PACKAGE_TOO_LARGE; 503 BUSY and, with no answer in 10 s, DEPLOY_UNAVAILABLE, each with payload.retryable true: a publish sent again answers kept already once its copy is kept.";
 
 /// What every removal says of the public pages it leaves up (`pages_left_up`, FINDINGS A-242).
 const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDINGS A-242): a page outlives its publisher, its tenant and its hive, and stays up until its expires_at (24 h after its publish by default, 30 days at most, never renewed; the edge then serves it no more and SY.admin's sweep retires it) or until it is taken down. The ok answer names the pages it leaves up in payload.pages_left_up: {count, pages: [{publication_id, expires_at (epoch seconds), status, filename_original, publisher_l2_name, tenant_id, edge_node}], more}, soonest to expire first, at most 20 of them in 8 KiB (more counts the rest), never a link's key. A ledger SY.admin cannot read gives {count: null, error}, and refuses nothing. GET /artifacts lists every page that is up; POST /artifacts/unpublish takes one down by its publication_id.";
@@ -21190,6 +21445,16 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "cd_tree" => vec![
             "Read when asked: the tenant's infra deployments, its EDs (virtual persons) with their documents, each ED's parts (the ILKs whose works_for names it) with role, node and status, and its deployments with source, version, state, each agent's assets and each IO's credential key names.",
             DEPLOY_ORDER_NOTE,
+        ],
+        "cd_publish" => vec![
+            "The body is {package}, one released package as Archi's CI keeps it: the system ones Fluxbee ships (/usr/share/fluxbee/solutions) and Archi's own (state/packages). SY.deploy checks its format (its kind and origin, its nodes and their roles, one door per capability, its blanks and templates), keeps a copy and answers {status: ok, kept: new or already, id, version, hash}: the same id and version again with the same content is kept already; with other content PACKAGE_CHANGED (409), since a change is a new version.",
+            "A package whose message to SY.deploy would pass one mesh message (128 KiB, less the router's reserve) is refused by SY.admin with 413 PACKAGE_TOO_LARGE and nothing is sent; asking again cannot pass.",
+            "Archi publishes every package it has at its start, one by one (docs/digital-executive-v1-stage-3.md §3, §11); until SY.deploy holds one, its cd_deploy answers CATALOG_NOT_READY (503, retryable).",
+            PACKAGE_ORDER_NOTE,
+        ],
+        "cd_unpublish" => vec![
+            "The package's id and version, the path's (POST /cd/packages/{id}/{version}/unpublish): each a non-empty string, or INVALID_REQUEST before SY.deploy is asked. That version is offered no more (cd_catalog leaves it out) and no new deployment takes it; the deployments that run it keep it, and its copy stays while one does.",
+            PACKAGE_ORDER_NOTE,
         ],
         _ => vec![],
     }
@@ -41635,7 +41900,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "30");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "31");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -53123,6 +53388,381 @@ mod tests {
         );
         assert_eq!(status, 409);
         assert!(envelope_of(&body)["payload"].get("retryable").is_none());
+    }
+
+    /// The two writes of SY.deploy's catalog are actions of the catalog
+    /// (docs/digital-executive-v1-stage-3.md §3): their routes, their help, a write's
+    /// confirmation, and who may ask for them over the mesh: Archi alone, never IO.cloud (Fluxbee
+    /// Cloud reads the catalog) nor SY.deploy; SY.deploy's codes for a package as HTTP statuses.
+    #[test]
+    fn sy_deploys_catalog_writes_are_archis_and_the_operators() {
+        for (action, pattern, path, required) in [
+            (
+                "cd_publish",
+                "POST /cd/packages",
+                "/cd/packages",
+                json!(["package"]),
+            ),
+            (
+                "cd_unpublish",
+                "POST /cd/packages/{id}/{version}/unpublish",
+                "/cd/packages/policies/1/unpublish",
+                json!(["id", "version"]),
+            ),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect("registered");
+            assert!(
+                matches!(spec.route, InternalActionRoute::DeployCommand),
+                "{action}"
+            );
+            assert!(!spec.requires_target, "{action}");
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], json!(false), "{action}");
+            assert_eq!(doc["confirmation_required"], json!(true), "{action}");
+            assert_eq!(doc["executor_available"], json!(true), "{action}");
+            assert_eq!(doc["handler"], json!("deploy_command"), "{action}");
+            assert_eq!(doc["path_patterns"], json!([pattern]), "{action}");
+            assert_eq!(
+                admin_methods_allowed_for_path(path),
+                vec!["POST"],
+                "{action}"
+            );
+            let schema = &doc["executor_contract"]["function_schema"];
+            assert_eq!(schema["required"], required, "{action}: {schema}");
+            assert!(
+                admin_action_request_notes(action).contains(&PACKAGE_ORDER_NOTE),
+                "{action}"
+            );
+            assert!(DEPLOY_ORDERS.contains(&action), "{action}");
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&action), "{action}");
+            assert!(
+                fluxbee_sdk::cloud::cloud_deploy_op_params(action).is_none(),
+                "{action}"
+            );
+            assert!(
+                mesh_admits("SY.architect@motherbee", action, None, &json!({})).is_ok(),
+                "{action}"
+            );
+            for caller in [
+                "IO.cloud@motherbee",
+                "SY.deploy@motherbee",
+                "SY.architect@worker1",
+                "SY.wf-rules@motherbee",
+                "AI.ed4qm7k2xa@worker1",
+                "WF.billing.ed4qm7k2xa@worker1",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, None, &json!({})).is_err(),
+                    "{caller} {action}"
+                );
+            }
+            let example = admin_action_example_payload(action);
+            assert_eq!(
+                deploy_order_request_error(action, &example),
+                None,
+                "{action}"
+            );
+        }
+        // The publish's example is its payload, between the SCMD's single quotes.
+        let example = admin_action_example_payload("cd_publish");
+        assert!(!example.to_string().contains('\''));
+        assert_eq!(
+            admin_action_example_scmd("cd_publish"),
+            Some(format!("curl -X POST /cd/packages -d '{example}'"))
+        );
+        assert_eq!(
+            admin_action_example_scmd("cd_unpublish").as_deref(),
+            Some("curl -X POST /cd/packages/policies/1/unpublish")
+        );
+        for words in [
+            "SY.deploy@motherbee",
+            "_caller",
+            "never Fluxbee Cloud",
+            "PACKAGE_CHANGED",
+        ] {
+            assert!(PACKAGE_ORDER_NOTE.contains(words), "{words}");
+        }
+        // What SY.admin refuses before SY.deploy is asked.
+        for (action, payload) in [
+            ("cd_publish", json!({})),
+            ("cd_publish", json!({ "package": null })),
+            ("cd_publish", json!({ "package": "policies" })),
+            (
+                "cd_publish",
+                json!({ "package": [example["package"].clone()] }),
+            ),
+            ("cd_unpublish", json!({})),
+            ("cd_unpublish", json!({ "id": "policies" })),
+            ("cd_unpublish", json!({ "id": "policies", "version": " " })),
+            ("cd_unpublish", json!({ "id": "policies", "version": 1 })),
+            (
+                "cd_unpublish",
+                json!([{ "id": "policies", "version": "1" }]),
+            ),
+        ] {
+            assert!(
+                deploy_order_request_error(action, &payload).is_some(),
+                "{action} {payload}"
+            );
+        }
+        // SY.deploy's codes for a package, and for an order before its first package.
+        for (code, status) in [
+            ("PACKAGE_INVALID", 400),
+            ("PACKAGE_CHANGED", 409),
+            ("PACKAGE_TOO_LARGE", 413),
+            ("CATALOG_NOT_READY", 503),
+        ] {
+            assert_eq!(deploy_error_http_status(code), status, "{code}");
+        }
+        assert!(DEPLOY_RETRYABLE_CODES.contains(&"CATALOG_NOT_READY"));
+        for code in ["PACKAGE_INVALID", "PACKAGE_CHANGED", PACKAGE_TOO_LARGE] {
+            assert!(!DEPLOY_RETRYABLE_CODES.contains(&code), "{code}");
+        }
+        assert!(DEPLOY_ORDER_NOTE.contains("CATALOG_NOT_READY"));
+        // The size SY.admin measures is the message's own, without a copy of its payload.
+        let target = "SY.deploy@motherbee";
+        let mut whole = l2_action_message(
+            "test-uuid",
+            target,
+            "command",
+            "cd_publish",
+            example.clone(),
+        );
+        whole.routing.trace_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            l2_action_message_len("test-uuid", target, "command", "cd_publish", &example),
+            mesh_reply::serialized_len(&whole)
+        );
+        // The command log names a publish's package, never holds it whole.
+        let mut stamped = example.clone();
+        stamped["_caller"] = json!({ "by": "archi", "tenant_id": null });
+        let logged = deploy_order_log_params("cd_publish", &stamped);
+        assert_eq!(
+            logged,
+            json!({
+                "_caller": { "by": "archi", "tenant_id": null },
+                "package": {
+                    "id": "policies",
+                    "version": "1",
+                    "kind": "infrastructure",
+                    "origin": "catalog",
+                    "bytes": mesh_reply::serialized_len(&example["package"]),
+                },
+            })
+        );
+        let unpublish = json!({ "id": "policies", "version": "1" });
+        assert_eq!(
+            deploy_order_log_params("cd_unpublish", &unpublish),
+            unpublish
+        );
+        assert_eq!(deploy_order_log_params("cd_deploy", &stamped), stamped);
+    }
+
+    /// SY.admin forwards a publish and a withdraw to SY.deploy@motherbee as commands, with the
+    /// caller it stamps, and answers what SY.deploy says: kept is a 200, PACKAGE_CHANGED a 409. A
+    /// package too large for one message, one that is no object, IO.cloud and SY.deploy asking:
+    /// refused, nothing sent (docs/digital-executive-v1-stage-3.md §3).
+    #[tokio::test]
+    async fn sy_admin_forwards_the_packages_to_sy_deploy() {
+        let (ctx, mut harness) = opa_test_admin("deploy-packages");
+        let no_query = HashMap::new();
+        let wait = Duration::from_secs(5);
+        fn deploy_answer(sent: &Message, payload: Value) -> Message {
+            let mut reply = reply_to(sent, "", payload);
+            reply.meta.msg_type = format!("{}_response", sent.meta.msg_type);
+            reply.meta.msg = None;
+            reply.meta.action = sent.meta.action.clone();
+            reply
+        }
+        let envelope_of = |body: &str| -> Value { serde_json::from_str(body).expect("JSON") };
+
+        // The operator's publish: a command with the body and the caller; kept is a 200, and the
+        // log names the package by its id and version.
+        let order = admin_action_example_payload("cd_publish");
+        let body = order.to_string();
+        let route = handle_cd_paths(
+            "POST",
+            "/cd/packages",
+            &no_query,
+            body.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        );
+        let deploy = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the publish");
+            assert_eq!(dst_of(&sent), json!(format!("SY.deploy@{PRIMARY_HIVE_ID}")));
+            assert_eq!(sent.meta.msg_type, "command");
+            assert_eq!(sent.meta.action.as_deref(), Some("cd_publish"));
+            let mut expected = order.clone();
+            expected["_caller"] = json!({ "by": "operator", "tenant_id": null });
+            assert_eq!(sent.payload, expected);
+            let kept = json!({
+                "status": "ok",
+                "kept": "new",
+                "id": "policies",
+                "version": "1",
+                "hash": "9f2c",
+            });
+            harness
+                .inject(deploy_answer(&sent, kept))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(route, deploy);
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 200, "{body}");
+        let envelope = envelope_of(&body);
+        assert_eq!(envelope["status"], json!("ok"));
+        assert_eq!(envelope["payload"]["kept"], json!("new"));
+        let logged = fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("the log");
+        let entry: Value =
+            serde_json::from_str(logged.lines().last().expect("an entry")).expect("JSON");
+        assert_eq!(entry["action"], json!("cd_publish"));
+        assert_eq!(entry["origin"], json!("http"));
+        assert_eq!(entry["params"]["package"]["id"], json!("policies"));
+        assert_eq!(entry["params"]["package"]["version"], json!("1"));
+        assert!(entry["params"]["package"].get("nodes").is_none());
+        assert_eq!(entry["params"]["_caller"]["by"], json!("operator"));
+
+        // Archi's withdraw, and the operator's by its path: a command each with the id and the
+        // version; PACKAGE_CHANGED from SY.deploy is a 409, never retryable.
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "cd_unpublish",
+            Some(PRIMARY_HIVE_ID),
+            json!({ "id": "policies", "version": "1" }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        );
+        let deploy = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the withdraw");
+            assert_eq!(sent.meta.msg_type, "command");
+            assert_eq!(
+                sent.payload,
+                json!({
+                    "id": "policies",
+                    "version": "1",
+                    "_caller": { "by": "archi", "tenant_id": null },
+                })
+            );
+            harness
+                .inject(deploy_answer(
+                    &sent,
+                    json!({ "status": "ok", "id": "policies", "version": "1" }),
+                ))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(run, deploy);
+        assert_eq!(result.expect("dispatch").http_status, 200);
+        let route = handle_cd_paths(
+            "POST",
+            "/cd/packages/policies/1/unpublish",
+            &no_query,
+            b"",
+            &ctx,
+            &ctx.rpc,
+        );
+        let deploy = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the withdraw");
+            assert_eq!(sent.meta.action.as_deref(), Some("cd_unpublish"));
+            assert_eq!(sent.payload["id"], json!("policies"));
+            assert_eq!(sent.payload["version"], json!("1"));
+            let changed = json!({
+                "status": "error",
+                "error_code": "PACKAGE_CHANGED",
+                "message": "policies 1 is kept with another content",
+            });
+            harness
+                .inject(deploy_answer(&sent, changed))
+                .await
+                .expect("injected");
+        };
+        let (result, ()) = tokio::join!(route, deploy);
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 409, "{body}");
+        let envelope = envelope_of(&body);
+        assert_eq!(envelope["error_code"], json!("PACKAGE_CHANGED"));
+        assert!(envelope["payload"].get("retryable").is_none());
+
+        // A package past one mesh message: 413 PACKAGE_TOO_LARGE from SY.admin, nothing sent.
+        let mut large = order.clone();
+        large["package"]["description"] = json!("x".repeat(mesh_reply::MAX_FRAME_SIZE));
+        let large = large.to_string();
+        let (status, body) = handle_cd_paths(
+            "POST",
+            "/cd/packages",
+            &no_query,
+            large.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("answered")
+        .expect("routed");
+        assert_eq!(status, 413, "{body}");
+        let envelope = envelope_of(&body);
+        assert_eq!(envelope["error_code"], json!(PACKAGE_TOO_LARGE));
+        assert!(envelope["payload"].get("retryable").is_none());
+
+        // Refused, nothing sent: no package, IO.cloud's and SY.deploy's own, a forged caller.
+        for (action, params, origin, status) in [
+            ("cd_publish", json!({}), AdminOrigin::Http, 400),
+            (
+                "cd_unpublish",
+                json!({ "id": "policies" }),
+                AdminOrigin::Executor,
+                400,
+            ),
+            (
+                "cd_publish",
+                order.clone(),
+                AdminOrigin::Mesh("IO.cloud@motherbee"),
+                403,
+            ),
+            (
+                "cd_unpublish",
+                json!({ "id": "policies", "version": "1" }),
+                AdminOrigin::Mesh("SY.deploy@motherbee"),
+                403,
+            ),
+            (
+                "cd_unpublish",
+                json!({ "id": "policies", "version": "1", "_caller": { "by": "operator" } }),
+                AdminOrigin::Mesh("SY.architect@motherbee"),
+                400,
+            ),
+        ] {
+            let result = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                Some(PRIMARY_HIVE_ID),
+                params.clone(),
+                origin,
+            )
+            .await
+            .expect("dispatch");
+            assert_eq!(
+                result.http_status, status,
+                "{action} {params}: {}",
+                result.envelope
+            );
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
     }
 
     /// The ILK of a Fluxbee Cloud person action whose virtual flag decides it: IO.cloud's relay

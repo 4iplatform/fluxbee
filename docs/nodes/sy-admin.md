@@ -484,7 +484,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `web_status` | answered by SY.admin from what it holds (the exposures registry, the edge's and io.web's last answers, the ACME client), plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
 | `publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link` | `SY.vault@motherbee` (an enable's key), the public edge (a publish's and an unpublish's routes) and `IO.web@motherbee` | `VAULT_PUT`, `EDGE_WEB_ROUTES`, `IO_WEB_EXPOSURES`, `IO_WEB_ACCESS_LINK`, each waited 5 s ([The exposures](#the-exposures)) |
 | `list_exposures` | answered by SY.admin from its registry | |
-| `cd_deploy`, `cd_remove`; `cd_get`, `cd_list`, `cd_catalog`, `cd_tree` | `SY.deploy@motherbee` | a `command` (the writes) or a `query` (the reads) with the action's name, the request and the `_caller` SY.admin stamps (`handle_deploy_order`, `send_l2_action_request`) ([SY.deploy's orders](#sydeploys-orders)) |
+| `cd_deploy`, `cd_remove`, `cd_publish`, `cd_unpublish`; `cd_get`, `cd_list`, `cd_catalog`, `cd_tree` | `SY.deploy@motherbee` | a `command` (the writes) or a `query` (the reads) with the action's name, the request and the `_caller` SY.admin stamps (`handle_deploy_order`, `send_l2_action_request`) ([SY.deploy's orders](#sydeploys-orders)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
@@ -674,6 +674,8 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
 | `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | command | exactly one of `deployment_id` and `grouping_id`, the path's |
 | `cd_catalog` | `GET /cd/catalog` | query | the query's params as fields (none) |
 | `cd_tree` | `GET /cd/tree?tenant_id=` | query | `{tenant_id}` |
+| `cd_publish` | `POST /cd/packages` | command | the body: `{package}`, one released package ([stage 3](../digital-executive-v1-stage-3.md) §2, §3) |
+| `cd_unpublish` | `POST /cd/packages/{id}/{version}/unpublish` | command | `{id, version}`, the path's |
 
 - **The caller, stamped:** every order carries `_caller` `{by, tenant_id}` (`stamp_relay_facts`),
   from the router-stamped caller (`launched_by_for_caller`): `by` is `operator` (the HTTP API, the
@@ -683,11 +685,21 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
   carries `_caller` is refused with `400 INVALID_REQUEST` before anything else, and nothing is sent.
 - **Who asks:** the operator's HTTP API, the executor, Archi (`MeshAccess::Archi`), and Fluxbee Cloud
   through IO.cloud's relay, the six in `CLOUD_EXPOSED_ACTIONS` with their params in the SDK's
-  `CLOUD_DEPLOY_OP_PARAMS`. SY.deploy itself may not.
+  `CLOUD_DEPLOY_OP_PARAMS`. The catalog's two writes, `cd_publish` and `cd_unpublish`, are Archi's,
+  the HTTP API's and the executor's alone: Fluxbee Cloud reads the catalog and never writes it
+  (neither is in `CLOUD_EXPOSED_ACTIONS`). SY.deploy itself may ask for no order.
 - **Refused before SY.deploy is asked** (`deploy_order_request_error`): a payload that is no JSON
-  object, and a `cd_remove` that names other than exactly one of `deployment_id` and `grouping_id`,
-  a non-empty string: `400 INVALID_REQUEST`. SY.deploy checks the rest. A field that is `null` reads
-  as absent and is not sent, as the executor passes `null` for an optional field a plan leaves out.
+  object, a `cd_remove` that names other than exactly one of `deployment_id` and `grouping_id`, a
+  non-empty string, a `cd_publish` whose `package` is no JSON object, and a `cd_unpublish` that does
+  not name `id` and `version`, each a non-empty string: `400 INVALID_REQUEST`. SY.deploy checks the
+  rest, a package's whole format included. A field that is `null` reads as absent and is not sent,
+  as the executor passes `null` for an optional field a plan leaves out.
+- **A package past one message** (stage 3 §3: a message is at most 128 KiB): SY.admin measures the
+  `cd_publish` it would send, serialized (`l2_action_message_len`), and one past
+  `mesh_reply::REPLY_MAX_BYTES` (the frame less the router's reserve), which the SDK or the router
+  would drop with no answer, is refused with `413 PACKAGE_TOO_LARGE` and nothing is sent
+  (`package_too_large_response`); asking again cannot pass. SY.deploy answers the same code for a
+  package past its own bound.
 - **The answers:** an accepted write (`{status: ok, accepted: true, deployment_id, grouping,
   state: deploying}`) is `202` with its status `ok`, so a mesh caller reads it as ok; any other ok,
   `200`. SY.deploy's codes: `INVALID_REQUEST` and `BLANK_INVALID` `400`; `NOT_FOUND` and
@@ -697,8 +709,16 @@ the `wf_rules_*` reads to SY.wf-rules: `send_l2_action_request`, a `command` for
   `BUSY` is a `503`, where SY.wf-rules' is a `409`. SY.deploy not answering within 10 s, or not
   reachable, is `503 DEPLOY_UNAVAILABLE` with `payload.retryable: true` (`deploy_order_answer`): a
   `cd_deploy` sent again with its `request_key` gives back the same deployment.
-- **The audit log:** the two writes are in SY.admin's command log, with the `_caller` stamped on
-  them; the reads are not.
+- **The catalog's answers** (stage 3 §3): a publish kept is `200` `{status: ok, kept: new |
+  already, id, version, hash}` (the same id and version with the same content is `already`); its
+  refusals `PACKAGE_INVALID` `400` (the message says why), `PACKAGE_CHANGED` `409` (the same id and
+  version with another content: a change is a new version) and `PACKAGE_TOO_LARGE` `413`, none
+  retryable. A `cd_deploy` while SY.deploy holds no package at all (before Archi's first publish on
+  a new installation) answers `CATALOG_NOT_READY` `503`, with `payload.retryable: true`. A withdrawn
+  version is offered no more; the deployments that run it keep it.
+- **The audit log:** the four writes are in SY.admin's command log, with the `_caller` stamped on
+  them; the reads are not. A publish is logged by its package's `id`, `version`, `kind`, `origin`
+  and size (`bytes`), never the package whole (`deploy_order_log_params`).
 - **SY.deploy's row** (§8, agreed by the operator on 2026-11-26): `SY.deploy@motherbee`, its name
   exactly, has a clause of its own in `authorize_mesh_caller`, next to Archi's and IO.cloud's,
   admitting the actions of `DEPLOY_STEP_ACTIONS` and nothing else (`authorize_deploy_step`):
@@ -2368,7 +2388,7 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 30, 136 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 31, 138 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -2510,6 +2530,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `cd_remove` | `POST /cd/deployments/{deployment_id}/remove`, `POST /cd/groupings/{grouping_id}/remove` | Remove one deployment, or a whole grouping, through SY.deploy: each node retired (kill_node with retire_instance), an ED marked last (delete_ilk). Answers accepted (202) at once; cd_get follows it to removed. |
 | `cd_catalog` | `GET /cd/catalog` | List the sources SY.deploy holds, ready to deploy, by kind (ed, infra, custom): each with its versions and its blanks. |
 | `cd_tree` | `GET /cd/tree` | Read one tenant's tree from SY.deploy: its infra, its EDs with their documents, each ED's parts (the ILKs that work for it) and its deployments. Never a secret. |
+| `cd_publish` | `POST /cd/packages` | Publish one released package to SY.deploy's catalog (Archi's CI): SY.deploy checks its format and keeps a copy, answering kept new or already with its id, version and hash; PACKAGE_INVALID says why, PACKAGE_CHANGED is the same id and version with other content, PACKAGE_TOO_LARGE one past a mesh message (128 KiB). |
+| `cd_unpublish` | `POST /cd/packages/{id}/{version}/unpublish` | Withdraw one version of a package from SY.deploy's catalog: it is offered no more and no new deployment takes it; the deployments that run it keep it. |
 
 ### HTTP routes outside the catalog
 
