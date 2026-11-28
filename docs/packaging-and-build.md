@@ -21,6 +21,15 @@ motherbee only — see [07-operaciones.md](history/07-operaciones.md) for the de
   wf-generic (Go) is not core since 0.1.124: it ships only as the `wf.engine` runtime below.
 - The **base IO/AI nodes**, defined declaratively in
   [`packaging/base-nodes.json`](../packaging/base-nodes.json) (the single source of truth).
+- The **system solutions** ([digital-executive-v1-stage-3](digital-executive-v1-stage-3.md) §3):
+  the deployable packages that ship with Fluxbee, `packaging/solutions/<id>/<version>.json` in the
+  repo (the plain Digital Executive, `plain-ed/1.json`, among them), installed read-only
+  (`0644`) at `/usr/share/fluxbee/solutions/<id>/<version>.json`. They are the package's, never
+  config: replaced on every upgrade, removed with the package, kept by the factory reset. Archi
+  reads them as `system` (it may derive a custom copy, never edit one) and publishes them to
+  SY.deploy at its start; SY.deploy reads none of them itself
+  ([sy-deploy](nodes/sy-deploy.md)). A new system package, or a new version of one, is a file
+  there and a Fluxbee release.
 
 There are **two layers**:
 
@@ -270,6 +279,8 @@ the problem of whoever connects a Cloud, not of the backend.
 ## 6. References
 
 - [`packaging/base-nodes.json`](../packaging/base-nodes.json) — the declarative base set.
+- [`packaging/solutions/`](../packaging/solutions) — the system solutions, one
+  `<id>/<version>.json` each, which `build-deb.sh` installs at `/usr/share/fluxbee/solutions/`.
 - [`packaging/build-deb.sh`](../packaging/build-deb.sh) — build of the `.deb` (reads the manifest).
 - [`packaging/fluxbee-firstboot`](../packaging/fluxbee-firstboot) — bootstrap + auto-spawn.
 - [`packaging/fluxbee-seed-runtimes`](../packaging/fluxbee-seed-runtimes) — registers the base runtimes

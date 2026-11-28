@@ -254,6 +254,14 @@ ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
 # runtimes to auto-spawn as default instances at boot (boot=true) and under which names.
 install -m0644 packaging/base-nodes.json "$DEST/usr/share/fluxbee/base-nodes.json"
+# The system solutions (docs/digital-executive-v1-stage-3.md §3): the packages that ship with
+# Fluxbee, `packaging/solutions/<id>/<version>.json`, the plain ED's among them. Read-only for
+# Archi, which publishes them to SY.deploy at its start; replaced on every upgrade (the package's,
+# never config), and kept by the factory reset.
+install -d -m0755 "$DEST/usr/share/fluxbee/solutions"
+while IFS= read -r -d '' solution; do
+  install -D -m0644 "$solution" "$DEST/usr/share/fluxbee/solutions/${solution#packaging/solutions/}"
+done < <(find packaging/solutions -mindepth 2 -maxdepth 2 -type f -name '*.json' -print0 | sort -z)
 # The factory reset reads that same manifest to know which nodes are SYSTEM (kept) and which
 # were launched by users (removed). Dry-run by default: `sudo fluxbee-factory-reset`.
 install -m0755 packaging/fluxbee-factory-reset "$DEST/usr/share/fluxbee/fluxbee-factory-reset"
@@ -283,7 +291,8 @@ Description: Fluxbee internal-network orchestration mesh
  architect, cognition, timer, wf-rules, deploy, opa-rules, frontdesk, edge)
  plus the managed IO/AI runtimes (io.api, io.blob, io.cloud, io.slack, io.wapp,
  ai.generic, wf.engine, io.linkedhelper) seeded under dist/runtimes per
- packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes).
+ packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes),
+ and the system solutions Archi publishes to SY.deploy (/usr/share/fluxbee/solutions).
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

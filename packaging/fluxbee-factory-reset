@@ -33,7 +33,8 @@ REMOVED (operator decisions, 2026-09-28):
   - SY.deploy's records of what it deployed (state/sy-deploy/deployments/ and journal/): the
     nodes and ILKs they name go with the users' above, so SY.deploy is held down from the start
     (it would resume a deployment under way) and its records go once the ILKs are purged; its
-    sources' copies stay (state/sy-deploy/sources/, the installation's catalog);
+    packages' copies and their publications stay (state/sy-deploy/sources/ and published/, the
+    installation's catalog);
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
@@ -48,7 +49,8 @@ REMOVED (operator decisions, 2026-09-28):
   - the user OPA policy on every hive (opa_clear: current, staged, backup; routers unload it --
     the SYSTEM policy is baked into the router and untouched).
 
-KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes), what
+KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes, the system
+solutions the package ships in /usr/share/fluxbee/solutions/), what
 starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with their ILK, ICH and
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
 (admin command log, deploy history, vault audit, SY.admin's publication ledger, whose rows say
@@ -101,8 +103,8 @@ WF_NODE_PREFIX = "WF."
 WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (src/release_settings.rs)
 COGNITION_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.cognition (the same)
 CONVERSATION_DIRS = ("thread-state", "immediate-memory")
-# SY.deploy's records of what it deployed (docs/nodes/sy-deploy.md): removed; its sources' copies
-# (sources/) stay.
+# SY.deploy's records of what it deployed (docs/nodes/sy-deploy.md): removed; its packages' copies
+# and their publications (sources/, published/) stay.
 DEPLOY_STATE = os.path.join(STATE_DIR, "state", "sy-deploy")
 DEPLOY_RECORD_DIRS = ("deployments", "journal")
 
