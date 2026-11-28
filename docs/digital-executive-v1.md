@@ -809,3 +809,17 @@ Options (b), a label over several agents, and (c), one node that does everything
   - **origin:** `system` (ships with Fluxbee, locked), `catalog` (Archi's standard), `custom` (made
     by Archi for one tenant or one ED);
   - **offered to:** every tenant, one tenant, or one ED (a custom one).
+
+## 35. Notes, 2026-11-28 (later): what a capability is
+
+- **The operator:**
+  - a capability always works behind the ED; it can be a set of agents associated to reach an
+    objective. Loops are seen later; nothing restricts them now;
+  - custom capabilities are made for the tenant, not restricted to one ED. If one is restricted, it
+    is only a flag in the CI: all EDs, or ED xx;
+  - no capability talks with people. It may have IOs to read external systems, never people.
+- **So, for the package:**
+  - a capability's nodes are agents, and IOs to external systems; none is a channel to people;
+  - each works for the ED it is deployed into (`works_for`), never speaks as it (no `speaks_as`);
+  - offered to: the tenant (custom) or every tenant (catalog), with an optional flag in the CI that
+    narrows it to all EDs or to named EDs.
