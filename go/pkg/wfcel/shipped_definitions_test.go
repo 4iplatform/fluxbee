@@ -84,6 +84,10 @@ func TestEveryWorkflowDefinitionInTheDocsValidates(t *testing.T) {
 			}
 			for _, definition := range workflowDefinitionsIn(parsed) {
 				found++
+				// A solution package's WF node holds a template SY.deploy fills when it deploys it
+				// (docs/digital-executive-v1-stage-3.md §2): its grouping and nodes refs get sample
+				// values here, as SY.deploy would give them, and every other $ref stays the WF's own.
+				definition = fillDeployTemplates(definition).(map[string]any)
 				data, _ := json.Marshal(definition)
 				if _, err := LoadDefinitionBytes(data, "", fixedClock); err != nil {
 					t.Errorf("%s:%d: %v", doc, block.line, err)
@@ -173,6 +177,44 @@ func jsonBlocks(markdown string) []fencedBlock {
 
 // workflowDefinitionsIn finds every object with a wf_schema_version and states in doc (SY.wf-rules'
 // metadata has a wf_schema_version too).
+// fillDeployTemplates replaces the refs SY.deploy fills in a package's WF definition (grouping.*,
+// nodes.*) with sample values, as for an ED whose short id is ed4qm7k2xa on worker1; any other
+// $ref (input.*, event.*, state.*, vars.*) is the WF engine's own and is left as written.
+func fillDeployTemplates(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		if ref, ok := typed["$ref"].(string); ok && len(typed) == 1 {
+			switch {
+			case ref == "grouping.conscious":
+				return "AI.ed4qm7k2xa@worker1"
+			case ref == "grouping.short_id":
+				return "ed4qm7k2xa"
+			case ref == "grouping.hive":
+				return "worker1"
+			case ref == "grouping.ilk_id":
+				return "ilk:11111111-1111-4111-8111-111111111111"
+			case ref == "grouping.tenant_id":
+				return "tnt:22222222-2222-4222-8222-222222222222"
+			case strings.HasPrefix(ref, "nodes.") && strings.HasSuffix(ref, ".node_name"):
+				role := strings.TrimSuffix(strings.TrimPrefix(ref, "nodes."), ".node_name")
+				return "AI." + role + ".ed4qm7k2xa@worker1"
+			}
+		}
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = fillDeployTemplates(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = fillDeployTemplates(child)
+		}
+		return out
+	}
+	return value
+}
+
 func workflowDefinitionsIn(doc any) []map[string]any {
 	var out []map[string]any
 	switch typed := doc.(type) {

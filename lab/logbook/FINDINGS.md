@@ -593,6 +593,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-370 🔵 Purging a person leaves its document's files in `blob/people/` (low; identity; found 2026-11-27 building 0.1.159).
 - A-371 🔵 `ILK_SET_TENANT` does not check the relations that name the moved person: a node of the old tenant keeps working for someone of another tenant (low; identity; found 2026-11-27 building 0.1.159).
 - A-372 ✅ (io.wapp; io.slack waits for its revamp) io.wapp (and io.slack) provision a writer at their own hive's SY.identity, a replica on a worker, which answers NOT_PRIMARY: an IO on a worker gives a stranger no temporary ILK and forwards with a null src_ilk; io.api asks the primary (Digital Executive; found 2026-11-28 in gate0260; io.wapp fixed in 0.1.161).
+- A-373 🔵 A capability removed from an ED cannot be added to it again: its retired nodes' ILKs keep holding the names, and SY.deploy's removed records too; a re-add should restore and reuse the retired ILKs (stage 2 §9's recreate) (low; SY.deploy; found 2026-11-28 building 0.1.164).
+- A-374 🔵 A capability's WF definition is first compiled at its deployment's `wf_rules_compile_apply` step: a definition SY.wf-rules refuses leaves the deployment `failed`; the publish or Archi's release should check it first (`wf_rules_check`) (low; SY.deploy, Archi; found 2026-11-28 building 0.1.164).
+- A-375 🔵 Publishing a version older than the three SY.deploy keeps answers `kept: new` and the copy is pruned at once (low; SY.deploy; found 2026-11-28 building 0.1.164).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1669,6 +1672,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-375 [SY.deploy] 🔵 low (found 2026-11-28 by 0.1.164's builder, read in the code) — an old version published is pruned at once
+
+- **What:** SY.deploy keeps the last three versions of a package, and every one a deployment runs,
+  and prunes after each publish. A version older than those three is kept and then pruned in the
+  same publish, while the answer says `kept: new`.
+- **Effect:** the caller believes a version is offered that is not.
+- **Status:** recorded; the answer should say so, or such a publish be refused.
+
+### A-374 [SY.deploy, Archi] 🔵 low (found 2026-11-28 by 0.1.164's builder, read in the code) — a capability's WF is first compiled when it is deployed
+
+- **What:** SY.deploy checks a package's format at the publish, but a WF node's definition is
+  compiled only at its deployment's `wf_rules_compile_apply` step.
+- **Effect:** a definition SY.wf-rules refuses leaves the deployment `failed`, after its earlier
+  steps ran.
+- **Status:** recorded; Archi's release, or SY.deploy's publish, should check each WF definition
+  with `wf_rules_check` first.
+
+### A-373 [SY.deploy] 🔵 low (found 2026-11-28 by 0.1.164's builder, read in the code) — a capability cannot be added again to an ED it was removed from
+
+- **What:** removing a capability retires its nodes: their ILKs are marked and keep holding the
+  nodes' names, and SY.deploy's removed record keeps them too. Adding the same capability to the
+  same ED again is refused (`INVALID_REQUEST`).
+- **Effect:** an operator who removes a capability by mistake cannot put it back on that ED.
+- **Status:** recorded; a re-add should restore the retired ILKs and launch the nodes with them, as
+  stage 2 §9's recreate does.
 
 ### A-372 [IO/io.wapp, io.slack] 🔴 ✅ io.wapp fixed in 0.1.161 (found 2026-11-28 in gate0260, 0.1.160; seen in worker1's journal and SY.storage) — an IO on a worker provisions at its identity replica
 
