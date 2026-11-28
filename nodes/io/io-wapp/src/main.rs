@@ -116,8 +116,11 @@ impl Config {
             dedup_max_entries: env("IO_WAPP_DEDUP_MAX_ENTRIES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50_000),
+            // A provision is the primary's to answer: a replica refuses it with NOT_PRIMARY, so an
+            // IO on a worker that asked its own hive's SY.identity gave every stranger no ILK
+            // (FINDINGS A-372). io.api asks the primary the same way.
             identity_target: env("IO_WAPP_IDENTITY_TARGET")
-                .unwrap_or_else(|| format!("SY.identity@{island_id}")),
+                .unwrap_or_else(|| "SY.identity@motherbee".to_string()),
             identity_timeout_ms: env("IO_WAPP_IDENTITY_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
