@@ -6,6 +6,8 @@ mod execution_report;
 mod failure_classifier;
 #[path = "sy_architect/messages_db.rs"]
 mod messages_db;
+#[path = "sy_architect/package_ci.rs"]
+mod package_ci;
 #[path = "sy_architect/pipeline_types.rs"]
 mod pipeline_types;
 #[path = "sy_architect/reconciler.rs"]
@@ -125,7 +127,7 @@ fn build_archi_prompt(handbook: Option<&str>) -> String {
 
 ## Role
 
-You are a coordinator, not an executor. You read system state and route all mutations through controlled planning tools. You never call admin actions directly — every state change eventually goes through `fluxbee_plan_compiler`.
+You are a coordinator, not an executor. You read system state and route all mutations through controlled planning tools. You never call admin actions directly — every state change eventually goes through `fluxbee_plan_compiler`, except a deployable package's release, which goes through `release_package`.
 
 ## Reading system state
 
@@ -166,11 +168,16 @@ Every AI agent loads the same base tools: beyond answering, an agent can do only
 
 A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs, a stopped WF node's too: tell the operator how many run before you stage `wf_rules_delete`. Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why): start the node or wait for it, or remove it with force once the operator accepts ending the conversations it keeps, their number unknown. With force too, an ORCHESTRATOR_ERROR from the node's config read (it says nothing was changed) changed nothing: ask again. Any other ORCHESTRATOR_ERROR may come from the node's kill, which may have stopped or removed the node: read the workflow's status (`GET /hives/{hive}/wf-rules/status?workflow_name=`), then ask again.
 
+## Deployable packages: Archi's CI
+
+The solutions SY.deploy deploys (an ED, its capabilities, a tenant's infrastructure) are packages (handbook §4.4.7). `list_packages` lists your CI: the packages Fluxbee ships, read-only (never edit one: derive a custom copy under a new id), and the ones you released. A package is released only from this chat: `release_package` stages it for the operator's CONFIRM, which writes it once and publishes it to SY.deploy. Archi publishes its whole CI to SY.deploy at its start by itself: never stage a publish. Before you release a capability, check its door's definition (`POST /hives/{hive}/wf-rules/check`, its templates filled with sample values).
+
 ## Pipeline confirmation rules
 
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
 - After `fluxbee_plan_compiler` returns `status: "plan_ready"`, call NO more tools. Present the `human_summary`; do not say how to confirm, the chat adds that line itself. Only the literal word CONFIRM triggers execution.
 - After `fluxbee_plan_compiler` returns `status: "blocked"`, call NO more tools. Present the `human_summary` as the blocker and stop; do not ask for CONFIRM.
+- After `release_package` returns `status: "release_ready"`, call NO more tools. Present its `message`, which says how to confirm. If it refuses the package, fix what it names and call it again.
 - Never call `fluxbee_plan_compiler` more than once per task unless the operator gives new information that resolves the blocker.
 - A user message such as "reintenta", "sí, reintenta", or "seguí" after a blocked mutation is permission to call `fluxbee_plan_compiler` again if the missing state has now been resolved.
 
@@ -303,6 +310,9 @@ struct ArchitectAdminToolContext {
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
     active_pipeline_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>,
     agent_asset_catalog: Arc<RwLock<BTreeMap<String, AgentAssetCatalogEntry>>>,
+    /// Archi's CI of deployable packages, its publish and the releases staged in the chat
+    /// (docs/digital-executive-v1-stage-3.md §3).
+    package_ci: Arc<package_ci::PackageCi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -412,6 +422,9 @@ struct ArchitectState {
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
     active_pipeline_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>,
     agent_asset_catalog: Arc<RwLock<BTreeMap<String, AgentAssetCatalogEntry>>>,
+    /// Archi's CI of deployable packages, its publish and the releases staged in the chat
+    /// (docs/digital-executive-v1-stage-3.md §3).
+    package_ci: Arc<package_ci::PackageCi>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,6 +442,9 @@ struct ArchitectStatus {
     nodes_by_status: BTreeMap<String, u32>,
     components: Vec<ArchitectComponentStatus>,
     error: Option<String>,
+    /// The publish of Archi's CI to SY.deploy this run (`PackageCi::summary`): how many packages
+    /// it kept new and had already, each refused and each not answered yet, with why.
+    packages: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -756,6 +772,8 @@ enum PendingConfirmationFlow {
     PipelineConfirm1,
     PipelineConfirm2,
     PlanCompile,
+    /// A package `release_package` staged (docs/digital-executive-v1-stage-3.md §11).
+    PackageRelease,
 }
 
 impl PendingConfirmationFlow {
@@ -764,6 +782,7 @@ impl PendingConfirmationFlow {
             PendingConfirmationFlow::PipelineConfirm1 => "pipeline_confirm1",
             PendingConfirmationFlow::PipelineConfirm2 => "pipeline_confirm2",
             PendingConfirmationFlow::PlanCompile => "plan_compile",
+            PendingConfirmationFlow::PackageRelease => "package_release",
         }
     }
 
@@ -778,6 +797,9 @@ impl PendingConfirmationFlow {
             PendingConfirmationFlow::PlanCompile => {
                 "There is a compiled executor plan pending in this chat. Reply CONFIRM to execute it or CANCEL to discard it before starting a new request."
             }
+            PendingConfirmationFlow::PackageRelease => {
+                "There is a package release pending in this chat. Reply CONFIRM to release it or CANCEL to discard it before starting a new request."
+            }
         }
     }
 
@@ -791,6 +813,9 @@ impl PendingConfirmationFlow {
             }
             PendingConfirmationFlow::PlanCompile => {
                 "A compiled executor plan is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
+            }
+            PendingConfirmationFlow::PackageRelease => {
+                "A package release is pending in this chat. Reply CONFIRM to release it or CANCEL to discard."
             }
         }
     }
@@ -973,6 +998,12 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         )))?;
         registry.register(Arc::new(StartPipelineTool::new(self.context.clone())))?;
         registry.register(Arc::new(PipelineActionTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ListPackagesTool {
+            context: self.context.clone(),
+        }))?;
+        registry.register(Arc::new(ReleasePackageTool {
+            context: self.context.clone(),
+        }))?;
         registry.register(Arc::new(PlanCompilerTool::new(self.context.clone())))
     }
 }
@@ -4796,6 +4827,174 @@ async fn run_design_loop(
     final_output.ok_or_else(|| "design loop finished without producing output".into())
 }
 
+// ── Archi's CI of deployable packages (docs/digital-executive-v1-stage-3.md §3) ──
+
+/// The CI's listing for the model: both stores, or one package whole to derive from.
+struct ListPackagesTool {
+    context: ArchitectAdminToolContext,
+}
+
+#[async_trait]
+impl FunctionTool for ListPackagesTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "list_packages".to_string(),
+            description: "List Archi's CI: the deployable packages (solutions) SY.deploy deploys, \
+                each an executive, a capability or an infrastructure. Two stores: the packages \
+                Fluxbee ships (store system, origin system, read-only: never edited; derive a \
+                custom copy under a new id) and the ones you released (store own). Each with its \
+                id, version, kind, origin, title, offered_to, where it lives, and its publish to \
+                SY.deploy this run (new, already, refused with the reason, pending). Name an id \
+                and a version to read that package whole. Read-only. What SY.deploy offers a \
+                tenant: fluxbee_system_get GET /cd/catalog."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "A package's id, with version: that package whole, its content included."
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "The package's version, with id."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let named = |field: &str| {
+            arguments
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        match (named("id"), named("version")) {
+            (None, None) => Ok(self.context.package_ci.listing()),
+            (Some(id), Some(version)) => match self.context.package_ci.package(id, version) {
+                Some(package) => Ok(json!({ "status": "ok", "package": package })),
+                None => Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "Archi's CI holds no package {id} {version}: list it without an id to see \
+                     what it holds"
+                ))),
+            },
+            _ => Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+                "list_packages reads one package by both its id and its version, or lists all \
+                 with neither"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+/// A package's release from the chat (docs/digital-executive-v1-stage-3.md §11: a release comes
+/// only through Archi's chat, with the operator's CONFIRM): staged here, written and published on
+/// CONFIRM (`confirm_package_release`).
+struct ReleasePackageTool {
+    context: ArchitectAdminToolContext,
+}
+
+#[async_trait]
+impl FunctionTool for ReleasePackageTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "release_package".to_string(),
+            description: "Release a deployable package into Archi's CI. It stages the package \
+                for the operator's CONFIRM, which writes it once to Archi's store \
+                (state/packages/<id>/<version>.json) and publishes it to SY.deploy (cd_publish \
+                through SY.admin), which checks it; a package SY.deploy refuses is removed and \
+                the reason told. The package is in SY.deploy's format (handbook 4.4.7). Its \
+                origin is custom (one tenant) or catalog (every tenant), never system: those \
+                ship with Fluxbee. A version is released once: a new content takes a new \
+                version. After it returns status release_ready, call no more tools: present its \
+                message, which says how to confirm."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["package"],
+                "properties": {
+                    "package": {
+                        "type": "object",
+                        "description": "The whole package: schema 1, id and version (each 1 to 64 of [a-z0-9._-]), kind (executive, capability or infrastructure), origin (custom or catalog), offered_to ({\"tenants\": \"all\"} or {\"tenants\": [\"tnt:...\"]}, exactly one tenant for custom; a capability may add \"eds\": \"all\" or [\"<short_id>\", ...]), title, description, blanks, founds (an executive only), nodes (each AI, IO or WF with its role, middle, work_role and config; a WF its definition instead: a capability's door, work_role capability, exactly one), vault. Templates: {\"$blank\": \"<name>\"} for a value the user fills, {\"$ref\": \"grouping.ilk_id\" | \"grouping.short_id\" | \"grouping.tenant_id\" | \"grouping.hive\" | \"grouping.conscious\" | \"nodes.<role>.node_name\"} for what SY.deploy fills."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = self.context.session_id.as_deref().ok_or_else(|| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(
+                "release_package requires a session context".to_string(),
+            )
+        })?;
+        let package = arguments.get("package").cloned().ok_or_else(|| {
+            fluxbee_ai_sdk::AiSdkError::Protocol("release_package requires 'package'".to_string())
+        })?;
+        // One thing waits for the operator's CONFIRM: the release takes a staged plan's place.
+        self.context
+            .plan_compile_pending
+            .lock()
+            .await
+            .remove(session_id);
+        let release = self
+            .context
+            .package_ci
+            .stage_release(session_id, package)
+            .map_err(|why| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "release_package refused the package before staging it: {why}"
+                ))
+            })?;
+        Ok(json!({
+            "status": "release_ready",
+            "pending_confirmation": true,
+            "message": release.staged_message(),
+            "package": release.view(),
+        }))
+    }
+}
+
+/// The operator's CONFIRM of a staged release: the package written once to Archi's store and
+/// published to SY.deploy at once (`PackageCi::confirm_release`); SY.deploy's refusal removes the
+/// file and the chat says why.
+async fn confirm_package_release(
+    state: &ArchitectState,
+    session_id: &str,
+    session_title: &str,
+    release: package_ci::PendingRelease,
+) -> ChatResponse {
+    let context = admin_tool_context(state, Some(session_id));
+    let result = state
+        .package_ci
+        .confirm_release(&release, |package| {
+            publish_package_through_admin(&context, package)
+        })
+        .await;
+    let (status, message) = result.message(&release.id, &release.version);
+    tracing::info!(
+        id = %release.id,
+        version = %release.version,
+        status = %status,
+        "sy.architect: a package's release confirmed: {message}"
+    );
+    ChatResponse {
+        status: status.to_string(),
+        mode: "chat".to_string(),
+        output: json!({
+            "message": message,
+            "released": release.view(),
+        }),
+        session_id: Some(session_id.to_string()),
+        session_title: Some(session_title.to_string()),
+    }
+}
+
 // ── PlanCompilerTool (PROG-T11/T12/T13) ───────────────────────────────
 
 struct PlanCompilerTool {
@@ -4904,12 +5103,14 @@ impl FunctionTool for PlanCompilerTool {
             .to_string();
 
         // Any new plan_compiler invocation supersedes a previously pending unconfirmed plan
-        // for this session. Clear it up front so a later CONFIRM cannot execute stale work.
+        // for this session, and a staged package release. Clear them up front so a later CONFIRM
+        // cannot execute stale work.
         self.context
             .plan_compile_pending
             .lock()
             .await
             .remove(&session_id);
+        self.context.package_ci.discard_release(&session_id);
 
         let execution = match run_plan_compiler_transaction(
             &self.context,
@@ -6459,6 +6660,7 @@ async fn main() -> Result<(), ArchitectError> {
         nodes_by_status: BTreeMap::new(),
         components: default_component_statuses(),
         error: None,
+        packages: None,
     };
     let initial_messages_db_configured = initial_messages_db_url.is_some();
     let initial_messages_db = match initial_messages_db_url.as_deref() {
@@ -6473,6 +6675,7 @@ async fn main() -> Result<(), ArchitectError> {
         }
         None => None,
     };
+    let package_ci = Arc::new(package_ci::PackageCi::for_state_dir(&state_dir));
     let state = Arc::new(ArchitectState {
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
@@ -6498,6 +6701,7 @@ async fn main() -> Result<(), ArchitectError> {
         plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
         active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
         agent_asset_catalog: Arc::new(RwLock::new(agent_asset_catalog)),
+        package_ci,
     });
 
     ensure_chat_storage(&state).await?;
@@ -6524,6 +6728,13 @@ async fn main() -> Result<(), ArchitectError> {
     let refresh_state = Arc::clone(&state);
     tokio::spawn(async move {
         status_refresh_loop(refresh_state).await;
+    });
+
+    // Archi's CI to SY.deploy (docs/digital-executive-v1-stage-3.md §3, §11): every package it
+    // has, once SY.admin answers, and then any package new or changed since.
+    let publish_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        package_publish_loop(publish_state).await;
     });
 
     // Vault state changes arrive via VAULT_SECRET_CHANGED broadcasts
@@ -7130,6 +7341,7 @@ fn admin_tool_context(
         plan_compile_pending: Arc::clone(&state.plan_compile_pending),
         active_pipeline_runs: Arc::clone(&state.active_pipeline_runs),
         agent_asset_catalog: Arc::clone(&state.agent_asset_catalog),
+        package_ci: Arc::clone(&state.package_ci),
     }
 }
 
@@ -7259,6 +7471,9 @@ async fn pending_confirmation_flow(
         .contains_key(session_id)
     {
         return Some(PendingConfirmationFlow::PlanCompile);
+    }
+    if state.package_ci.staged_release(session_id).is_some() {
+        return Some(PendingConfirmationFlow::PackageRelease);
     }
     None
 }
@@ -9397,7 +9612,9 @@ async fn dynamic_handler(
     match (method, path) {
         (Method::GET, _) if is_favicon_path(path) => serve_favicon(path),
         (Method::GET, _) if is_status_path(path) => {
-            let status = state.cached_status.read().await.clone();
+            let mut status = state.cached_status.read().await.clone();
+            // What the CI's publish did, as it is now, not as the last refresh read it.
+            status.packages = Some(state.package_ci.summary());
             Json(status).into_response()
         }
         (Method::GET, _) if is_identity_ich_options_path(path) => {
@@ -9760,6 +9977,9 @@ async fn handle_chat_message(
             active_pipeline_at_stage(state, &resolved_session_id, &PipelineStage::Confirm2).await
         {
             handle_pipeline_confirm2(state, &session, pipeline_run).await
+        } else if let Some(release) = state.package_ci.take_release(&resolved_session_id) {
+            // A package `release_package` staged: written once and published.
+            confirm_package_release(state, &resolved_session_id, &session.title, release).await
         } else {
             // A plan the plan compiler staged: the one thing left to confirm. An SCMD never
             // waits for a CONFIRM: it runs as the operator types it.
@@ -9897,6 +10117,14 @@ async fn handle_chat_message(
             if plan_compile_plan_cancel.is_some() {
                 // plan_compile_pending was present; discard it
                 plan_discarded_response(&resolved_session_id, &session.title)
+            } else if state.package_ci.discard_release(&resolved_session_id) {
+                ChatResponse {
+                    status: "ok".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({ "message": "Package release discarded: nothing was written." }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                }
             } else if let Some(blocked_response) = handle_blocked_pipeline_control_message(
                 state,
                 &resolved_session_id,
@@ -10583,6 +10811,10 @@ async fn handle_ai_chat(
     });
     if let Some(plan) = pending_plan {
         add_plan_join_execution_hint(&mut output, &plan);
+    }
+    // A release staged this turn: the UI offers its CONFIRM.
+    if let Some(release) = state.package_ci.staged_release(&session.session_id) {
+        output["package_release"] = release.view();
     }
     Ok(output)
 }
@@ -11662,7 +11894,9 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /config/storage",
                 "SCMD: curl -X GET /cd/catalog",
                 "SCMD: curl -X GET /cd/deployments?tenant_id=tnt:550e8400-e29b-41d4-a716-446655440000",
-                "SCMD: curl -X GET /cd/tree?tenant_id=tnt:550e8400-e29b-41d4-a716-446655440000"
+                "SCMD: curl -X GET /cd/tree?tenant_id=tnt:550e8400-e29b-41d4-a716-446655440000",
+                "SCMD: curl -X GET /architect/packages",
+                "SCMD: curl -X GET /architect/packages/plain-ed/1"
             ],
             "mutation_examples": [
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\",\"ssh_user\":\"administrator\"}'",
@@ -11674,17 +11908,23 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge",
                 "A node's ILK works for a person (a Digital Executive's part), with its role, conscious, channel or agent; null and null clear it. A deployment is SY.deploy's to run: cd_deploy answers accepted, and GET /cd/deployments/{deployment_id} follows it to active or failed.",
                 "SCMD: curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/works-for -d '{\"works_for\":\"ilk:550e8400-e29b-41d4-a716-446655440001\",\"work_role\":\"conscious\"}'",
+                "Archi's CI (GET /architect/packages) is published to SY.deploy at Archi's start by itself, and a release from the chat (release_package, with CONFIRM) at once. A publish typed here sends the package as written and keeps no copy in Archi's CI; a withdrawal stops SY.deploy offering a version, and the deployments that run it keep it.",
+                "SCMD: curl -X POST /cd/packages -d '{\"package\":{\"schema\":1,\"id\":\"billing\",\"version\":\"1\",\"kind\":\"capability\",\"origin\":\"custom\",\"offered_to\":{\"tenants\":[\"tnt:550e8400-e29b-41d4-a716-446655440000\"]},\"title\":\"Invoices\",\"blanks\":[],\"nodes\":[]}}'",
+                "SCMD: curl -X POST /cd/packages/billing/1/unpublish",
                 "The installation's ai.default_provider and ai.providers.<provider>.model are in its installation file (docs/hive-config-update-v1.md §4); SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
             ]
         }
     }))
 }
 
-/// The two SCMD paths Archi answers itself, never SY.admin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The SCMD paths Archi answers itself, never SY.admin: its own config, and its CI of deployable
+/// packages (docs/digital-executive-v1-stage-3.md §3), whole or one package.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalArchitectScmd {
     ConfigGet,
     ConfigSet,
+    Packages,
+    Package { id: String, version: String },
 }
 
 /// Which of Archi's own paths an SCMD names, its path read as `translate_scmd` reads every other
@@ -11696,6 +11936,11 @@ fn local_architect_scmd(parsed: &ParsedScmd) -> Option<LocalArchitectScmd> {
     match (parsed.method.as_str(), segments.as_slice()) {
         ("GET", ["architect", "control", "config-get"]) => Some(LocalArchitectScmd::ConfigGet),
         ("POST", ["architect", "control", "config-set"]) => Some(LocalArchitectScmd::ConfigSet),
+        ("GET", ["architect", "packages"]) => Some(LocalArchitectScmd::Packages),
+        ("GET", ["architect", "packages", id, version]) => Some(LocalArchitectScmd::Package {
+            id: (*id).to_string(),
+            version: (*version).to_string(),
+        }),
         _ => None,
     }
 }
@@ -11716,6 +11961,26 @@ async fn handle_local_architect_scmd(
                 );
             }
             Ok(Some(handle_architect_local_config_set(state, body).await?))
+        }
+        Some(LocalArchitectScmd::Packages) => Ok(Some(json!({
+            "status": "ok",
+            "action": "architect_packages",
+            "payload": state.package_ci.listing(),
+        }))),
+        Some(LocalArchitectScmd::Package { id, version }) => {
+            Ok(Some(match state.package_ci.package(&id, &version) {
+                Some(package) => json!({
+                    "status": "ok",
+                    "action": "architect_package",
+                    "payload": package,
+                }),
+                None => json!({
+                    "status": "not_found",
+                    "action": "architect_package",
+                    "error_code": "NOT_FOUND",
+                    "error_detail": format!("Archi's CI holds no package {id} {version}"),
+                }),
+            }))
         }
         None => Ok(None),
     }
@@ -12116,8 +12381,9 @@ const COMMAND_LOG_MAX_PAGES: usize = 5;
 
 /// Whether SY.admin's command log keeps a tracked mutation of `action` (FINDINGS A-320): the ones
 /// SY.admin runs as commands (`handle_admin_command`), each with its outcome once it ends: the
-/// deployment writes among them (`cd_deploy`, `cd_remove`, which SY.admin runs as commands before
-/// it forwards them to SY.deploy; the `cd_*` reads are reads, never recorded). Of the actions an
+/// deployment writes among them (`cd_deploy`, `cd_remove`, `cd_publish`, `cd_unpublish`, which
+/// SY.admin runs as commands before it forwards them to SY.deploy; the `cd_*` reads are reads,
+/// never recorded). Of the actions an
 /// SCMD records, `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin
 /// and are not in it, so a timed-out one stays open, as before: Archi waits for each of them as
 /// long as SY.admin does, or longer. `add_hive` is read in the hive registry instead.
@@ -12414,8 +12680,9 @@ fn system_get_may_run(method: &str, action: &str) -> bool {
 /// out and stays as it was: every action that list names, and the changes an SCMD maps outside
 /// it: an ILK's charge to a tenant and its purge, a virtual person's creation, whom an ILK works
 /// for, a person's document, a tenant's creation, its update, its sponsor and its purge, a tap,
-/// the global user policy's clear, and a deployment and its removal (SY.deploy's `cd_deploy` and
-/// `cd_remove`, docs/digital-executive-v1-stage-2.md §2).
+/// the global user policy's clear, a deployment and its removal (SY.deploy's `cd_deploy` and
+/// `cd_remove`, docs/digital-executive-v1-stage-2.md §2), and a package's publish and its
+/// withdrawal (`cd_publish`, `cd_unpublish`, docs/digital-executive-v1-stage-3.md §3).
 fn is_mutating_admin_action(action: &str) -> bool {
     admin_action_allows_ai_write(action)
         || matches!(
@@ -12427,6 +12694,8 @@ fn is_mutating_admin_action(action: &str) -> bool {
                 | "set_person_document"
                 | "cd_deploy"
                 | "cd_remove"
+                | "cd_publish"
+                | "cd_unpublish"
                 | "create_tenant"
                 | "update_tenant"
                 | "set_tenant_sponsor"
@@ -14319,6 +14588,44 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: scmd_text_params(raw_query, &["tenant_id"]),
         }),
+        // A package's publish to SY.deploy and its withdrawal (docs/digital-executive-v1-stage-3.md
+        // §3), on SY.admin's routes as the other deployment writes: a publish's body,
+        // `{"package": {...}}`, goes as it came; an unpublish names its package by the path alone.
+        ("POST", ["cd", "packages"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for cd_publish must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "cd_publish".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
+        ("POST", ["cd", "packages", id, version, "unpublish"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for cd_unpublish must be a JSON object".into());
+            }
+            for field in ["id", "version"] {
+                if params.get(field).is_some() {
+                    return Err(format!(
+                        "SCMD for cd_unpublish names its package by the path: its body must not \
+                         name {field}"
+                    )
+                    .into());
+                }
+            }
+            params["id"] = Value::String((*id).to_string());
+            params["version"] = Value::String((*version).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "cd_unpublish".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
         ("PUT", ["config", "storage"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
@@ -14762,6 +15069,90 @@ async fn execute_admin_action_with_context(
     }))
 }
 
+/// How long the CI's publish waits after a pass every package of which got its verdict: then it
+/// looks for a package new or changed since (a release is published at once, never by this).
+const PACKAGE_PUBLISH_RESCAN: Duration = Duration::from_secs(60);
+/// How long it waits after a pass SY.admin or SY.deploy did not answer: at the start, until they
+/// do.
+const PACKAGE_PUBLISH_RETRY: Duration = Duration::from_secs(10);
+
+/// One `cd_publish` through the motherbee's SY.admin, which forwards it to SY.deploy
+/// (docs/digital-executive-v1-stage-3.md §3): `{"package": ...}`. Its answer as SY.admin gave it,
+/// or why none came.
+async fn publish_package_through_admin(
+    context: &ArchitectAdminToolContext,
+    package: Value,
+) -> Result<Value, String> {
+    execute_admin_action_with_context(
+        context,
+        &format!("SY.admin@{}", context.hive_id),
+        "cd_publish",
+        Some(&context.hive_id),
+        json!({ "package": package }),
+        "packages.publish",
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// Archi's CI published to SY.deploy (docs/digital-executive-v1-stage-3.md §3, §11): at its start,
+/// once SY.admin answers, every package it has, shipped or its own, one by one (`publish_pass`);
+/// then, each minute, any package new or changed since: a refused one is not sent again until its
+/// file changes. One log line says what each pass that changed something did: new, already, and
+/// each refused with why; Archi's status keeps it (`ArchitectStatus::packages`).
+async fn package_publish_loop(state: Arc<ArchitectState>) {
+    let context = admin_tool_context(&state, None);
+    let mut said_unanswered = false;
+    loop {
+        let report = state
+            .package_ci
+            .publish_pass(|package| publish_package_through_admin(&context, package))
+            .await;
+        for removed in &report.removed {
+            tracing::warn!(
+                package = %removed,
+                "sy.architect: a released package SY.deploy refused on its publish is removed"
+            );
+        }
+        match &report.unanswered {
+            Some(reason) if !said_unanswered => {
+                tracing::warn!(
+                    reason = %reason,
+                    "sy.architect: the CI's publish got no answer from SY.admin or SY.deploy; asked \
+                     again every 10 s"
+                );
+                said_unanswered = true;
+            }
+            Some(_) => {}
+            None => said_unanswered = false,
+        }
+        if report.changed && report.unanswered.is_none() {
+            let summary = state.package_ci.summary();
+            let line = state.package_ci.summary_line();
+            let refused = summary["refused"]
+                .as_array()
+                .is_some_and(|refused| !refused.is_empty());
+            if refused {
+                tracing::warn!(
+                    sent = report.sent,
+                    "sy.architect: published its CI to SY.deploy: {line}"
+                );
+            } else {
+                tracing::info!(
+                    sent = report.sent,
+                    "sy.architect: published its CI to SY.deploy: {line}"
+                );
+            }
+        }
+        time::sleep(if report.unanswered.is_some() {
+            PACKAGE_PUBLISH_RETRY
+        } else {
+            PACKAGE_PUBLISH_RESCAN
+        })
+        .await;
+    }
+}
+
 async fn status_refresh_loop(state: Arc<ArchitectState>) {
     loop {
         let fresh = build_architect_status(&state).await;
@@ -14785,6 +15176,7 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
         nodes_by_status: BTreeMap::new(),
         components: default_component_statuses(),
         error: None,
+        packages: Some(state.package_ci.summary()),
     };
 
     match fetch_inventory_status_data(state).await {
@@ -16459,6 +16851,22 @@ fn sanitize_user_message_for_persistence(user_message: &str) -> String {
 /// (a postgres URL), went to the journal in clear.
 fn admin_params_for_log(action: &str, params: &Value) -> Value {
     let mut logged = shown_once::kept(params);
+    // A package's publish names its package, never the whole of it (up to 120 KiB a line).
+    if action == "cd_publish" {
+        if let Some(package) = logged.get_mut("package") {
+            let bytes = serde_json::to_vec(&*package)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            *package = json!({
+                "id": package.get("id"),
+                "version": package.get("version"),
+                "kind": package.get("kind"),
+                "origin": package.get("origin"),
+                "bytes": bytes,
+            });
+        }
+        return logged;
+    }
     let steps = match action {
         "executor_validate_plan" => "/execution/steps",
         "executor_execute_plan" => "/plan/execution/steps",
@@ -19322,6 +19730,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
           executionHint: (output && output.execution_hint) || "Executing pipeline plan..."
         }};
       }}
+      if (data && data.mode === "chat" && output && output.package_release) {{
+        return {{
+          confirmLabel: "Release package",
+          cancelLabel: "Discard",
+          lockReason: "A package release is waiting for confirmation in this chat. Use Release package or Discard below.",
+          executionHint: "Releasing package..."
+        }};
+      }}
       if (data && data.mode === "chat") {{
         return {{
           confirmLabel: "Execute plan",
@@ -20262,6 +20678,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       if (data && data.mode === "pipeline") {{
         return output.stage === "confirm1" || output.stage === "confirm2";
+      }}
+      if (data && data.mode === "chat" && output.package_release) {{
+        return typeof output.message === "string" && /confirm/i.test(output.message);
       }}
       if (data && data.mode === "chat") {{
         const trace = output.plan_compile_trace;
@@ -32046,12 +32465,29 @@ mod tests {
             plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
             active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
             agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
+            package_ci: Arc::new(package_ci::PackageCi::new(
+                PathBuf::from("/tmp/fluxbee-test-system-solutions"),
+                PathBuf::from("/tmp/fluxbee-test-state/packages"),
+            )),
         };
         (context, router)
     }
 
     /// Archi's state on the motherbee whose router is the test's, as `harness_tool_context`'s.
     fn harness_state() -> (
+        Arc<ArchitectState>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+    ) {
+        harness_state_with_ci(package_ci::PackageCi::new(
+            PathBuf::from("/tmp/fluxbee-test-system-solutions"),
+            PathBuf::from("/tmp/fluxbee-test-state/packages"),
+        ))
+    }
+
+    /// `harness_state`, with the CI of deployable packages given.
+    fn harness_state_with_ci(
+        ci: package_ci::PackageCi,
+    ) -> (
         Arc<ArchitectState>,
         fluxbee_sdk::RouterDispatcherTestHarness,
     ) {
@@ -32093,11 +32529,13 @@ mod tests {
                 nodes_by_status: BTreeMap::new(),
                 components: default_component_statuses(),
                 error: None,
+                packages: None,
             })),
             admin_actions_cache: Arc::new(Mutex::new(None)),
             plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
             active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
             agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
+            package_ci: Arc::new(ci),
         };
         (Arc::new(state), router)
     }
@@ -35008,6 +35446,19 @@ mod tests {
                 "curl -X POST /architect%2Fcontrol/config-set -d '{\"config\":{}}'",
                 None,
             ),
+            (
+                "curl -X GET /architect/packages",
+                Some(LocalArchitectScmd::Packages),
+            ),
+            (
+                "curl -X GET /architect/packages/plain%2Ded/1",
+                Some(LocalArchitectScmd::Package {
+                    id: "plain-ed".to_string(),
+                    version: "1".to_string(),
+                }),
+            ),
+            ("curl -X POST /architect/packages", None),
+            ("curl -X GET /architect/packages/plain-ed", None),
             ("curl -X GET /architect/control/config-set", None),
             ("curl -X POST /architect/control/config-get", None),
             ("curl -X GET /architect/control/config%2Dget%2", None),
@@ -35461,6 +35912,8 @@ mod tests {
             ("POST", "/cd/deployments".to_string()),
             ("POST", "/cd/deployments/dp7xk3m2qa/remove".to_string()),
             ("POST", format!("/cd/groupings/{ilk}/remove")),
+            ("POST", "/cd/packages".to_string()),
+            ("POST", "/cd/packages/billing/1/unpublish".to_string()),
             ("POST", "/hives/worker1/nodes".to_string()),
             ("POST", format!("{node}/start")),
             ("POST", format!("{node}/restart")),
@@ -35526,6 +35979,8 @@ mod tests {
             "set_person_document",
             "cd_deploy",
             "cd_remove",
+            "cd_publish",
+            "cd_unpublish",
             "create_tenant",
             "update_tenant",
             "set_tenant_sponsor",
@@ -35567,7 +36022,7 @@ mod tests {
         // A deployment's order is a command SY.admin runs and logs before it forwards it to
         // SY.deploy: a timed-out one is settled by the log. The deployments' reads are reads,
         // never recorded.
-        for action in ["cd_deploy", "cd_remove"] {
+        for action in ["cd_deploy", "cd_remove", "cd_publish", "cd_unpublish"] {
             assert!(action_in_command_log(action), "{action}");
             assert!(open_operation_is_read(action), "{action}");
         }
@@ -35673,6 +36128,200 @@ mod tests {
         ] {
             assert!(translate_scmd("motherbee", parse(&raw)).is_err(), "{raw}");
         }
+    }
+
+    /// A package's publish and its withdrawal (docs/digital-executive-v1-stage-3.md §3, the
+    /// contract of release 3C) on SY.admin's routes, sent to the motherbee's SY.admin: a publish's
+    /// body as it came, an unpublish's package from its path alone. Both are recorded changes,
+    /// never the AI's to stage as a plan and never run by `fluxbee_system_get`.
+    #[test]
+    fn a_packages_publish_and_withdrawal_translate_as_sy_admins_routes() {
+        let body = json!({ "package": { "schema": 1, "id": "billing", "version": "1",
+                                        "kind": "capability", "origin": "custom" } });
+        for (raw, action, params) in [
+            (
+                format!("curl -X POST /cd/packages -d '{body}'"),
+                "cd_publish",
+                body.clone(),
+            ),
+            (
+                "curl -X POST /cd/packages/billing/1/unpublish".to_string(),
+                "cd_unpublish",
+                json!({ "id": "billing", "version": "1" }),
+            ),
+            (
+                "curl -X POST /cd/packages/plain-ed/1.0.2/unpublish -d '{}'".to_string(),
+                "cd_unpublish",
+                json!({ "id": "plain-ed", "version": "1.0.2" }),
+            ),
+        ] {
+            let translated =
+                translate_scmd("worker1", parse(&raw)).unwrap_or_else(|err| panic!("{raw}: {err}"));
+            assert_eq!(translated.action, action, "{raw}");
+            assert_eq!(translated.admin_target, "SY.admin@worker1", "{raw}");
+            assert_eq!(translated.target_hive, "worker1", "{raw}");
+            assert_eq!(translated.params, params, "{raw}");
+            assert!(is_mutating_admin_action(action), "{action}");
+            assert!(!admin_action_allows_ai_write(action), "{action}");
+            assert!(!system_get_may_run("POST", action), "{action}");
+            assert!(action_in_command_log(action), "{action}");
+        }
+        for raw in [
+            "curl -X POST /cd/packages -d '[]'",
+            r#"curl -X POST /cd/packages/billing/1/unpublish -d '{"id":"other"}'"#,
+            r#"curl -X POST /cd/packages/billing/1/unpublish -d '{"version":"2"}'"#,
+            "curl -X POST /cd/packages/billing/unpublish",
+        ] {
+            assert!(translate_scmd("motherbee", parse(raw)).is_err(), "{raw}");
+        }
+    }
+
+    /// A package's publish is logged by its package, never whole: a package may take 120 KiB.
+    #[test]
+    fn a_publish_is_logged_by_its_package_never_whole() {
+        let params = json!({ "package": { "id": "billing", "version": "1", "kind": "capability",
+                                          "origin": "custom", "description": "x".repeat(4096) } });
+        let logged = admin_params_for_log("cd_publish", &params);
+        assert_eq!(logged["package"]["id"], "billing");
+        assert_eq!(logged["package"]["version"], "1");
+        assert_eq!(logged["package"]["kind"], "capability");
+        assert_eq!(logged["package"]["origin"], "custom");
+        assert!(logged["package"]["bytes"].as_u64().unwrap() > 4096);
+        assert!(logged["package"].get("description").is_none());
+        // Any other action's params as before.
+        let other = json!({ "deployment_id": "dp7xk3m2qa" });
+        assert_eq!(admin_params_for_log("cd_remove", &other), other);
+    }
+
+    /// A release from the chat (docs/digital-executive-v1-stage-3.md §11): `release_package`
+    /// stages the package in place of a staged plan, and the chat holds a release to confirm;
+    /// CONFIRM writes it once to Archi's store and sends `cd_publish` with `{"package": ...}` to
+    /// the motherbee's SY.admin; SY.deploy's refusal removes the file and the chat says why.
+    #[tokio::test]
+    async fn a_release_is_staged_by_its_tool_and_published_through_sy_admin_on_confirm() {
+        let root = std::env::temp_dir().join(format!("fluxbee-release-{}", Uuid::new_v4()));
+        let own = root.join("state").join(package_ci::OWN_PACKAGES_SUBDIR);
+        let ci = package_ci::PackageCi::new(root.join("system"), own.clone());
+        let (state, mut router) = harness_state_with_ci(ci);
+        let package = |id: &str, origin: &str| {
+            json!({
+                "schema": 1, "id": id, "version": "1", "kind": "capability", "origin": origin,
+                "offered_to": { "tenants": ["tnt:550e8400-e29b-41d4-a716-446655440000"] },
+                "title": "Invoices", "description": "The state of an invoice.", "blanks": [],
+                "nodes": [{ "role": "door", "kind": "WF", "middle": id, "work_role": "capability",
+                            "definition": { "start_from": [{ "$ref": "grouping.conscious" }] } }],
+                "vault": [],
+            })
+        };
+        let tool = ReleasePackageTool {
+            context: admin_tool_context(&state, Some("s1")),
+        };
+
+        // A system package is never released.
+        let err = tool
+            .call(json!({ "package": package("billing", "system") }))
+            .await
+            .expect_err("a system release");
+        assert!(
+            err.to_string().contains("system packages ship in the .deb"),
+            "{err}"
+        );
+        assert!(state.package_ci.staged_release("s1").is_none());
+
+        // Staged in place of a staged plan.
+        state.plan_compile_pending.lock().await.insert(
+            "s1".to_string(),
+            PlanCompilePending {
+                plan: json!({}),
+                cookbook_entry: None,
+                trace: None,
+            },
+        );
+        let staged = tool
+            .call(json!({ "package": package("billing", "custom") }))
+            .await
+            .expect("staged");
+        assert_eq!(staged["status"], "release_ready");
+        assert_eq!(staged["pending_confirmation"], true);
+        assert!(tool_output_requests_confirmation(&staged));
+        let message = staged["message"].as_str().unwrap();
+        assert!(message.ends_with("Reply CONFIRM to release it or CANCEL to discard."));
+        assert_eq!(
+            staged["package"]["path"],
+            own.join("billing/1.json").display().to_string()
+        );
+        assert!(!state.plan_compile_pending.lock().await.contains_key("s1"));
+        // What the chat holds to confirm (`pending_confirmation_flow`, which reads the pipeline
+        // runs first, in the chat's database).
+        assert!(state.package_ci.staged_release("s1").is_some());
+        assert!(PendingConfirmationFlow::PackageRelease
+            .blocked_message()
+            .contains("Reply CONFIRM to release it"));
+        assert!(
+            !own.join("billing/1.json").exists(),
+            "staging writes nothing"
+        );
+
+        // CONFIRM: written once, published through the motherbee's SY.admin.
+        let release = state.package_ci.take_release("s1").expect("the release");
+        let (answer, sent) = tokio::join!(
+            confirm_package_release(&state, "s1", "Operator chat", release),
+            answer_admin_command(
+                &mut router,
+                "cd_publish",
+                json!({ "status": "ok", "action": "cd_publish",
+                        "payload": { "status": "ok", "kept": "new", "id": "billing",
+                                     "version": "1", "hash": "sha256:00" } }),
+            ),
+        );
+        assert!(
+            matches!(&sent.routing.dst, Destination::Unicast(dst) if dst == "SY.admin@motherbee"),
+            "{:?}",
+            sent.routing.dst
+        );
+        assert_eq!(sent.payload["target"], "motherbee", "{}", sent.payload);
+        assert_eq!(
+            sent.payload["params"],
+            json!({ "package": package("billing", "custom") })
+        );
+        assert_eq!(answer.status, "ok", "{}", answer.output);
+        assert_eq!(answer.mode, "chat");
+        let told = answer.output["message"].as_str().unwrap();
+        assert!(told.contains("Package billing 1 is released"), "{told}");
+        let written: Value =
+            serde_json::from_slice(&fs::read(own.join("billing/1.json")).unwrap()).unwrap();
+        assert_eq!(written, package("billing", "custom"));
+        assert!(state.package_ci.staged_release("s1").is_none());
+        let summary = state.package_ci.summary();
+        assert_eq!(summary["new"], 1, "{summary}");
+
+        // Refused by SY.deploy: the file is removed and the reason told.
+        tool.call(json!({ "package": package("crm", "custom") }))
+            .await
+            .expect("staged");
+        let release = state.package_ci.take_release("s1").expect("the release");
+        let (answer, _) = tokio::join!(
+            confirm_package_release(&state, "s1", "Operator chat", release),
+            answer_admin_command(
+                &mut router,
+                "cd_publish",
+                json!({ "status": "error", "action": "cd_publish",
+                        "error_code": "PACKAGE_INVALID",
+                        "error_detail": "a capability has exactly one door",
+                        "payload": { "status": "error", "error_code": "PACKAGE_INVALID",
+                                     "message": "a capability has exactly one door" } }),
+            ),
+        );
+        assert_eq!(answer.status, "error");
+        let told = answer.output["message"].as_str().unwrap();
+        assert!(
+            told.contains("PACKAGE_INVALID: a capability has exactly one door"),
+            "{told}"
+        );
+        assert!(told.contains("Its file was removed"), "{told}");
+        assert!(!own.join("crm/1.json").exists());
+        assert!(own.join("billing/1.json").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The pruning rule of Archi's saved manifests (docs/digital-executive-v1-stage-2.md §3.3):
