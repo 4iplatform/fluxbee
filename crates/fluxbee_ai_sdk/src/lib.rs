@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod capabilities;
 pub mod control_plane;
 pub mod errors;
 pub mod function_calling;
@@ -18,6 +19,12 @@ pub mod thread_state_tools;
 pub mod usage;
 
 pub use agent::Agent;
+pub use capabilities::{
+    capabilities_of, capability_result_of, capability_result_prompt_block, AskCapabilityTool,
+    CapabilityConversation, CapabilityDirectory, CapabilityDoor, CapabilityResult,
+    ASK_CAPABILITY_TOOL, CAPABILITY_REQUEST_TIMEOUT, CAPABILITY_RESULT_KEY, CAPABILITY_WORK_ROLE,
+    MSG_CAPABILITY_REQUEST, MSG_CAPABILITY_REQUEST_RESPONSE, MSG_WF_HELP, MSG_WF_HELP_RESPONSE,
+};
 pub use control_plane::{
     control_caller_authorized, control_request, is_infrastructure_message, is_vault_secret_changed,
     note_infrastructure_message, ControlRequest, MSG_PING, MSG_STATUS,

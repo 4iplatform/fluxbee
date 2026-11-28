@@ -521,6 +521,49 @@ registered case ends saved as `completed` and is never deleted by the model.
 - **A put replaces the whole record.** `ttl_seconds` is stored with it, but nothing expires it.
 - **Their cards** are the first three of [the tool catalog](../../docs/reference/agent-tools.md).
 
+## A Digital Executive's capabilities
+
+The conscious of a Digital Executive reaches the ED's capabilities, a WF at each one's door, through
+one base tool (docs/digital-executive-v1-stage-3.md §5, §6, §6.1; `src/capabilities.rs`).
+
+- **Which capabilities** is identity's (`capabilities_of`): the ILKs of the node's hive's identity
+  SHM whose `work_role` is `capability` and whose `works_for` is the ED, or that work for nobody and
+  are of the tenant of the conscious's own ILK (a capability of every ED of that tenant). Each one's
+  `handler_node` is its door's node name, the name the model asks it by.
+- **`ask_capability`** (`AskCapabilityTool::new(directory, ed, conversation)`, its card in
+  [the tool catalog](../../docs/reference/agent-tools.md)). The node keeps one
+  `CapabilityDirectory::new(router, node_name, self_ilk)` and makes the tool per turn with the ED
+  it speaks as then (`RuntimeLoad::speaks_as_person`, None while identity does not confirm it, and
+  the tool then answers `no_capabilities`) and the turn's conversation.
+  - Without `capability`, it lists them, each with its door's `WF_HELP` (`workflow_type`,
+    `description`, `input_schema`, `actions`), asked in parallel within 10 s and kept until the
+    identity region's sequence moves or the ED changes; a help that failed is asked again next
+    time and listed with `help_error`.
+  - With one (by its node name, in any case) and its `input`, it sends the door
+    `CAPABILITY_REQUEST` by `send_system_rpc`, waiting up to 60 s, with `{request_id, ed_ilk,
+    input, conversation}`. Its result is the door's `CAPABILITY_REQUEST_RESPONSE` payload naming
+    the `capability`; a WF engine's own refusal `{ok: false, error, detail}` reads as `{status:
+    "error", error_code, message}`; no answer is `capability_unavailable` (not `retryable` on a
+    timeout, since the request may still run).
+  - **The conversation is never the model's** (`CapabilityConversation::of_turn`): the turn's
+    thread, its `src_ilk` as the person, the node it came through (`routing.src_l2_name`) and
+    `meta.context.io.reply_target`; on a result's turn, the result's own.
+- **A result that comes later** is a `user` message from a door with
+  `meta.context.capability_result` `{request_id, capability, status, result?, error_code?,
+  message?, conversation}`. The runtime screens it as it takes it (`screen_capability_result`):
+  - from one of the ED's capabilities, while identity confirms the ED, it runs as a turn in the
+    person's conversation (its thread is the conversation's, its `capability` the sender's name),
+    and the answer, a busy or error one too, goes to the conversation's `io_node` with `dst_ilk` the
+    person, its `reply_target` as `meta.context.io.reply_target`, the thread, and the ED as
+    `src_ilk`, never back to the door (`address_to_conversation`);
+  - from any other sender, or with no ED confirmed, the field is taken out and the message runs as
+    any other;
+  - from one of them with a conversation that names no thread or no IO node, or when identity
+    cannot be read, the message is neither run nor answered, since a door never gets an answer
+    from the conscious. Each case is a log line.
+  - `capability_result_of` reads the result a handler sees, and `capability_result_prompt_block`
+    renders it for the model, its result's JSON cut at 8 KiB.
+
 ## Writing an AI node
 
 - **Implement `AiNode`:** `on_message(&self, msg) -> Result<Option<Message>>`. Return the reply built

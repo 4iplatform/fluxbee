@@ -17,6 +17,10 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio::time::Instant;
 
+use crate::capabilities::{
+    address_to_conversation, identity_of_node, result_conversation, screen_capability_result,
+    IdentityRead, ResultScreen,
+};
 use crate::errors::AiSdkError;
 use crate::errors::Result;
 use crate::function_calling::DEFAULT_MAX_TURNS;
@@ -220,6 +224,13 @@ impl RuntimeLoad {
     /// config names no person, and until the runtime runs.
     pub fn speaks_as(&self) -> Option<SpeaksAsStatus> {
         self.metrics.speaks_as.status()
+    }
+
+    /// The person the agent speaks as now, as identity names it: Some only while identity confirms
+    /// the one its config names, the ED whose capabilities `ask_capability` reaches
+    /// (`crate::capabilities`).
+    pub fn speaks_as_person(&self) -> Option<String> {
+        self.metrics.speaks_as.confirmed()
     }
 
     /// `RuntimeLoadSnapshot::add_to_status` with the load now, and, when the config names a person
@@ -899,6 +910,9 @@ struct Lanes<N, W> {
     /// The direct lane's `user` messages: the frontdesk's handoffs and the answers
     /// `ai_runtime_busy`.
     direct_user: JoinSet<Result<()>>,
+    /// The identity of the node's hive, which a capability's result is checked against
+    /// (`screen_capability_result`): its SHM.
+    identity: IdentityRead,
 }
 
 impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
@@ -907,6 +921,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             .bounds
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(LoadBounds::of(&config));
+        let identity = identity_of_node(&writer.full_name());
         Self {
             node,
             writer,
@@ -916,6 +931,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             waiting: VecDeque::new(),
             direct_control: JoinSet::new(),
             direct_user: JoinSet::new(),
+            identity,
         }
     }
 
@@ -925,11 +941,15 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
 
     /// Places a message the reader handed on: a tap copy nowhere, a message that runs without the
     /// model on the direct lane, an LLM turn on a free worker, at the end of the queue, or, with the
-    /// queue full, nowhere but its answer `ai_runtime_busy`. A task that ended first gives back its
+    /// queue full, nowhere but its answer `ai_runtime_busy`. A message that carries a capability's
+    /// result is screened first (`screen_capability`). A task that ended first gives back its
     /// place.
-    fn take(&mut self, msg: Message) -> Result<()> {
+    fn take(&mut self, mut msg: Message) -> Result<()> {
         self.settle_ended()?;
         if ignored_tap_copy(&msg, &self.metrics) {
+            return Ok(());
+        }
+        if !is_control_traffic(&msg) && !self.screen_capability(&mut msg) {
             return Ok(());
         }
         if is_control_traffic(&msg) {
@@ -953,6 +973,60 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
         }
         self.note_load();
         Ok(())
+    }
+
+    /// Screens a message that carries a capability's result (docs/digital-executive-v1-stage-3.md
+    /// §6.1, `screen_capability_result`) against the ED the agent speaks as now and its hive's
+    /// identity: one from the ED's capabilities runs in the person's conversation and its answer
+    /// goes to the person's IO node (`process_one`); from any other sender the result is taken out
+    /// and the message runs as any other. False for one that must neither run nor be answered: from
+    /// one of the ED's capabilities but not as the contract says, or whose sender identity could
+    /// not be checked for, since a capability's door never gets an answer.
+    fn screen_capability(&self, msg: &mut Message) -> bool {
+        let ed = self.metrics.speaks_as.confirmed();
+        let identity = self.identity.clone();
+        let screen = screen_capability_result(
+            msg,
+            ed.as_deref(),
+            self.config.self_ilk_id.as_deref(),
+            || identity(),
+        );
+        match screen {
+            ResultScreen::Absent => true,
+            ResultScreen::Accepted {
+                capability,
+                request_id,
+            } => {
+                tracing::info!(
+                    trace_id = %msg.routing.trace_id,
+                    capability = %capability,
+                    request_id = %request_id,
+                    thread_id = ?msg.meta.thread_id,
+                    "a capability's result runs as a turn in its person's conversation; the \
+                     answer goes to the person's IO node"
+                );
+                true
+            }
+            ResultScreen::Ignored(reason) => {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    reason = %reason,
+                    "a message carries a capability's result from no capability of this agent's \
+                     ED: the result is taken out, and the message runs as any other"
+                );
+                true
+            }
+            ResultScreen::Dropped(reason) => {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    reason = %reason,
+                    "a capability's result is neither run nor answered"
+                );
+                false
+            }
+        }
     }
 
     /// The next task of either lane to end, once one does; None when none runs.
@@ -1120,8 +1194,17 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
                  the queue for them is full"
             );
         }
-        let Some(reply) = busy_reply(&msg, &self.config) else {
+        let Some(mut reply) = busy_reply(&msg, &self.config) else {
             return;
+        };
+        // A capability's result is answered in its person's conversation, never to its door.
+        let conversation = result_conversation(&msg);
+        let requester = match &conversation {
+            Some(conversation) => {
+                address_to_conversation(&mut reply, conversation);
+                Some(conversation.io_node.clone())
+            }
+            None => msg.routing.src_l2_name.clone(),
         };
         if !self.has_direct_place(DirectPlace::User) {
             let dropped_total = self
@@ -1145,7 +1228,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
         }
         let task = send_reply(
             self.writer.clone(),
-            msg.routing.src_l2_name.clone(),
+            requester,
             reply,
             self.config.clone(),
             self.metrics.clone(),
@@ -1271,7 +1354,10 @@ fn with_jitter(base: Duration) -> Duration {
     Duration::from_millis(total as u64)
 }
 
-/// Runs `msg`'s handler once, within `handler_timeout` (its lane's), and sends its answer.
+/// Runs `msg`'s handler once, within `handler_timeout` (its lane's), and sends its answer: to the
+/// requester, or, for a capability's result the runtime let through (`Lanes::screen_capability`),
+/// into the person's conversation it carries, never to its door (docs/digital-executive-v1-stage-3.md
+/// §6.1).
 async fn process_one<N: AiNode, W: ReplyWriter>(
     node: Arc<N>,
     writer: W,
@@ -1281,11 +1367,19 @@ async fn process_one<N: AiNode, W: ReplyWriter>(
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
     // The reply goes to the requester's UUID: its entry in the cycle's trace names the requester by
-    // the name the router stamped on the request.
-    let requester = msg.routing.src_l2_name.clone();
+    // the name the router stamped on the request. A capability's result is answered to the
+    // person's IO node, which the entry names.
+    let conversation = result_conversation(&msg);
+    let requester = match &conversation {
+        Some(conversation) => Some(conversation.io_node.clone()),
+        None => msg.routing.src_l2_name.clone(),
+    };
     let maybe_response = run_handler(node.as_ref(), msg, handler_timeout, &metrics).await;
 
-    if let Some(response) = maybe_response {
+    if let Some(mut response) = maybe_response {
+        if let Some(conversation) = &conversation {
+            address_to_conversation(&mut response, conversation);
+        }
         send_reply(writer, requester, response, config, metrics.clone()).await?;
     }
 
@@ -2334,6 +2428,11 @@ mod tests {
     impl Harness {
         /// The dispatch loop of `run_with_config`, on `config`, with the test as its router.
         fn start(config: RuntimeConfig) -> Self {
+            Self::start_with_identity(config, None)
+        }
+
+        /// `start`, with `identity` as the node's hive's identity in place of its SHM.
+        fn start_with_identity(config: RuntimeConfig, identity: Option<IdentityRead>) -> Self {
             let node = Arc::new(GatedNode::new());
             let metrics = Arc::new(RuntimeMetrics::default());
             let (sent, answers) = mpsc::unbounded_channel();
@@ -2341,6 +2440,9 @@ mod tests {
             let writer = TestWriter::new(sent);
             let notes = writer.notes.clone();
             let mut lanes = Lanes::new(node.clone(), writer, config, metrics.clone());
+            if let Some(identity) = identity {
+                lanes.identity = identity;
+            }
             let ended = tokio::spawn(async move {
                 let mut reader = tokio::spawn(std::future::pending::<Result<()>>());
                 dispatch(&mut lanes, &mut rx, &mut reader).await
@@ -2601,6 +2703,153 @@ mod tests {
         runtime.send(turn("turn-5")).await;
         runtime.let_turns_go(1);
         assert_eq!(runtime.answer().await.routing.trace_id, "turn-5");
+    }
+
+    const ED: &str = "ilk:7a1f0c3e-1111-4c2b-9d3e-0123456789ab";
+    const CONSCIOUS: &str = "ilk:7a1f0c3e-3333-4c2b-9d3e-0123456789ab";
+    const PERSON: &str = "ilk:7a1f0c3e-4444-4c2b-9d3e-0123456789ab";
+    const ACME: &str = "tnt:00000000-0000-4000-8000-00000000000a";
+    const DOOR: &str = "WF.billing.ed4qm7k2xa@worker1";
+
+    /// The identity of the ED's hive: its conscious, and the door of one capability of the ED.
+    fn ed_identity() -> IdentityRead {
+        let entry =
+            |ilk_id: &str, node: &str, work_role: &str| fluxbee_sdk::identity::IdentityIlkOption {
+                ilk_id: ilk_id.to_string(),
+                tenant_id: ACME.to_string(),
+                display_name: Some(node.to_string()),
+                handler_node: Some(node.to_string()),
+                registration_status: "complete".to_string(),
+                ilk_type: "agent".to_string(),
+                role_hash: None,
+                skill_hashes: Vec::new(),
+                handbook_hashes: Vec::new(),
+                personality_hash: None,
+                is_virtual: false,
+                works_for: Some(ED.to_string()),
+                work_role: Some(work_role.to_string()),
+                document_hash: None,
+            };
+        Arc::new(move || {
+            Ok(fluxbee_sdk::identity::IdentityIlkSnapshot {
+                seq: 1,
+                ilks: vec![
+                    entry(CONSCIOUS, "AI.ed4qm7k2xa@worker1", "conscious"),
+                    entry(
+                        "ilk:00000000-0000-4000-8000-000000000001",
+                        DOOR,
+                        "capability",
+                    ),
+                ],
+            })
+        })
+    }
+
+    /// A door's `notify`: a capability's result for the person's conversation, from `sender`.
+    fn result_turn(id: &str, sender: &str, io_node: &str) -> Message {
+        let mut msg = turn(id);
+        msg.routing.src = format!("uuid-of-{sender}");
+        msg.routing.src_l2_name = Some(sender.to_string());
+        msg.meta.src_ilk = Some("ilk:00000000-0000-4000-8000-000000000001".to_string());
+        msg.meta.context = Some(json!({
+            "capability_result": {
+                "request_id": format!("req-{id}"),
+                "capability": sender,
+                "status": "done",
+                "result": {"state": "paid"},
+                "conversation": {
+                    "thread_id": "thread-of-ana",
+                    "person_ilk": PERSON,
+                    "io_node": io_node,
+                    "reply_target": {"kind": "wapp_post", "address": "5491100000000"}
+                }
+            }
+        }));
+        msg
+    }
+
+    /// docs/digital-executive-v1-stage-3.md §6.1: a result from one of the ED's capabilities runs in
+    /// the person's conversation and its answer, the busy one too, goes to the person's IO node as
+    /// the ED; from any other sender the result is taken out and the message is answered as before;
+    /// one from the door that does not name an IO node is neither run nor answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_capabilitys_result_is_answered_in_its_persons_conversation_never_to_its_door() {
+        let mut runtime = Harness::start_with_identity(
+            RuntimeConfig {
+                worker_pool_size: 1,
+                queue_capacity: 1,
+                self_ilk_id: Some(CONSCIOUS.to_string()),
+                speaks_as: Some(ED.to_string()),
+                ..RuntimeConfig::default()
+            },
+            Some(ed_identity()),
+        );
+        runtime.metrics.speaks_as.record(
+            "AI.ed4qm7k2xa@worker1",
+            ED,
+            Ok(ED.to_string()),
+            Instant::now(),
+        );
+        const IO: &str = "IO.wapp.ed4qm7k2xa@worker1";
+        let to_the_persons_io = |answer: &Message| {
+            assert!(
+                matches!(&answer.routing.dst, Destination::Unicast(dst) if dst == IO),
+                "{:?}",
+                answer.routing.dst
+            );
+            assert_eq!(answer.meta.dst_ilk.as_deref(), Some(PERSON));
+            assert_eq!(answer.meta.src_ilk.as_deref(), Some(ED));
+            assert_eq!(answer.meta.thread_id.as_deref(), Some("thread-of-ana"));
+            let context = answer.meta.context.as_ref().expect("a context");
+            assert_eq!(
+                context["io"]["reply_target"],
+                json!({"kind": "wapp_post", "address": "5491100000000"})
+            );
+            assert!(context.get("capability_result").is_none());
+        };
+
+        runtime.send(result_turn("result-1", DOOR, IO)).await;
+        runtime.let_turns_go(1);
+        let answer = runtime.answer().await;
+        to_the_persons_io(&answer);
+        assert_eq!(runtime.note_of("result-1").to.as_deref(), Some(IO));
+
+        // A busy answer goes there too: one turn runs, one waits, the third is refused.
+        for id in ["held-turn", "waiting-turn"] {
+            runtime.send(turn(id)).await;
+        }
+        runtime.send(result_turn("result-busy", DOOR, IO)).await;
+        let busy = runtime.answer().await;
+        assert_eq!(busy.routing.trace_id, "result-busy");
+        assert_eq!(busy.payload["code"], json!("ai_runtime_busy"));
+        to_the_persons_io(&busy);
+        runtime.let_turns_go(2);
+        assert_eq!(
+            ids(&[runtime.answer().await, runtime.answer().await]),
+            ["held-turn", "waiting-turn"]
+        );
+
+        // From no capability of the ED: answered to its sender, without the result.
+        runtime
+            .send(result_turn("stranger", "WF.stranger@worker1", IO))
+            .await;
+        runtime.let_turns_go(1);
+        let answer = runtime.answer().await;
+        assert!(matches!(
+            &answer.routing.dst,
+            Destination::Unicast(dst) if dst == "uuid-of-WF.stranger@worker1"
+        ));
+        assert!(answer
+            .meta
+            .context
+            .as_ref()
+            .is_some_and(|context| context.get("capability_result").is_none()));
+
+        // From the door, with a conversation that names no IO node: neither run nor answered.
+        runtime.send(result_turn("odd", DOOR, DOOR)).await;
+        runtime.let_turns_go(1);
+        runtime.no_answer().await;
+        assert!(!runtime.node.started().contains(&"odd".to_string()));
     }
 
     /// The direct lane's bound: past it a message is dropped, neither run nor answered, and the
